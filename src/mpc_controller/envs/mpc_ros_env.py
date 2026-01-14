@@ -8,9 +8,9 @@ import gymnasium as gym
 import rospy
 from stable_baselines3 import SAC,PPO
 from gymnasium.wrappers import TimeLimit
-import wandb
+#import wandb
 from stable_baselines3.common.callbacks import BaseCallback
-from wandb.integration.sb3 import WandbCallback
+#from wandb.integration.sb3 import WandbCallback
 from stable_baselines3.common.callbacks import EvalCallback
 from gymnasium.envs.registration import register
 import signal
@@ -145,10 +145,10 @@ class mpcGym(gym.Env):
 
         start_point = self.map.get_spawn_points()[1]
         print("Start point: ", start_point)
-        start_point.location.x = 127.4
-        start_point.location.y = 195.4
+        start_point.location.x = -2.3
+        start_point.location.y = 204.1
         start_point.location.z = 0.3
-        start_point.rotation.yaw = 180.0
+        start_point.rotation.yaw = 2
         start_point = carla_common.transforms.carla_transform_to_ros_pose(start_point)
         spawn_pose = self.carla_spawn_to_ros_pose(start_point)
         self.initial_pose_publisher.publish(spawn_pose)
@@ -395,8 +395,8 @@ class mpcGym(gym.Env):
 
     def _get_obs(self):
         self.print_initialized()
-        while not self.ref_path_initialized or not self.ego_state_initialized or not self.frenet_pose_initialized or \
-                not self.selected_obstacles_initialized or not self.predicted_path_initialized or not self.acados_init:
+        while not rospy.is_shutdown() and (not self.ref_path_initialized or not self.ego_state_initialized or not self.frenet_pose_initialized or \
+                not self.selected_obstacles_initialized or not self.predicted_path_initialized or not self.acados_init):
             if not self.ref_path_initialized:
                 rospy.loginfo("Reference path not initialized.")
             if not self.ego_state_initialized:
@@ -555,7 +555,7 @@ class LapTimeEvalCallback(EvalCallback):
             if self.locals['infos'][0]['done'] == 'path end':
                 lap_time = self.locals['infos'][0]['lap_time']
                 self.lap_times.append(lap_time)
-                wandb.log({"eval/lap_time": lap_time})
+                #wandb.log({"eval/lap_time": lap_time})
         return result
 
 
@@ -580,13 +580,13 @@ class RewardLoggerCallback(BaseCallback):
             if self.locals['infos'][0]['done'] == 'path end':
                 self.episode_lengths.append(self.episode_length)
                 print("INFOs: ", self.locals['infos'][0])
-                wandb.log({"episode_reward": self.episode_reward, "episode_length": self.episode_length, 
-                           "lap_time": self.locals['infos'][0]['lap_time']})
+                #wandb.log({"episode_reward": self.episode_reward, "episode_length": self.episode_length, 
+                           #"lap_time": self.locals['infos'][0]['lap_time']})
     
             else:
                 self.episode_lengths.append(0)                
                 # Log the episode reward and length to wandb
-                wandb.log({"episode_reward": self.episode_reward, "episode_length": 0})
+                #wandb.log({"episode_reward": self.episode_reward, "episode_length": 0})
                 
             # Reset the reward and length for the next episode
             self.episode_reward = 0.0
@@ -594,9 +594,9 @@ class RewardLoggerCallback(BaseCallback):
         
         return True
 
-    def _on_training_end(self) -> None:
+    #def _on_training_end(self) -> None:
         # Log the final episode rewards and lengths
-        wandb.log({"final_episode_rewards": self.episode_rewards, "final_episode_lengths": self.episode_lengths})
+        #wandb.log({"final_episode_rewards": self.episode_rewards, "final_episode_lengths": self.episode_lengths})
 
 register(
     id='mpc-gym-v0',
@@ -637,6 +637,62 @@ def print_wrappers(env):
     else:
         print(type(env))
 
+def evaluate_best_model(model_path, num_episodes=5):
+    """
+    Load and evaluate the best model with visualization
+    """
+    rospy.init_node('mpc_gym_eval_node')
+    env = gym.make('mpc-gym-v0')
+    
+    # Load the trained model
+    print(f"Loading model from: {model_path}")
+    try:
+        model = SAC.load(model_path)
+        print("✅ Model loaded successfully!")
+    except Exception as e:
+        print(f"❌ Failed to load model: {e}")
+        env.close()
+        return
+    
+    # Run evaluation episodes
+    for episode in range(num_episodes):
+        print(f"\n{'='*60}")
+        print(f"EPISODE {episode + 1}/{num_episodes}")
+        print(f"{'='*60}\n")
+        
+        obs, _ = env.reset()
+        done = False
+        episode_reward = 0
+        step = 0
+        
+        while not done and not rospy.is_shutdown():
+            # Get action from trained model (deterministic for evaluation)
+            action, _states = model.predict(obs, deterministic=True)
+            
+            # Take step
+            obs, reward, done, truncated, info = env.step(action)
+            
+            episode_reward += reward
+            step += 1
+            
+            # Print progress every 50 steps
+            if step % 50 == 0:
+                print(f"Step {step}: Reward={reward:.2f}, "
+                      f"Cumulative={episode_reward:.2f}, "
+                      f"Speed={env.current_speed:.2f} m/s")
+        
+        # Episode finished
+        print(f"\n--- Episode {episode + 1} Summary ---")
+        print(f"Total Reward: {episode_reward:.2f}")
+        print(f"Steps: {step}")
+        print(f"Completion: {info.get('done', 'unknown')}")
+        if 'lap_time' in info:
+            print(f"Lap Time: {info['lap_time']:.2f}s")
+        print()
+    
+    env.close()
+    print("Evaluation complete!")
+    
 # def train_sac(args=None):
 #     def signal_handler(sig, frame):
 #         print('Interrupt received, shutting down.')
@@ -690,7 +746,7 @@ def train_sac(args=None):
     signal.signal(signal.SIGTERM, signal_handler)
     print("Adeen")
     # run = wandb.init(project="mpc_residual", entity="adeeb-islam8", sync_tensorboard=True)
-    wandb.init(project="mpc_residual", entity="adeeb-islam8", sync_tensorboard=True)
+    #wandb.init(project="mpc_residual", entity="adeeb-islam8", sync_tensorboard=True)
     rospy.init_node('mpc_gym_node')
     # rospy.spin()
     env = gym.make('mpc-gym-v0')
@@ -709,7 +765,7 @@ def train_sac(args=None):
                                  deterministic=True, render=False)
 
     try:
-        model.learn(total_timesteps=100000, progress_bar= True, callback=[WandbCallback(), RewardLoggerCallback(), eval_callback], log_interval=1)
+        model.learn(total_timesteps=100000, progress_bar= True, callback=[RewardLoggerCallback(), eval_callback], log_interval=1)
         # model.learn(total_timesteps=1000, progress_bar=True)
 
         model.save("sac_mpc")
@@ -720,7 +776,8 @@ def train_sac(args=None):
     finally:
         rospy.loginfo('Shutting down mpc gym node.')
         env.close()
-        wandb.finish()
+        #wandb.finish()
 if __name__ == "__main__":
     # main()
-    train_sac()
+    # train_sac()
+    evaluate_best_model("/home/ave/Desktop/carla_mpc_residual_learning/src/mpc_controller/envs/sac_mpc/models/best_model_obs/best_model.zip", 30)

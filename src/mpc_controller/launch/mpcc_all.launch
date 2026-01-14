@@ -6,7 +6,7 @@
   <!-- carla parameter -->
   <arg name='host' default='localhost'/> <!-- host the carla server is running on -->
   <arg name='port' default='2000'/> <!-- port of the carla server -->
-  <arg name="town" default="Town01"/> 
+  <arg name="town" default="Town03"/> 
   <!-- <arg name="town" default="/home/adeeb/CARLA_0.9.13/CarlaUE4/Content/Carla/Maps/OpenDrive/no_lane_map.xodr"/> the carla town to load -->
   <arg name='timeout' default='10'/> <!-- the carla timeout for server communication -->
   <arg name='passive' default='False'/> <!-- enable/disable passive mode -->
@@ -17,8 +17,12 @@
   
    
   <arg name="role_name" default="ego_vehicle"/> <!-- role name of the ego vehicle (used for identification in many nodes) -->
-  <arg name='spawn_point' default='127.4,-195.4,2,0,0,180'/> 
-  <!-- <arg name='spawn_point' default=""/>  -->
+  <arg name='spawn_point' default='-2.3,-204.1,2,0,0,2'/>
+  <!-- for town01 use  <arg name='spawn_point' default='127.4,-195.4,2,0,0,180'/>  -->
+  <!-- for town02 use <arg name='spawn_point' default='127.4,-191.4,2,0,0,0'/> -->
+  <!-- for town03 use <arg name='spawn_point' default='-2.3,-204.1,2,0,0,2'/> -->
+  <!-- for town04 use <arg name='spawn_point' default='179.8,-206.2,2,0,0,19'/> -->
+  <!-- <arg name='spawn_point' default=""/> -->
   <!-- <arg name='spawn_point' default='71.1,-45.7,35.0,0.0,0.0,180.0'/> -->
   <!-- <arg name="goal_point" default="-64.6,24.4,0.59,0.0,0.0,180"/> goal point for the ego vehicle -->
 
