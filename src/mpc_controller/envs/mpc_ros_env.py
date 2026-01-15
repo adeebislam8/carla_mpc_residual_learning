@@ -45,6 +45,16 @@ RAD2DEG = 180.0/np.pi
 DIST2OBSTACLE = 6.0
 PATH_LENGTH = 100.0
 
+shutdown_requested = False
+
+def sigint_handler(sig, frame):
+    global shutdown_requested
+    rospy.loginfo("Shutdown requested via SIGINT...")
+    shutdown_requested = True
+    rospy.signal_shutdown("SIGINT")
+
+signal.signal(signal.SIGINT, sigint_handler)
+
 class mpcGym(gym.Env):
     metadata = {'render.modes': ['human']}
 
@@ -80,14 +90,16 @@ class mpcGym(gym.Env):
         self.map = self.world.get_map()
 
         self.speed_count = 0
-        self.state_dim = 60
-        self.action_space = spaces.Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), shape=(2,), dtype=np.float64)
+        self.state_dim = 62 # 60+ 2 from reverse (current and prev)
+        self.action_space = spaces.Box(low=np.array([-1.0, -1.0, -1.0]), high=np.array([1.0, 1.0, 1.0]), shape=(3,), dtype=np.float64)
         self.observation_space = spaces.Box(
             low=np.ones(self.state_dim) * -np.inf,
             high=np.ones(self.state_dim) * np.inf,
             shape=(self.state_dim,),
             dtype=np.float64)
         print("Action space: ", self.action_space)
+        self.current_reverse = False
+        self.prev_reverse = False
         self.setup_ros()
 
     def setup_ros(self):
@@ -136,28 +148,48 @@ class mpcGym(gym.Env):
         self.action_stop_publisher.publish(control_msg)
 
     def reset_vehicle(self):
-        speed = self.current_ego_state_info[0]
-        while abs(speed) > 0.5:
-            self.emergency_stop()
-            print("reset_veh emer_stop")
+        try: 
             speed = self.current_ego_state_info[0]
-            rospy.sleep(0.5)
+            start_time = time.time()
+            timeout = 10
+            self.emergency_stop()
 
-        start_point = self.map.get_spawn_points()[1]
-        print("Start point: ", start_point)
-        start_point.location.x = -2.3
-        start_point.location.y = 204.1
-        start_point.location.z = 0.3
-        start_point.rotation.yaw = 2
-        start_point = carla_common.transforms.carla_transform_to_ros_pose(start_point)
-        spawn_pose = self.carla_spawn_to_ros_pose(start_point)
-        self.initial_pose_publisher.publish(spawn_pose)
-        emergency_stop_signal = Int16()
-        emergency_stop_signal.data = 0
-        self.action_stop_publisher.publish(emergency_stop_signal)
+            while abs(speed) > 0.5 and not shutdown_requested:
+                if time.time() - start_time > timeout:
+                    rospy.logwarn("Timeout waiting for vehicle to stop")
+                    break
 
-        rospy.loginfo("Resetting the vehicle to a random spawn point and goal point.")
-        rospy.sleep(1)
+                self.emergency_stop()
+                print("reset_veh emer_stop")
+                speed = self.current_ego_state_info[0]
+                rospy.sleep(0.5)
+                if shutdown_requested:
+                    return
+
+            start_point = self.map.get_spawn_points()[1]
+            print("Start point: ", start_point)
+            start_point.location.x = -2.3
+            start_point.location.y = 204.1
+            start_point.location.z = 0.2
+            start_point.rotation.yaw = 2
+            start_point = carla_common.transforms.carla_transform_to_ros_pose(start_point)
+            spawn_pose = self.carla_spawn_to_ros_pose(start_point)
+            self.initial_pose_publisher.publish(spawn_pose)
+            emergency_stop_signal = Int16()
+            emergency_stop_signal.data = 0
+            self.action_stop_publisher.publish(emergency_stop_signal)
+
+            if rospy.is_shutdown():
+                return
+
+            rospy.loginfo("Resetting the vehicle to a random spawn point and goal point.")
+            rospy.sleep(1)
+        finally:
+            if not shutdown_requested and not rospy.is_shutdown():
+                emergency_stop_signal = Int16()
+                emergency_stop_signal.data = 0
+                self.action_stop_publisher.publish(emergency_stop_signal)
+                rospy.loginfo("Emergency stop released")
 
     def distance(self, p1, p2):
         return np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
@@ -349,22 +381,27 @@ class mpcGym(gym.Env):
         if abs(action[1]) > 1:
             reward -= 10
             print("steer penalty")
+        if action[2]: # encourage not to reverse too much
+            reward -= 2
         print("Current s: ", self.current_s)
         print("prev s: ", self.prev_s)
         print("Current d: ", d)
         print("Current speed: ", self.current_speed)
-        
-        reward += (self.current_s - self.prev_s) * 10
+        progress = self.current_s - self.prev_s
+        if action[2] and progress < 0: # try to add little reward for reverse if needed
+            reward += abs(progress)
+        else:
+            reward += progress * 10
 
         # reward for staying in the lane
         if not (d < 3.5 and d > -0.5):
-            reward -= 1
+            reward -= 5
 
         for obs in self.selected_obstacles:
             if self.distance_to_obs(obs) < DIST2OBSTACLE:
                 reward -= 5
 
-        if self.current_speed < 1:
+        if self.current_speed < 1 and not action[2]: #reverse and stall
             reward -= 10
 
         if s >= self.path_length - 10:
@@ -395,8 +432,17 @@ class mpcGym(gym.Env):
 
     def _get_obs(self):
         self.print_initialized()
-        while not rospy.is_shutdown() and (not self.ref_path_initialized or not self.ego_state_initialized or not self.frenet_pose_initialized or \
+        start_wait_time = time.time()
+        timeout_duration = 5.0
+        while not rospy.is_shutdown() and not shutdown_requested and (not self.ref_path_initialized or not self.ego_state_initialized or not self.frenet_pose_initialized or \
                 not self.selected_obstacles_initialized or not self.predicted_path_initialized or not self.acados_init):
+            
+            if time.time() - start_wait_time > timeout_duration:
+                rospy.logwarn("TIMEOUT: Observations not received within 5s. Forcing break to avoid hang.")
+                emergency_stop_signal = Int16(data=0)
+                self.action_stop_publisher.publish(emergency_stop_signal)
+                break
+
             if not self.ref_path_initialized:
                 rospy.loginfo("Reference path not initialized.")
             if not self.ego_state_initialized:
@@ -444,6 +490,8 @@ class mpcGym(gym.Env):
             # reference_sampled_points.flatten(),
             kappa_points,
             [self.current_step],
+            [float(self.current_reverse)],
+            [float(self.prev_reverse)],
             self.predicted_path_frenet.flatten()
         ], axis=0)
 
@@ -463,6 +511,8 @@ class mpcGym(gym.Env):
         self.ego_state_initialized = False
         self.frenet_pose_initialized = False
         self.inside_obs = False
+        self.current_reverse = False
+        self.prev_reverse = False
         rospy.loginfo("Resetting the observation.")
 
     def step(self, residual):
@@ -472,21 +522,25 @@ class mpcGym(gym.Env):
         # print("Residual: ", residual)
         residual[0] = 0.1 * residual[0]
         residual[1] = 0.1 * residual[1]
+        reverse_gear = residual[2]
         # residual = [0,0]
+        reverse = reverse_gear > 0
         print("Stepping with residual: ", residual)
-        residual_msg = Float32MultiArray(data=residual)
+        residual_msg = Float32MultiArray(data=[residual[0], residual[1], float(reverse)])
         self.action_publisher.publish(residual_msg)
 
         throttle = self.current_observation[4] + residual[0]
         steer = self.current_observation[5] + residual[1]
 
-        rospy.loginfo("Stepped with throttle: {} and steer: {}".format(throttle, steer))
+        rospy.loginfo("Stepped with throttle: {}, steer: {}, reverse: {}".format(throttle, steer, reverse))
         observation = self._get_obs()
         reward = self._calculate_reward(observation, [throttle, steer])
         print("Reward: ", reward)
         done, info = self.check_done()
         print("Done: ", done)
         print("Info: ", info)
+        self.prev_reverse = self.current_reverse
+        self.current_reverse = reverse
 
         return observation, reward, done, False, info
 
@@ -735,12 +789,31 @@ def evaluate_best_model(model_path, num_episodes=5):
 #         wandb.finish()
 
 def train_sac(args=None):
+    model = None
+    env = None
+
     def signal_handler(sig, frame):
-        print('Interrupt received, shutting down.')
-        model.save("sac_mpc")
-        env.close()
+        global shutdown_requested
+        print('Interrupt received, shutting down...')
+        shutdown_requested = True
+        
+        try:
+            if model is not None:
+                print("Saving model...")
+                model.save("with_reverse_sac_mpc")
+                print("Model saved successfully!")
+        except Exception as e:
+            print(f"Could not save model: {e}")
+        
+        try:
+            if env is not None:
+                print("Closing environment...")
+                env.close()
+        except Exception as e:
+            print(f"Could not close environment: {e}")
+        
         rospy.signal_shutdown('Interrupt received')
-        exit(0)
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -765,19 +838,21 @@ def train_sac(args=None):
                                  deterministic=True, render=False)
 
     try:
-        model.learn(total_timesteps=100000, progress_bar= True, callback=[RewardLoggerCallback(), eval_callback], log_interval=1)
-        # model.learn(total_timesteps=1000, progress_bar=True)
+        # model.learn(total_timesteps=100000, progress_bar= True, callback=[RewardLoggerCallback(), eval_callback], log_interval=1)
+        model.learn(total_timesteps=5000, progress_bar=True)
 
-        model.save("sac_mpc")
+        model.save("with_reverse_sac_mpc")
     except rospy.ROSInterruptException:
         pass
     except KeyboardInterrupt:
         rospy.loginfo('Interrupt received, shutting down.')
     finally:
         rospy.loginfo('Shutting down mpc gym node.')
-        env.close()
+        if env is not None:
+            env.close()
+        rospy.signal_shutdown('Training ended')
         #wandb.finish()
 if __name__ == "__main__":
     # main()
-    # train_sac()
-    evaluate_best_model("/home/ave/Desktop/carla_mpc_residual_learning/src/mpc_controller/envs/sac_mpc/models/best_model_obs/best_model.zip", 30)
+    train_sac()
+    # evaluate_best_model("/home/ave/Desktop/carla_mpc_residual_learning/src/mpc_controller/envs/sac_mpc/models/best_model_obs/best_model.zip", 30)
