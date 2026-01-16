@@ -37,6 +37,7 @@ from scipy.interpolate import make_interp_spline
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 import carla_common.transforms
 import threading
+import traceback
 import random
 secure_random = random.SystemRandom()
 
@@ -54,6 +55,10 @@ def sigint_handler(sig, frame):
     rospy.signal_shutdown("SIGINT")
 
 signal.signal(signal.SIGINT, sigint_handler)
+
+file_path = "/home/ave/Desktop/carla_mpc_residual_learning/debug,txt"
+with open(file_path, "w") as file:
+    file.write("")
 
 class mpcGym(gym.Env):
     metadata = {'render.modes': ['human']}
@@ -147,18 +152,66 @@ class mpcGym(gym.Env):
         control_msg.data = 1
         self.action_stop_publisher.publish(control_msg)
 
+    def clear_spawn_point(self, spawn_location, radius=5.0):
+        """Remove vehicles from spawn and optionally relocate them"""
+        try:
+            all_vehicles = self.world.get_actors().filter('vehicle.*')
+            spawn_points = self.map.get_spawn_points()
+            
+            cleared_count = 0
+            for vehicle in all_vehicles:
+                # Skip ego vehicle
+                if vehicle.attributes.get('role_name') == 'ego_vehicle':
+                    continue
+                
+                # Check distance to spawn point
+                vehicle_loc = vehicle.get_location()
+                distance = np.sqrt(
+                    (vehicle_loc.x - spawn_location.x)**2 + 
+                    (vehicle_loc.y - spawn_location.y)**2
+                )
+                
+                if distance < radius:
+                    # Teleport to random far location
+                    far_spawn = secure_random.choice(spawn_points)
+                    while self._distance_2d(far_spawn.location, spawn_location) < 50:
+                        far_spawn = secure_random.choice(spawn_points)
+                    
+                    vehicle.set_transform(far_spawn)
+                    rospy.loginfo(f"Relocated vehicle {distance:.2f}m away")
+                    cleared_count += 1
+            
+            if cleared_count > 0:
+                rospy.sleep(0.3)
+                rospy.loginfo(f"Cleared {cleared_count} vehicles from spawn area")
+            
+            return True
+        except Exception as e:
+            rospy.logerr(f"Failed to clear spawn point: {e}")
+            return False
+
+    def _distance_2d(self, loc1, loc2):
+        """Helper to calculate 2D distance"""
+        return np.sqrt((loc1.x - loc2.x)**2 + (loc1.y - loc2.y)**2)
+    
     def reset_vehicle(self):
         try: 
             speed = self.current_ego_state_info[0]
             start_time = time.time()
             timeout = 10
+            with open(file_path, 'a') as file:
+                file.write("reset vehicle first try\n")
             self.emergency_stop()
 
             while abs(speed) > 0.5 and not shutdown_requested:
                 if time.time() - start_time > timeout:
                     rospy.logwarn("Timeout waiting for vehicle to stop")
+                    with open(file_path, 'a') as file:
+                        file.write("Time out in reset vehicle\n")
                     break
-
+                
+                with open(file_path, 'a') as file:
+                    file.write("reset vehicle in while\n")
                 self.emergency_stop()
                 print("reset_veh emer_stop")
                 speed = self.current_ego_state_info[0]
@@ -168,10 +221,11 @@ class mpcGym(gym.Env):
 
             start_point = self.map.get_spawn_points()[1]
             print("Start point: ", start_point)
-            start_point.location.x = -2.3
-            start_point.location.y = 204.1
+            start_point.location.x = 127.4
+            start_point.location.y = 195.4
             start_point.location.z = 0.2
-            start_point.rotation.yaw = 2
+            start_point.rotation.yaw = 180
+            self.clear_spawn_point(carla.Location(x=127.4, y=195.4, z=0.2), radius=5)
             start_point = carla_common.transforms.carla_transform_to_ros_pose(start_point)
             spawn_pose = self.carla_spawn_to_ros_pose(start_point)
             self.initial_pose_publisher.publish(spawn_pose)
@@ -184,8 +238,15 @@ class mpcGym(gym.Env):
 
             rospy.loginfo("Resetting the vehicle to a random spawn point and goal point.")
             rospy.sleep(1)
+        except Exception as e:
+            with open(file_path, "a") as file:
+                file.write(e)
         finally:
+            with open(file_path, 'a') as file:
+                file.write("reset vehicle finally\n")
             if not shutdown_requested and not rospy.is_shutdown():
+                with open(file_path, 'a') as file:
+                    file.write("reset vehicle finally if\n")
                 emergency_stop_signal = Int16()
                 emergency_stop_signal.data = 0
                 self.action_stop_publisher.publish(emergency_stop_signal)
@@ -368,6 +429,9 @@ class mpcGym(gym.Env):
 
     def _calculate_reward(self, observation, action):
         print("action: ", action)
+        if len(action) != 3:
+            with open(file_path, "a") as file:
+                file.write(f"action dim mismatched. Got :{len(action)}\n")
         if self.collision:
             return -100
         # s = observation[2]
@@ -382,7 +446,7 @@ class mpcGym(gym.Env):
             reward -= 10
             print("steer penalty")
         if action[2]: # encourage not to reverse too much
-            reward -= 2
+            reward -= 10
         print("Current s: ", self.current_s)
         print("prev s: ", self.prev_s)
         print("Current d: ", d)
@@ -440,6 +504,8 @@ class mpcGym(gym.Env):
             if time.time() - start_wait_time > timeout_duration:
                 rospy.logwarn("TIMEOUT: Observations not received within 5s. Forcing break to avoid hang.")
                 emergency_stop_signal = Int16(data=0)
+                with open(file_path, "a") as file:
+                    file.write("in get obs\n")
                 self.action_stop_publisher.publish(emergency_stop_signal)
                 break
 
@@ -534,7 +600,7 @@ class mpcGym(gym.Env):
 
         rospy.loginfo("Stepped with throttle: {}, steer: {}, reverse: {}".format(throttle, steer, reverse))
         observation = self._get_obs()
-        reward = self._calculate_reward(observation, [throttle, steer])
+        reward = self._calculate_reward(observation, [throttle, steer, reverse])
         print("Reward: ", reward)
         done, info = self.check_done()
         print("Done: ", done)
@@ -590,6 +656,8 @@ class mpcGym(gym.Env):
 
     def close(self):
         rospy.loginfo("Shutting down mpc gym environment.")
+        with open(file_path, 'a') as file:
+                file.write("close\n")
         self.emergency_stop()
         rospy.signal_shutdown("Closing the environment")
         if hasattr(self, 'client'):
@@ -833,22 +901,32 @@ def train_sac(args=None):
 
     model = SAC('MlpPolicy', env, verbose=2)
 
-    eval_callback = EvalCallback(env, best_model_save_path='./sac_mpc/models/best_model_obs',
-                                 log_path='./sac_mpc/eval_logs', eval_freq=5000,
+    eval_callback = EvalCallback(env, best_model_save_path='./sac_mpc/models/best_model_with_reverse',
+                                 log_path='./sac_mpc/eval_logs_with_reverse', eval_freq=5000,
                                  deterministic=True, render=False)
 
     try:
-        # model.learn(total_timesteps=100000, progress_bar= True, callback=[RewardLoggerCallback(), eval_callback], log_interval=1)
-        model.learn(total_timesteps=5000, progress_bar=True)
+        with open(file_path, 'a') as file:
+                file.write("Start Training\n")
+        model.learn(total_timesteps=100000, progress_bar= True, callback=[RewardLoggerCallback(), eval_callback], log_interval=1)
+        # model.learn(total_timesteps=5000, progress_bar=True)
 
         model.save("with_reverse_sac_mpc")
+        with open(file_path, 'a') as file:
+                file.write("Already save file\n")
     except rospy.ROSInterruptException:
         pass
     except KeyboardInterrupt:
         rospy.loginfo('Interrupt received, shutting down.')
+    except Exception as e:
+        with open(file_path, "a") as file:
+            file.write(f"Error: {str(e)}\n")  # ✅ Convert to string
+            file.write(f"Traceback: {traceback.format_exc()}\n")  # Even better!
     finally:
         rospy.loginfo('Shutting down mpc gym node.')
         if env is not None:
+            with open(file_path, 'a') as file:
+                file.write("env close in finally train sac\n")
             env.close()
         rospy.signal_shutdown('Training ended')
         #wandb.finish()
