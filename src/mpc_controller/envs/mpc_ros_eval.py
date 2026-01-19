@@ -730,13 +730,13 @@ def evaluate_best_model(model_path, num_episodes=5, completion_threshold=0.97):
             # Print progress every 50 steps
             if step % 50 == 0:
                 completion_pct = (env.unwrapped.current_s / env.unwrapped.path_length * 100) if env.unwrapped.path_length > 0 else 0
-                with open(file_path, "a") as file:
-                    file.write(f"Step {step}: Reward={reward: .2f}, Progress={completion_pct:.1f}%\n")
                 print(f"Step {step}: Reward={reward:.2f}, "
                     f"Cumulative={episode_reward:.2f}, "
                     f"Speed={env.unwrapped.current_speed:.2f} m/s, "
                     f"Lane Dev={abs(env.unwrapped.current_d):.2f}m, "
                     f"Progress={completion_pct:.1f}%")
+                if completion_pct >= completion_threshold:
+                    break
         
         # Episode finished - collect metrics
         completion_reason = info.get('done', 'unknown')
@@ -807,6 +807,9 @@ def evaluate_best_model(model_path, num_episodes=5, completion_threshold=0.97):
         if 'lap_time' in info:
             print(f"Lap Time: {info['lap_time']:.2f}s")
         print()
+    
+        with open(file_path, "a"):
+            file.write("Finish one episode")
     
     env.close()
     
