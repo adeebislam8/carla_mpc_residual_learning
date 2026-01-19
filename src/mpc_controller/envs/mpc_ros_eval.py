@@ -8,9 +8,7 @@ import gymnasium as gym
 import rospy
 from stable_baselines3 import SAC,PPO
 from gymnasium.wrappers import TimeLimit
-#import wandb
 from stable_baselines3.common.callbacks import BaseCallback
-#from wandb.integration.sb3 import WandbCallback
 from stable_baselines3.common.callbacks import EvalCallback
 from gymnasium.envs.registration import register
 import signal
@@ -56,6 +54,9 @@ def sigint_handler(sig, frame):
 
 signal.signal(signal.SIGINT, sigint_handler)
 
+file_path = "/home/ave/Desktop/carla_mpc_residual_learning/debug,txt"
+with open(file_path, "w") as file:
+    file.write("")
 
 class mpcGym(gym.Env):
     metadata = {'render.modes': ['human']}
@@ -229,6 +230,9 @@ class mpcGym(gym.Env):
 
             rospy.loginfo("Resetting the vehicle to a random spawn point and goal point.")
             rospy.sleep(1)
+        except Exception as e:
+            with open(file_path, "a") as file:
+                file.write(e)
         finally:
             if not shutdown_requested and not rospy.is_shutdown():
                 emergency_stop_signal = Int16()
@@ -370,47 +374,6 @@ class mpcGym(gym.Env):
             if 10 in msg.crossed_lane_markings:
                 self.lane_invasion = True
 
-    # def _calculate_reward(self, observation, action):
-    #     print("action: ", action)
-    #     if self.collision:
-    #         return -100
-    #     # s = observation[2]
-    #     # d = observation[3]
-    #     s = self.current_s
-    #     d = self.current_d
-    #     reward = 0
-    #     if abs(action[0]) > 1:
-    #         reward -= 10
-    #         print("throttle penalty")
-    #     if abs(action[1]) > 1:
-    #         reward -= 10
-    #         print("steer penalty")
-    #     print("Current s: ", self.current_s)
-    #     print("prev s: ", self.prev_s)
-    #     print("Current d: ", d)
-    #     print("Current speed: ", self.current_speed)
-        
-    #     reward += (self.current_s - self.prev_s) * 10
-
-    #     # reward for staying in the lane
-    #     if not (d < 3.5 and d > -0.5):
-    #         reward -= 1
-
-    #     for obs in self.selected_obstacles:
-    #         if self.distance_to_obs(obs) < DIST2OBSTACLE:
-    #             reward -= 5
-
-    #     if self.current_speed < 1:
-    #         reward -= 1
-
-
-    #     for obs in self.selected_obstacles:
-    #         if self.distance_to_obs(obs) < 2:
-    #             self.inside_obs = True
-    #             reward = 0
-    #     return reward
-
-
     def _calculate_reward(self, observation, action):
         print("action: ", action)
         if self.collision:
@@ -511,20 +474,6 @@ class mpcGym(gym.Env):
         y_ref_points = self.y_ref_spline(s_list)
         kappa_points = self.kappa_spline(s_list)
 
-        
-
-        # print("Current frenet pose shape: ", self.current_frenet_pose)
-        # print("Path length: ", self.path_length)
-        # print("#################################################################")
-        # print("Distance to finsh line: ", self.path_length - self.current_frenet_pose[0])
-        # print("currenf frent test: ", self.current_frenet_pose)
-        # print("MPC control: ", self.mpc_control)
-        # print("Selected obstacles: ", self.selected_obstacles)
-        # print("Ego state info: ", self.current_ego_state_info)
-        # # print("Reference sampled points: ", reference_sampled_points)
-        # print("kappa points: ", kappa_points)
-        # print("Predicted path frenet: ", self.predicted_path_frenet)
-        # print("#################################################################")
         observation = np.concatenate([
             np.array([self.path_length - self.current_frenet_pose[0]]),  # Convert scalar to 1D array
             self.current_frenet_pose,
@@ -541,8 +490,6 @@ class mpcGym(gym.Env):
         ], axis=0)
 
         self.current_observation = observation
-        # print("Observation: ", observation)
-        # print("Observation shape: ", observation.shape)
         if observation.shape[0] != self.state_dim:
             rospy.loginfo("Observation shape is incorrect.")
         return observation
@@ -635,6 +582,8 @@ class mpcGym(gym.Env):
 
     def close(self):
         rospy.loginfo("Shutting down mpc gym environment.")
+        with open(file_path, 'a') as file:
+                file.write("close\n")
         self.emergency_stop()
         rospy.signal_shutdown("Closing the environment")
         if hasattr(self, 'client'):
@@ -679,13 +628,9 @@ class RewardLoggerCallback(BaseCallback):
             if self.locals['infos'][0]['done'] == 'path end':
                 self.episode_lengths.append(self.episode_length)
                 print("INFOs: ", self.locals['infos'][0])
-                #wandb.log({"episode_reward": self.episode_reward, "episode_length": self.episode_length, 
-                           #"lap_time": self.locals['infos'][0]['lap_time']})
     
             else:
                 self.episode_lengths.append(0)                
-                # Log the episode reward and length to wandb
-                #wandb.log({"episode_reward": self.episode_reward, "episode_length": 0})
                 
             # Reset the reward and length for the next episode
             self.episode_reward = 0.0
@@ -693,41 +638,11 @@ class RewardLoggerCallback(BaseCallback):
         
         return True
 
-    #def _on_training_end(self) -> None:
-        # Log the final episode rewards and lengths
-        #wandb.log({"final_episode_rewards": self.episode_rewards, "final_episode_lengths": self.episode_lengths})
-
 register(
     id='mpc-gym-v0',
     entry_point='__main__:mpcGym',
     max_episode_steps=1000,
 )
-
-def main(args=None):
-    try:
-        rospy.init_node('mpc_gym_node')
-        env = gym.make('mpc-gym-v0')
-        env.reset()
-        rate = rospy.Rate(10)
-        print("After spin")
-        step = 0
-        while not rospy.is_shutdown():
-            ob, reward, done, _, _ = env.step([0, 0])
-            print("Step: ", step)
-            step += 1
-            print("Observation: ", ob)
-            print("Reward: ", reward)
-            if done:
-                print("Done")
-                step = 0
-                env.reset()
-            rate.sleep()
-    except rospy.ROSInterruptException:
-        pass
-    except KeyboardInterrupt:
-        rospy.loginfo('Interrupt received, shutting down.')
-    finally:
-        rospy.loginfo('Shutting down mpc gym node.')
 
 def print_wrappers(env):
     if hasattr(env, 'env'):
@@ -736,112 +651,246 @@ def print_wrappers(env):
     else:
         print(type(env))
 
-
-# def train_sac(args=None):
-#     def signal_handler(sig, frame):
-#         print('Interrupt received, shutting down.')
-#         model.save("sac_mpc")
-#         env.close()
-#         rospy.signal_shutdown('Interrupt received')
-#         exit(0)
-
-#     signal.signal(signal.SIGINT, signal_handler)
-#     signal.signal(signal.SIGTERM, signal_handler)
-
-#     run = wandb.init(project="mpc_residual", entity="adeeb-islam8", sync_tensorboard=True)
-#     # wandb.init(project="mpc_residual", entity="adeeb-islam8", sync_tensorboard=True)
-#     rospy.init_node('mpc_gym_node')
-#     env = gym.make('mpc-gym-v0')
-#     env.reset()
-
-#     print_wrappers(env)
-#     model = SAC('MlpPolicy', env, verbose=2, tensorboard_log=f"./sac_mpc_log/runs/{run.id}")
-#     # model = PPO('MlpPolicy', env, verbose=2, tensorboard_log=f"./sac_mpc_log/runs/{run.id}")
-
-#     # model = SAC('MlpPolicy', env, verbose=2)
-
-#     eval_callback = EvalCallback(env, best_model_save_path='./sac_mpc/models/best_model',
-#                                  log_path='./sac_mpc/eval_logs', eval_freq=5000,
-#                                  deterministic=True, render=False)
-
-#     try:
-#         model.learn(total_timesteps=100000, progress_bar= True, callback=[WandbCallback(), RewardLoggerCallback(), eval_callback], log_interval=1)
-#         # model.learn(total_timesteps=1000, progress_bar=True)
-
-#         model.save("sac_mpc")
-#     except rospy.ROSInterruptException:
-#         pass
-#     except KeyboardInterrupt:
-#         rospy.loginfo('Interrupt received, shutting down.')
-#     finally:
-#         rospy.loginfo('Shutting down mpc gym node.')
-#         env.close()
-#         wandb.finish()
-
-def train_sac(args=None):
-    model = None
-    env = None
-
-    def signal_handler(sig, frame):
-        global shutdown_requested
-        print('Interrupt received, shutting down...')
-        shutdown_requested = True
-        
-        try:
-            if model is not None:
-                print("Saving model...")
-                model.save("with_reverse_sac_mpc")
-                print("Model saved successfully!")
-        except Exception as e:
-            print(f"Could not save model: {e}")
-        
-        try:
-            if env is not None:
-                print("Closing environment...")
-                env.close()
-        except Exception as e:
-            print(f"Could not close environment: {e}")
-        
-        rospy.signal_shutdown('Interrupt received')
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    print("Adeen")
-    # run = wandb.init(project="mpc_residual", entity="adeeb-islam8", sync_tensorboard=True)
-    #wandb.init(project="mpc_residual", entity="adeeb-islam8", sync_tensorboard=True)
-    rospy.init_node('mpc_gym_node')
-    # rospy.spin()
+def evaluate_best_model(model_path, num_episodes=5, completion_threshold=0.97):
+    """
+    Load and evaluate the best model with comprehensive metrics
+    
+    Args:
+        model_path: Path to the saved model
+        num_episodes: Number of episodes to evaluate
+        completion_threshold: Path completion ratio to consider as success (default 0.97 = 97%)
+    """
+    rospy.init_node('mpc_gym_eval_node')
     env = gym.make('mpc-gym-v0')
-    env.reset()
-
-    print_wrappers(env)
-    # model = SAC('MlpPolicy', env, verbose=2, tensorboard_log=f"./sac_mpc_log/runs/{run.id}")
-    # model = SAC.load("./sac_mpc/models/best_model/best_model_sac_0_2_50k.zip", env=env, tensorboard_log=f"./sac_mpc_log/runs/{run.id}")
-
-    # model = PPO('MlpPolicy', env, verbose=2, tensorboard_log=f"./sac_mpc_log/runs/{run.id}")
-
-    model = SAC('MlpPolicy', env, verbose=2)
-
-    eval_callback = EvalCallback(env, best_model_save_path='./sac_mpc/models/best_model_with_reverse',
-                                 log_path='./sac_mpc/eval_logs_with_reverse', eval_freq=5000,
-                                 deterministic=True, render=False)
-
+    
+    print(f"Loading model from: {model_path}")
+    print(f"Completion threshold: {completion_threshold*100:.0f}% of path")
     try:
-        model.learn(total_timesteps=100000, progress_bar= True, callback=[RewardLoggerCallback(), eval_callback], log_interval=1)
-        # model.learn(total_timesteps=5000, progress_bar=True)
+        model = SAC.load(model_path)
+        with open(file_path, "a") as file:
+            file.write("Load model successfully\n")
+        print("Model loaded successfully!")
+    except Exception as e:
+        with open(file_path, "a") as file:
+            file.write(f"Failed to load model: {e}\n")
+        print(f"Failed to load model: {e}")
+        env.close()
+        return
+    
+    # Initialize metrics tracking
+    metrics = {
+        'total_episodes': num_episodes,
+        'successful_completions': 0,
+        'collisions': 0,
+        'lane_invasions': 0,
+        'speed_timeouts': 0,
+        'inside_obstacle': 0,
+        'lap_times': [],
+        'episode_rewards': [],
+        'episode_steps': [],
+        'completion_rates': [],
+        'average_speeds': [],
+        'lane_deviations': [],  # Track average |d| per episode
+        'reverse_usage': [],  # Track how often reverse was used
+        'termination_reasons': []  # Track detailed termination info
+    }
+    
+    # Run evaluation episodes
+    for episode in range(num_episodes):
+        print(f"\n{'='*60}")
+        print(f"EPISODE {episode + 1}/{num_episodes}")
+        print(f"{'='*60}\n")
+        
+        obs, _ = env.reset()
+        done = False
+        episode_reward = 0
+        step = 0
+        
+        # Episode-specific tracking
+        episode_speeds = []
+        episode_lane_devs = []
+        reverse_count = 0
+        
+        while not done and not rospy.is_shutdown():
+            action, _states = model.predict(obs, deterministic=True)
+            # Track reverse usage
+            if action[2] > 0:
+                reverse_count += 1
+            
+            # Take step
+            obs, reward, done, truncated, info = env.step(action)
+            
+            episode_reward += reward
+            step += 1
+            
+            # Track metrics during episode
+            episode_speeds.append(env.unwrapped.current_speed)
+            episode_lane_devs.append(abs(env.unwrapped.current_d))
+            
+            # Print progress every 50 steps
+            if step % 50 == 0:
+                completion_pct = (env.unwrapped.current_s / env.unwrapped.path_length * 100) if env.unwrapped.path_length > 0 else 0
+                with open(file_path, "a") as file:
+                    file.write(f"Step {step}: Reward={reward: .2f}, Progress={completion_pct:.1f}%\n")
+                print(f"Step {step}: Reward={reward:.2f}, "
+                    f"Cumulative={episode_reward:.2f}, "
+                    f"Speed={env.unwrapped.current_speed:.2f} m/s, "
+                    f"Lane Dev={abs(env.unwrapped.current_d):.2f}m, "
+                    f"Progress={completion_pct:.1f}%")
+        
+        # Episode finished - collect metrics
+        completion_reason = info.get('done', 'unknown')
+        
+        # Calculate completion rate (progress along path)
+        completion_rate = (env.unwrapped.current_s / env.unwrapped.path_length) if env.unwrapped.path_length > 0 else 0
+        completion_pct = completion_rate * 100
+        metrics['completion_rates'].append(completion_pct)
+        
+        # Consider episode successful if completed >= threshold of path
+        # This handles both 'path end' termination and near-complete scenarios
+        is_success = completion_rate >= completion_threshold
+        
+        # Update counters based on completion reason
+        if completion_reason == 'collision':
+            metrics['collisions'] += 1
+            metrics['termination_reasons'].append(f"Collision at {completion_pct:.1f}%")
+        elif completion_reason == 'path end' or is_success:
+            metrics['successful_completions'] += 1
+            if 'lap_time' in info:
+                metrics['lap_times'].append(info['lap_time'])
+            metrics['termination_reasons'].append(f"Success at {completion_pct:.1f}%")
+        elif completion_reason == 'speed low':
+            if is_success:
+                metrics['successful_completions'] += 1
+                if 'lap_time' in info:
+                    metrics['lap_times'].append(info['lap_time'])
+                metrics['termination_reasons'].append(f"Success (stalled at {completion_pct:.1f}%)")
+            else:
+                metrics['speed_timeouts'] += 1
+                metrics['termination_reasons'].append(f"Speed timeout at {completion_pct:.1f}%")
+        elif completion_reason == 'inside obs':
+            metrics['inside_obstacle'] += 1
+            metrics['termination_reasons'].append(f"Inside obstacle at {completion_pct:.1f}%")
+        else:
+            metrics['termination_reasons'].append(f"{completion_reason} at {completion_pct:.1f}%")
+        
+        # Track lane invasion (check if it happened during episode)
+        if env.unwrapped.lane_invasion:
+            metrics['lane_invasions'] += 1
+        
+        # Calculate episode statistics
+        metrics['episode_rewards'].append(episode_reward)
+        metrics['episode_steps'].append(step)
+        
+        if len(episode_speeds) > 0:
+            metrics['average_speeds'].append(np.mean(episode_speeds))
+        else:
+            metrics['average_speeds'].append(0.0)
+        
+        if len(episode_lane_devs) > 0:
+            metrics['lane_deviations'].append(np.mean(episode_lane_devs))
+        else:
+            metrics['lane_deviations'].append(0.0)
+        
+        metrics['reverse_usage'].append(reverse_count / max(step, 1))  # Ratio of reverse usage
+        
+        # Episode summary
+        print(f"\n--- Episode {episode + 1} Summary ---")
+        print(f"Total Reward: {episode_reward:.2f}")
+        print(f"Steps: {step}")
+        print(f"Completion Reason: {completion_reason}")
+        print(f"Path Completion: {completion_pct:.1f}%")
+        print(f"Success: {'YES' if is_success else 'NO'}")
+        print(f"Avg Speed: {metrics['average_speeds'][-1]:.2f} m/s")
+        print(f"Avg Lane Deviation: {metrics['lane_deviations'][-1]:.2f} m")
+        print(f"Reverse Usage: {metrics['reverse_usage'][-1]*100:.1f}%")
+        if 'lap_time' in info:
+            print(f"Lap Time: {info['lap_time']:.2f}s")
+        print()
+    
+    env.close()
+    
+    # Calculate and display final statistics
+    print(f"\n{'='*60}")
+    print("EVALUATION SUMMARY")
+    print(f"{'='*60}\n")
+    
+    # Success metrics
+    success_rate = (metrics['successful_completions'] / num_episodes) * 100
+    collision_rate = (metrics['collisions'] / num_episodes) * 100
+    lane_invasion_rate = (metrics['lane_invasions'] / num_episodes) * 100
+    
+    print(f"Total Episodes: {num_episodes}")
+    print(f"Completion Threshold: {completion_threshold*100:.0f}%")
+    print(f"\n--- Completion Statistics ---")
+    print(f"Successful Completions: {metrics['successful_completions']} ({success_rate:.1f}%)")
+    print(f"Collisions: {metrics['collisions']} ({collision_rate:.1f}%)")
+    print(f"Lane Invasions: {metrics['lane_invasions']} ({lane_invasion_rate:.1f}%)")
+    print(f"Speed Timeouts: {metrics['speed_timeouts']}")
+    print(f"Inside Obstacle: {metrics['inside_obstacle']}")
+    
+    print(f"\n--- Termination Details ---")
+    for i, reason in enumerate(metrics['termination_reasons'], 1):
+        print(f"  Episode {i}: {reason}")
+    
+    print(f"\n--- Performance Metrics ---")
+    if len(metrics['lap_times']) > 0:
+        print(f"Average Lap Time: {np.mean(metrics['lap_times']):.2f}s (±{np.std(metrics['lap_times']):.2f}s)")
+        print(f"Best Lap Time: {np.min(metrics['lap_times']):.2f}s")
+    else:
+        print(f"Average Lap Time: N/A (no successful completions)")
+    
+    print(f"Average Reward: {np.mean(metrics['episode_rewards']):.2f} (±{np.std(metrics['episode_rewards']):.2f})")
+    print(f"Average Steps: {np.mean(metrics['episode_steps']):.1f} (±{np.std(metrics['episode_steps']):.1f})")
+    print(f"Average Speed: {np.mean(metrics['average_speeds']):.2f} m/s (±{np.std(metrics['average_speeds']):.2f})")
+    print(f"Average Lane Deviation: {np.mean(metrics['lane_deviations']):.2f}m (±{np.std(metrics['lane_deviations']):.2f})")
+    print(f"Average Completion Rate: {np.mean(metrics['completion_rates']):.1f}%")
+    print(f"Average Reverse Usage: {np.mean(metrics['reverse_usage'])*100:.1f}%")
+    
+    # Calculate driving score (0-100)
+    # Weighted combination of multiple factors
+    driving_score = (
+        success_rate * 0.4 +  # 40% weight on success
+        (100 - collision_rate) * 0.3 +  # 30% weight on safety
+        (100 - lane_invasion_rate) * 0.15 +  # 15% weight on lane keeping
+        min(np.mean(metrics['completion_rates']), 100) * 0.15  # 15% weight on progress
+    )
+    
+    print(f"\n--- Overall Driving Score ---")
+    print(f"Driving Score: {driving_score:.1f}/100")
+    
+    # Save metrics to file
+    metrics_file = model_path.replace('.zip', '_evaluation_metrics.txt')
+    with open(metrics_file, 'w') as f:
+        f.write(f"Evaluation Metrics for {model_path}\n")
+        f.write(f"{'='*60}\n\n")
+        f.write(f"Total Episodes: {num_episodes}\n")
+        f.write(f"Completion Threshold: {completion_threshold*100:.0f}%\n\n")
+        f.write(f"Completion Statistics:\n")
+        f.write(f"  Successful Completions: {metrics['successful_completions']} ({success_rate:.1f}%)\n")
+        f.write(f"  Collisions: {metrics['collisions']} ({collision_rate:.1f}%)\n")
+        f.write(f"  Lane Invasions: {metrics['lane_invasions']} ({lane_invasion_rate:.1f}%)\n")
+        f.write(f"  Speed Timeouts: {metrics['speed_timeouts']}\n")
+        f.write(f"  Inside Obstacle: {metrics['inside_obstacle']}\n\n")
+        f.write(f"Termination Details:\n")
+        for i, reason in enumerate(metrics['termination_reasons'], 1):
+            f.write(f"  Episode {i}: {reason}\n")
+        f.write(f"\nPerformance Metrics:\n")
+        if len(metrics['lap_times']) > 0:
+            f.write(f"  Average Lap Time: {np.mean(metrics['lap_times']):.2f}s (±{np.std(metrics['lap_times']):.2f}s)\n")
+            f.write(f"  Best Lap Time: {np.min(metrics['lap_times']):.2f}s\n")
+        f.write(f"  Average Reward: {np.mean(metrics['episode_rewards']):.2f} (±{np.std(metrics['episode_rewards']):.2f})\n")
+        f.write(f"  Average Steps: {np.mean(metrics['episode_steps']):.1f} (±{np.std(metrics['episode_steps']):.1f})\n")
+        f.write(f"  Average Speed: {np.mean(metrics['average_speeds']):.2f} m/s\n")
+        f.write(f"  Average Lane Deviation: {np.mean(metrics['lane_deviations']):.2f}m\n")
+        f.write(f"  Average Completion Rate: {np.mean(metrics['completion_rates']):.1f}%\n")
+        f.write(f"  Average Reverse Usage: {np.mean(metrics['reverse_usage'])*100:.1f}%\n\n")
+        f.write(f"Overall Driving Score: {driving_score:.1f}/100\n")
+    
+    print(f"\nMetrics saved to: {metrics_file}")
+    print("Evaluation complete!")
+    
+    return metrics
 
-        model.save("with_reverse_sac_mpc")
-    except rospy.ROSInterruptException:
-        pass
-    except KeyboardInterrupt:
-        rospy.loginfo('Interrupt received, shutting down.')
-    finally:
-        rospy.loginfo('Shutting down mpc gym node.')
-        if env is not None:
-            env.close()
-        rospy.signal_shutdown('Training ended')
-        #wandb.finish()
 if __name__ == "__main__":
-    # main()
-    train_sac()
+    evaluate_best_model("/home/ave/Desktop/carla_mpc_residual_learning/sac_mpc/models/best_model_with_reverse/best_model.zip", 5)
