@@ -118,7 +118,6 @@ class LocalPlannerMPC(CompatibleNode):
 
         self.throttle_residual = 0
         self.steering_residual = 0
-        self.reverse_residual = 0
         self.emergency_stop_alert = False
 
         self.acados_solver = None
@@ -226,7 +225,6 @@ class LocalPlannerMPC(CompatibleNode):
     def mpc_rl_residual_cb(self, msg):
         self.throttle_residual = msg.data[0]
         self.steering_residual = msg.data[1]
-        self.reverse_residual = msg.data[2]
 
     def obstacle_markers_cb(self, marker_array):
         # with self.data_lock:
@@ -827,12 +825,10 @@ class LocalPlannerMPC(CompatibleNode):
                 print("Steering: ", self.target_delta)
                 print("Throttle residual: ", self.throttle_residual)
                 print("Steering residual: ", self.steering_residual)
-                print("Reverse residual: ", self.reverse_residual)
                 self.target_D = np.clip(self.target_D + self.throttle_residual, -1, 1)
                 normalized_steer = self.target_delta / self.model.delta_max
                 steer = np.clip(normalized_steer + self.steering_residual, -1, 1)
                 self.target_delta = steer * self.model.delta_max
-                reverse = self.reverse_residual > 0
                 ########################################################
 
           
@@ -851,9 +847,7 @@ class LocalPlannerMPC(CompatibleNode):
                 control_msg.throttle = self.target_gas
                 control_msg.brake = self.target_brake
                 control_msg.hand_brake = False
-                control_msg.manual_gear_shift = True
-                control_msg.reverse = reverse
-                control_msg.gear = -1 if reverse else 1 # -1 for gear R, 1 for normal gear
+                control_msg.manual_gear_shift = False
                 # print("Control message: ", control_msg)
                 if self.emergency_stop_alert:
                     self.emergency_stop()
@@ -874,7 +868,7 @@ class LocalPlannerMPC(CompatibleNode):
         control_msg.throttle = 0.0
         control_msg.brake = 0.9
         control_msg.hand_brake = False
-        control_msg.manual_gear_shift = True
+        control_msg.manual_gear_shift = False
         self._control_cmd_publisher.publish(control_msg)
 
 
