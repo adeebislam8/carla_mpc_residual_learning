@@ -48,6 +48,10 @@ PATH_LENGTH = 100.0
 
 shutdown_requested = False
 
+debug_filepath = "/home/ave/Desktop/carla_mpc_residual_learning/debug.txt"
+with open(debug_filepath, "w") as file:
+    file.write('')
+
 def sigint_handler(sig, frame):
     global shutdown_requested
     rospy.loginfo("Shutdown requested via SIGINT...")
@@ -92,16 +96,14 @@ class mpcGym(gym.Env):
         self.map = self.world.get_map()
 
         self.speed_count = 0
-        self.state_dim = 62 # 60+ 2 from reverse (current and prev)
-        self.action_space = spaces.Box(low=np.array([-1.0, -1.0, -1.0]), high=np.array([1.0, 1.0, 1.0]), shape=(3,), dtype=np.float64)
+        self.state_dim = 60
+        self.action_space = spaces.Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), shape=(2,), dtype=np.float64)
         self.observation_space = spaces.Box(
             low=np.ones(self.state_dim) * -np.inf,
             high=np.ones(self.state_dim) * np.inf,
             shape=(self.state_dim,),
             dtype=np.float64)
         print("Action space: ", self.action_space)
-        self.current_reverse = False
-        self.prev_reverse = False
         self.setup_ros()
 
     def setup_ros(self):
@@ -210,16 +212,30 @@ class mpcGym(gym.Env):
                 if shutdown_requested:
                     return
 
-            start_point = self.map.get_spawn_points()[1]
+            # Generate random spawn and goal points (CARLA format)
+            start_point = self.generate_random_spawn_point_carla()
+            goal_point = self.generate_random_goal_point_carla(start_point)
+            
             print("Start point: ", start_point)
-            start_point.location.x = 127.4
-            start_point.location.y = 195.4
-            start_point.location.z = 0.2
-            start_point.rotation.yaw = 180
-            self.clear_spawn_point(carla.Location(x=127.4, y=195.4, z=0.2), radius=5)
-            start_point = carla_common.transforms.carla_transform_to_ros_pose(start_point)
-            spawn_pose = self.carla_spawn_to_ros_pose(start_point)
+            print("Goal point: ", goal_point)
+            
+            self.clear_spawn_point(
+                carla.Location(x=start_point.location.x, y=start_point.location.y, z=start_point.location.z), 
+                radius=10.0
+            )
+            
+            # Convert to ROS format
+            start_point_ros = carla_common.transforms.carla_transform_to_ros_pose(start_point)
+            spawn_pose = self.carla_spawn_to_ros_pose(start_point_ros)
             self.initial_pose_publisher.publish(spawn_pose)
+            
+            rospy.sleep(0.5)  # Wait for spawn to register
+            
+            # Publish goal
+            goal_point_ros = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
+            goal_pose = self.carla_goal_to_ros_pose(goal_point_ros)
+            self.goal_publisher.publish(goal_pose)
+            
             emergency_stop_signal = Int16()
             emergency_stop_signal.data = 0
             self.action_stop_publisher.publish(emergency_stop_signal)
@@ -228,7 +244,12 @@ class mpcGym(gym.Env):
                 return
 
             rospy.loginfo("Resetting the vehicle to a random spawn point and goal point.")
-            rospy.sleep(1)
+            rospy.sleep(1.5)  # Increased for path planning
+            
+        except Exception as e:
+            rospy.logerr(f"Error in reset_vehicle: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             if not shutdown_requested and not rospy.is_shutdown():
                 emergency_stop_signal = Int16()
@@ -236,26 +257,26 @@ class mpcGym(gym.Env):
                 self.action_stop_publisher.publish(emergency_stop_signal)
                 rospy.loginfo("Emergency stop released")
 
-    def distance(self, p1, p2):
-        return np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
-
-    def generate_random_spawn_point(self):
+    def generate_random_spawn_point_carla(self):
+        """Generate random spawn point in CARLA format (preserves orientation)"""
         spawn_points = self.map.get_spawn_points()
         spawn_point = secure_random.choice(spawn_points) if spawn_points else carla.Transform()
-        spawn_point = carla_common.transforms.carla_transform_to_ros_pose(spawn_point)
         return spawn_point
 
-    def generate_random_goal_point(self, random_spawn_point):
+    def generate_random_goal_point_carla(self, random_spawn_point):
+        """Generate random goal point in CARLA format"""
         spawn_points = self.map.get_spawn_points()
         goal_point = secure_random.choice(spawn_points) if spawn_points else carla.Transform()
-        goal_point = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
-
-        while self.distance(random_spawn_point.position, goal_point.position) < PATH_LENGTH:
+        
+        while self.distance_carla(random_spawn_point.location, goal_point.location) < PATH_LENGTH:
             goal_point = secure_random.choice(spawn_points) if spawn_points else carla.Transform()
-            goal_point = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
             rospy.loginfo("Random goal point is too close to the spawn point. Randomizing goal point again.")
-
+        
         return goal_point
+
+    def distance_carla(self, loc1, loc2):
+        """Calculate distance between two CARLA locations"""
+        return np.sqrt((loc1.x - loc2.x)**2 + (loc1.y - loc2.y)**2 + (loc1.z - loc2.z)**2)
 
     def carla_spawn_to_ros_pose(self, carla_pose):
         ros_pose = PoseWithCovarianceStamped()
@@ -426,17 +447,11 @@ class mpcGym(gym.Env):
         if abs(action[1]) > 1:
             reward -= 10
             print("steer penalty")
-        if action[2]: # encourage not to reverse too much
-            reward -= 10
         print("Current s: ", self.current_s)
         print("prev s: ", self.prev_s)
         print("Current d: ", d)
         print("Current speed: ", self.current_speed)
-        progress = self.current_s - self.prev_s
-        if action[2] and progress < 0: # try to add little reward for reverse if needed
-            reward += abs(progress)
-        else:
-            reward += progress * 10
+        reward += (self.current_s - self.prev_s) * 10
 
         # reward for staying in the lane
         if not (d < 3.5 and d > -0.5):
@@ -445,8 +460,11 @@ class mpcGym(gym.Env):
         for obs in self.selected_obstacles:
             if self.distance_to_obs(obs) < DIST2OBSTACLE:
                 reward -= 5
+        
+        alpha_penalty = abs(self.current_alpha)  # radians
+        reward -= alpha_penalty * 5
 
-        if self.current_speed < 1 and not action[2]: #reverse and stall
+        if self.current_speed < 1: # stall
             reward -= 10
 
         if s >= self.path_length - 10:
@@ -535,8 +553,6 @@ class mpcGym(gym.Env):
             # reference_sampled_points.flatten(),
             kappa_points,
             [self.current_step],
-            [float(self.current_reverse)],
-            [float(self.prev_reverse)],
             self.predicted_path_frenet.flatten()
         ], axis=0)
 
@@ -556,8 +572,6 @@ class mpcGym(gym.Env):
         self.ego_state_initialized = False
         self.frenet_pose_initialized = False
         self.inside_obs = False
-        self.current_reverse = False
-        self.prev_reverse = False
         rospy.loginfo("Resetting the observation.")
 
     def step(self, residual):
@@ -567,25 +581,21 @@ class mpcGym(gym.Env):
         # print("Residual: ", residual)
         residual[0] = 0.1 * residual[0]
         residual[1] = 0.1 * residual[1]
-        reverse_gear = residual[2]
         # residual = [0,0]
-        reverse = reverse_gear > 0
         print("Stepping with residual: ", residual)
-        residual_msg = Float32MultiArray(data=[residual[0], residual[1], float(reverse)])
+        residual_msg = Float32MultiArray(data=[residual[0], residual[1]])
         self.action_publisher.publish(residual_msg)
 
         throttle = self.current_observation[4] + residual[0]
         steer = self.current_observation[5] + residual[1]
 
-        rospy.loginfo("Stepped with throttle: {}, steer: {}, reverse: {}".format(throttle, steer, reverse))
+        rospy.loginfo("Stepped with throttle: {}, steer: {}".format(throttle, steer))
         observation = self._get_obs()
-        reward = self._calculate_reward(observation, [throttle, steer, reverse])
+        reward = self._calculate_reward(observation, [throttle, steer])
         print("Reward: ", reward)
         done, info = self.check_done()
         print("Done: ", done)
         print("Info: ", info)
-        self.prev_reverse = self.current_reverse
-        self.current_reverse = reverse
 
         return observation, reward, done, False, info
 
@@ -790,7 +800,7 @@ def train_sac(args=None):
         try:
             if model is not None:
                 print("Saving model...")
-                model.save("with_reverse_sac_mpc")
+                model.save("suboptimal_sac_mpc")
                 print("Model saved successfully!")
         except Exception as e:
             print(f"Could not save model: {e}")
@@ -814,6 +824,7 @@ def train_sac(args=None):
     # rospy.spin()
     env = gym.make('mpc-gym-v0')
     env.reset()
+    #Error before training: local variable 'start_point' referenced before assignment
 
     print_wrappers(env)
     # model = SAC('MlpPolicy', env, verbose=2, tensorboard_log=f"./sac_mpc_log/runs/{run.id}")
@@ -827,15 +838,21 @@ def train_sac(args=None):
                                  log_path='./sac_mpc/eval_logs_with_reverse', eval_freq=5000,
                                  deterministic=True, render=False)
 
+    with open(debug_filepath ,"a") as file:
+        file.write(f"train sac before try\n")
     try:
-        model.learn(total_timesteps=100000, progress_bar= True, callback=[RewardLoggerCallback(), eval_callback], log_interval=1)
-        # model.learn(total_timesteps=5000, progress_bar=True)
-
+        # model.learn(total_timesteps=100000, progress_bar= True, callback=[RewardLoggerCallback(), eval_callback], log_interval=1)
+        with open(debug_filepath ,"a") as file:
+            file.write(f"Start Training\n")
+        model.learn(total_timesteps=5000, progress_bar=True)
         model.save("with_reverse_sac_mpc")
     except rospy.ROSInterruptException:
         pass
     except KeyboardInterrupt:
         rospy.loginfo('Interrupt received, shutting down.')
+    except Exception as e:
+        with open(debug_filepath ,"a") as file:
+                file.write(f"Error from training: {e}\n")
     finally:
         rospy.loginfo('Shutting down mpc gym node.')
         if env is not None:
