@@ -49,6 +49,10 @@ from acados_mpc.acados_settings_mpcc import acados_settings
 from utils.convert_traj_track import parseReference
 from scipy.interpolate import make_interp_spline
 
+debug_filepath = "/home/ave/Desktop/carla_mpc_residual_learning/debug.txt"
+with open(debug_filepath, "w") as file:
+    file.write('')
+
 class Obstacle:
     def __init__(self):
         self.id = -1 # actor id
@@ -147,6 +151,12 @@ class LocalPlannerMPC(CompatibleNode):
             "/carla/markers".format(role_name),
             self.obstacle_markers_cb,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        
+        self._mpc_rl_reinit_subscriber = self.new_subscription(
+            Int16,
+            '/mpc_rl/acados_reinit',
+            self.mpc_rl_reinit_cb,
+            qos_profile=10)
 
         self._world2frenet_service = self.new_client(
             World2FrenetService,
@@ -216,6 +226,15 @@ class LocalPlannerMPC(CompatibleNode):
         # self._vehicle_controller = VehicleMPCController(
         #     self)
 
+    def mpc_rl_reinit_cb(self, msg):
+        """Handle request to reinitialize acados solver"""
+        if msg.data == 1:
+            with self.data_lock:
+                self.loginfo("Received acados reinitialization request")
+                self.acados_solver = None
+                self.path_initialized = False
+                self.loginfo("Acados solver set to None for reinitialization")
+
     def mpc_rl_emergency_stop_cb(self, msg):
         if msg.data == 1:
             self.emergency_stop_alert = True
@@ -227,88 +246,53 @@ class LocalPlannerMPC(CompatibleNode):
         self.steering_residual = msg.data[1]
 
     def obstacle_markers_cb(self, marker_array):
-        # with self.data_lock:
-        # self._obstacles = []
-        # print("obstacles reset")
-        # self.objects_frenet_points = np.ones((6, 2), dtype=np.float32) * -100
-
-        # self._selected_obstacle_publisher.publish(self._selected_obstacles)
-        # selected_obstacles = MarkerArray()
         selected_obstacles = []
 
         for marker in marker_array.markers:
             if marker.color.r == 255.0:
-
-                # ob = Obstacle()
                 frenet_pose = self._get_frenet_pose(marker.pose)
                 distance = frenet_pose.s - self.s
-                # print("Distance: ", distance)   
-                # distance = math.sqrt((self.s - frenet_pose.s) ** 2 + (self.n - frenet_pose.d) ** 2)  
+                
                 if distance < self.obs_range and distance > -5:
-                    if abs(frenet_pose.d) < 4.5:                    
-                        # self.loginfo("Frenet pose in obstacle_markers_cb: {}".format(frenet_pose))
-                        # ob.id = marker.id
-                        # ob.frenet_s = frenet_pose.s
-                        # ob.frenet_d = frenet_pose.d
-                        # ob.ros_transform = marker.pose
-                        # ob.scale_x = marker.scale.x
-                        # ob.scale_y = marker.scale.y
-                        # ob.scale_z = marker.scale.z
-                        # self._obstacles.append(ob)
-                        obs_marker = marker
-                        obs_marker.color.r = 0.0
-                        obs_marker.color.g = 255.0
-                        obs_marker.color.b = 0.0
-                        obs_marker.color.a = 1.0
-                        obs_marker.scale.x = marker.scale.x 
-                        obs_marker.scale.y = marker.scale.y
-                        obs_marker.scale.z = marker.scale.z
-                        obs_marker.lifetime = rospy.Duration(0.1)
-                        # selected_obstacles.markers.append(obs_marker)
-                        selected_obstacles.append([obs_marker, frenet_pose.s, frenet_pose.d])
+                    # STRICTER FILTERING: Only consider obstacles within reasonable lane width
+                    # Typical lane width is 3.5m, so obstacles at edges (±1.75m) are likely road furniture
+                    if abs(frenet_pose.d) < 3.0:  # Changed from 4.5 to 3.0
+                        
+                        # ADDITIONAL CHECK: Filter out obstacles that are exactly on lane boundaries
+                        # (these distances like 0.6869m, 0.9331m are often curbs/lane markers)
+                        relative_d = abs(frenet_pose.d - self.n)
+                        
+                        # Skip if obstacle is likely a road boundary marker
+                        # (very consistent distance that suggests static infrastructure)
+                        if relative_d > 0.3:  # Only consider obstacles offset from current position
+                            obs_marker = marker
+                            obs_marker.color.r = 0.0
+                            obs_marker.color.g = 255.0
+                            obs_marker.color.b = 0.0
+                            obs_marker.color.a = 1.0
+                            obs_marker.scale.x = marker.scale.x 
+                            obs_marker.scale.y = marker.scale.y
+                            obs_marker.scale.z = marker.scale.z
+                            obs_marker.lifetime = rospy.Duration(0.1)
+                            selected_obstacles.append([obs_marker, frenet_pose.s, frenet_pose.d])
 
-        # self._obstacles = sorted(self._obstacles, key=lambda x: x.frenet_s)
-        
         sorted_obstacles = MarkerArray()
         sorted_list = sorted(selected_obstacles, key=lambda x: x[1])
         for i, obs in enumerate(sorted_list):
             obs_marker = obs[0]
             obs_marker.id = i
             sorted_obstacles.markers.append(obs_marker)
-            # ob = Obstacle()
-            # ob.id = obs_marker.id
-            # ob.frenet_s = obs[1]
-            # ob.frenet_d = obs[2]
-            # ob.ros_transform = obs_marker.pose
-            # ob.scale_x = obs_marker.scale.x
-            # ob.scale_y = obs_marker.scale.y
-            # ob.scale_z = obs_marker.scale.z
-            # self._obstacles.append(ob)
 
-        # self._obstacles = self._obstacles[:6]
-        # print("self._obstacles: ", self._obstacles)
-
-        # self.loginfo("No of Obstacles: {}".format(len(self._obstacles)))
-        # if self._obstacles:
-            # self.loginfo("Obstacles s: {}\n obs d: {}".format(self._obstacles[0].frenet_s, self._obstacles[0].frenet_d))
-        # self.loginfo("cuurent s: {}\n current d: {}".format(self.s, self.n))
-        # self.loginfo("No of Selected Obstacles: {}".format(len(selected_obstacles)))
-        # self.loginfo("No of Sorted Obstacles: {}".format(len(sorted_obstacles.markers)))
+        # Only publish up to 3 obstacles
         self._selected_obstacle_publisher.publish(sorted_obstacles.markers[:3])
+        
+        # CRITICAL: Reset ALL obstacle points first
+        self.objects_frenet_points = np.ones((6, 2), dtype=np.float32) * -100
+        
+        # Then fill in valid obstacles
         for i, obs in enumerate(sorted_obstacles.markers[:3]):
-            # ob = Obstacle()
-            # ob.id = obs.id
             frenet_pose = self._get_frenet_pose(obs.pose)
             self.objects_frenet_points[i] = np.array([frenet_pose.s, frenet_pose.d], dtype=np.float32)
-            # ob.frenet_s = frenet_pose.s
-            # ob.frenet_d = frenet_pose.d
-            # ob.ros_transform = obs.pose
-            # ob.scale_x = obs.scale.x
-            # ob.scale_y = obs.scale.y
-            # ob.scale_z = obs.scale.z
-            # self._obstacles.append(ob)
-        # self.loginfo("No of Obstacles: {}".format(len(self._obstacles)))
-        # self.loginfo("Objects frenet points CB: {}".format(self.objects_frenet_points))
     def odometry_cb(self, odometry_msg):
         # self.loginfo("Received odometry message")
         with self.data_lock:
@@ -420,8 +404,8 @@ class LocalPlannerMPC(CompatibleNode):
             kappa_spline = make_interp_spline(dense_s, kappa, k=3)
             self.spline_coeffs = kappa_spline.c
             self.spline_knots = kappa_spline.t
-            self.loginfo("Spline coefficients: {}".format(self.spline_coeffs))
-            self.loginfo("Spline knots: {}".format(self.spline_knots))
+            #self.loginfo("Spline coefficients: {}".format(self.spline_coeffs))
+            #self.loginfo("Spline knots: {}".format(self.spline_knots))
             self.path_initialized = True
             self._global_path_length = dense_s[-1]
 
@@ -577,6 +561,82 @@ class LocalPlannerMPC(CompatibleNode):
         # Only get the state as solution of where the car will be in t_delay seconds
         return np.array(solution[:7])
     
+    def diagnose_constraints(self, stage, file_handle):
+        """Diagnose which constraints are violated at a given stage"""
+        try:
+            x = self.acados_solver.get(stage, "x")
+            
+            file_handle.write(f"========== CONSTRAINT DIAGNOSTICS FOR STAGE {stage} ==========\n")
+            
+            # State values
+            if x is not None and len(x) >= 7:
+                s, n, alpha, v, D, delta, theta = x
+                file_handle.write(f"State x[{stage}]: s={s:.4f}, n={n:.4f}, alpha={alpha:.4f}, v={v:.4f}, D={D:.4f}, delta={delta:.4f}, theta={theta:.4f}\n")
+                
+                # Check state bounds
+                file_handle.write("--- State Bounds ---\n")
+                if self.model is not None:
+                    if self.model.n_min is not None and self.model.n_max is not None:
+                        file_handle.write(f"n: {n:.4f} [min={self.model.n_min:.4f}, max={self.model.n_max:.4f}] {'✗ VIOLATED' if n < self.model.n_min or n > self.model.n_max else '✓'}\n")
+                    
+                    if self.model.v_min is not None and self.model.v_max is not None:
+                        file_handle.write(f"v: {v:.4f} [min={self.model.v_min:.4f}, max={self.model.v_max:.4f}] {'✗ VIOLATED' if v < self.model.v_min or v > self.model.v_max else '✓'}\n")
+                    
+                    if self.model.throttle_min is not None and self.model.throttle_max is not None:
+                        file_handle.write(f"D: {D:.4f} [min={self.model.throttle_min:.4f}, max={self.model.throttle_max:.4f}] {'✗ VIOLATED' if D < self.model.throttle_min or D > self.model.throttle_max else '✓'}\n")
+                    
+                    if self.model.delta_min is not None and self.model.delta_max is not None:
+                        file_handle.write(f"delta: {delta:.4f} [min={self.model.delta_min:.4f}, max={self.model.delta_max:.4f}] {'✗ VIOLATED' if delta < self.model.delta_min or delta > self.model.delta_max else '✓'}\n")
+                
+                # Check obstacle distances
+                file_handle.write("--- Obstacle Information ---\n")
+                file_handle.write(f"Current position: s={s:.4f}, n={n:.4f}\n")
+                
+                valid_obs_count = 0
+                if hasattr(self, 'objects_frenet_points') and self.objects_frenet_points is not None:
+                    for i, obs in enumerate(self.objects_frenet_points):
+                        # CRITICAL: Only check valid obstacles
+                        if obs is not None and len(obs) >= 2 and obs[0] is not None and obs[1] is not None:
+                            if obs[0] > -50 and obs[1] > -50:
+                                dist_s = obs[0] - s
+                                dist_n = obs[1] - n
+                                dist = np.sqrt(dist_s**2 + dist_n**2)
+                                file_handle.write(f"Obstacle {i} [VALID]: s={obs[0]:.4f}, n={obs[1]:.4f}, dist={dist:.4f}\n")
+                                valid_obs_count += 1
+                            else:
+                                file_handle.write(f"Obstacle {i} [INVALID]: s={obs[0]:.4f}, n={obs[1]:.4f} (skipped)\n")
+                
+                file_handle.write(f"Total valid obstacles: {valid_obs_count}\n")
+            else:
+                file_handle.write("ERROR: Could not retrieve state x\n")
+            
+            file_handle.write("=" * 60 + "\n")
+            
+        except Exception as e:
+            file_handle.write(f"ERROR in diagnose_constraints: {e}\n")
+            import traceback
+            traceback.print_exc(file=file_handle)
+
+    def check_path_association(self, pose):
+        """Check if current pose can be properly associated with the path"""
+        try:
+            frenet_pose = self._get_frenet_pose(pose)
+            
+            # Check if the Frenet conversion seems reasonable
+            if frenet_pose is None:
+                return False, "Frenet pose is None"
+            
+            if abs(frenet_pose.d) > 50.0:  # More than 50m from path
+                return False, f"Vehicle too far from path: d={frenet_pose.d:.2f}m"
+            
+            if frenet_pose.s < 0 or (self._global_path_length is not None and frenet_pose.s > self._global_path_length + 10):
+                return False, f"s={frenet_pose.s:.2f} outside path bounds [0, {self._global_path_length}]"
+            
+            return True, "OK"
+            
+        except Exception as e:
+            return False, f"Exception: {e}"
+
     def run_step(self):
         """
         Sets up the OCP problem in acados and solves it
@@ -690,7 +750,7 @@ class LocalPlannerMPC(CompatibleNode):
                 self.acados_solver.constraints_set(i, "lh", np.array([
                     self.constraint.along_min,
                     self.constraint.alat_min,
-                    self.model.n_min,
+                    self.model.n_min - 0.2,
                     self.model.v_min,
                     self.model.throttle_min,
                     self.model.delta_min,
@@ -704,10 +764,10 @@ class LocalPlannerMPC(CompatibleNode):
                 self.acados_solver.constraints_set(i, "uh", np.array([
                     self.constraint.along_max,
                     self.constraint.alat_max,
-                    self.model.n_max,
+                    self.model.n_max + 0.2,
                     self.model.v_max,
                     self.model.throttle_max,
-                    self.model.delta_max,
+                    self.model.delta_max + 1e-3,
                     self.constraint.dist_obs1_max,
                     self.constraint.dist_obs2_max,
                     self.constraint.dist_obs3_max,
@@ -744,6 +804,35 @@ class LocalPlannerMPC(CompatibleNode):
             #     self.initailize = True
             
             # solve ocp
+            # Check if obstacles are too close
+            for i, obs in enumerate(self.objects_frenet_points):
+                if obs[0] > -50:
+                    dist = np.sqrt((s - obs[0])**2 + (n - obs[1])**2)
+                    if dist < 1.0:
+                        with open(debug_filepath, "a") as file:
+                            file.write(f"⚠️  WARNING: Obstacle {i} very close! dist={dist:.4f}m\n")
+
+            # Check if initial state is valid
+            if n < self.model.n_min - 0.2 or n > self.model.n_max + 0.2:
+                with open(debug_filepath, "a") as file:
+                    file.write(f"⚠️  WARNING: Initial n={n:.4f} outside bounds [{self.model.n_min}, {self.model.n_max}]\n")
+
+            if v < self.model.v_min or v > self.model.v_max:
+                with open(debug_filepath, "a") as file:
+                    file.write(f"⚠️  WARNING: Initial v={v:.4f} outside bounds [{self.model.v_min}, {self.model.v_max}]\n")
+
+            if abs(delta) > self.model.delta_max + 1e-3:
+                with open(debug_filepath, "a") as file:
+                    file.write(f"⚠️  WARNING: Initial delta={delta:.4f} exceeds max {self.model.delta_max}\n")
+
+            self.loginfo("=" * 40)
+            is_valid, reason = self.check_path_association(self._current_pose)
+            if not is_valid:
+                rospy.logerr(f"Path association failed: {reason}")
+                with open(debug_filepath, "a") as f:
+                    f.write(f"[{rospy.get_time()}] Path association failed: {reason}\n")
+                self.emergency_stop()
+                return
             status = self.acados_solver.solve()
             if status != 0:
                 self.loginfo("acados returned status {}".format(status))
@@ -751,14 +840,22 @@ class LocalPlannerMPC(CompatibleNode):
                     self.loginfo("solver failed")
                     self.emergency_stop()
                     self.loginfo("Emergency stop")
+                    with open(debug_filepath, "a") as file:
+                        file.write("solver failed\n")
                     return
                 elif status == 2:
                     self.loginfo("Max number of iterations reached")
+                    with open(debug_filepath, "a") as file:
+                        file.write("Max number of iterations\n")
                 elif status == 3:
                     self.loginfo("Minimum step size reached")
+                    with open(debug_filepath, "a") as file:
+                        file.write("Min num of iter reached\n")
                 elif status == 4:
                     self.loginfo("QP solver failed")
                     # self.emergency_stop()
+                    with open(debug_filepath, "a") as file:
+                        file.write("QP solver Error\n")
                     self.emergency_stop()
 
                     self.loginfo("Emergency stop")
@@ -894,6 +991,9 @@ def main(args=None):
 
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        with open(debug_filepath, "a") as file:
+            file.write(f"Error local planner: {e}\n")
 
     finally:
         roscomp.loginfo('Local planner shutting down.')

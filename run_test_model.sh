@@ -22,7 +22,7 @@ LAUNCH_PID=$!
 
 sleep 2
 
-python ${PWD}/carla/PythonAPI/examples/generate_traffic.py --asynch --filterv vehicle.toyota* -s 1 -w 0 -n 0 &
+python ${PWD}/carla/PythonAPI/examples/generate_traffic.py --asynch --filterv vehicle.toyota* -s 1 -w 0 -n 40 &
 TRAFFIC_PID=$!
 
 sleep 2

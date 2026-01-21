@@ -54,8 +54,8 @@ def sigint_handler(sig, frame):
 
 signal.signal(signal.SIGINT, sigint_handler)
 
-file_path = "/home/ave/Desktop/carla_mpc_residual_learning/debug.txt"
-with open(file_path, "w") as file:
+debug_filepath = "/home/ave/Desktop/carla_mpc_residual_learning/debug.txt"
+with open(debug_filepath, "w") as file:
     file.write("")
 
 class mpcGym(gym.Env):
@@ -74,7 +74,7 @@ class mpcGym(gym.Env):
         self.collision = False
         self.lane_invasion = False
         self.mpc_control_initialized = False
-        self.selected_obstacles_initialized = False
+        self.selected_obstacles = np.ones((self.num_of_obs, 2)) * -100
         self.predicted_path_initialized = False
         self.ego_state_initialized = False
         self.frenet_pose_initialized = False
@@ -91,6 +91,9 @@ class mpcGym(gym.Env):
         self.client.set_timeout(10.0)
         self.world = self.client.get_world()
         self.map = self.world.get_map()
+        self.path_sequence_id = 0  # Track path updates
+        self.expected_path_sequence_id = 0  # What we're waiting for
+        self.waiting_for_new_path = False
 
         self.speed_count = 0
         self.state_dim = 60
@@ -127,6 +130,7 @@ class mpcGym(gym.Env):
         self.action_stop_publisher = rospy.Publisher('/mpc_rl/emergency_stop', Int16, queue_size=1)
         self.goal_publisher = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=1)
         self.initial_pose_publisher = rospy.Publisher('/initialpose', PoseWithCovarianceStamped, queue_size=1)
+        self.acados_reinit_publisher = rospy.Publisher('/mpc_rl/acados_reinit', Int16, queue_size=1) # for acados initialization after every reset
 
         self.world2frenet_service = rospy.ServiceProxy('/world2frenet', World2FrenetService)
         self.frenet2world_service = rospy.ServiceProxy('/frenet2world', Frenet2WorldService)
@@ -137,6 +141,8 @@ class mpcGym(gym.Env):
         rospy.loginfo("Initialized the MPC Gym environment.")
         print("Initialized the MPC Gym environment.")
         ob, _ = self.reset()
+        with open(debug_filepath, "a") as file:
+            file.write("Reset initialization\n")
         print("Observation_reset initialized: ", ob)
 
     def acados_init_callback(self, msg):
@@ -147,9 +153,60 @@ class mpcGym(gym.Env):
         control_msg = Int16()
         control_msg.data = 1
         self.action_stop_publisher.publish(control_msg)
+    
+    def is_spawn_valid(self, spawn_location, radius=10.0):
+        """Check if spawn location is safe and valid"""
+        try:
+            # Wait for frenet pose to be available
+            rospy.sleep(0.8)  # Increased wait time
+            
+            # Check if vehicle is within lane boundaries
+            if self.frenet_pose_initialized and self.current_d is not None and self.current_s is not None:
+                # CRITICAL: Reject if extremely far from centerline
+                if abs(self.current_d) > 10.0:
+                    rospy.logerr(f"Spawn REJECTED: Vehicle way off path (d={self.current_d:.2f}m)")
+                    with open(debug_filepath, "a") as f:
+                        f.write(f"Spawn rejected: d={self.current_d:.2f}, likely wrong path\n")
+                    return False
+                
+                # Warning for minor violations (but allow if < 1m)
+                if self.current_d < self.nmin - 1.0 or self.current_d > self.nmax + 1.0:
+                    rospy.logwarn(f"Spawn invalid: Vehicle significantly outside lane bounds (d={self.current_d:.2f})")
+                    return False
+                
+                # Allow small violations (vehicle might be painted on lane edge)
+                if self.current_d < self.nmin or self.current_d > self.nmax:
+                    rospy.logwarn(f"Spawn marginal: Vehicle slightly outside bounds (d={self.current_d:.2f}), allowing...")
+                    # Don't reject, just log
+            else:
+                rospy.logwarn("Frenet pose not yet initialized, cannot validate spawn")
+                return False
+            
+            # Check for very close obstacles (only if obstacle system is ready)
+            if self.selected_obstacles_initialized and hasattr(self, 'selected_obstacles'):
+                close_obstacle_count = 0
+                for obs in self.selected_obstacles:
+                    if obs is not None and len(obs) >= 2 and obs[0] is not None and obs[1] is not None:
+                        if obs[0] > -50:  # Valid obstacle
+                            dist = np.sqrt((self.current_s - obs[0])**2 + (self.current_d - obs[1])**2)
+                            if dist < 1.5:  # Changed from 2.0 to 1.5
+                                close_obstacle_count += 1
+                
+                # Only reject if multiple close obstacles (single one might be static)
+                if close_obstacle_count >= 2:
+                    rospy.logwarn(f"Spawn invalid: {close_obstacle_count} obstacles too close")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            rospy.logerr(f"Error checking spawn validity: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def clear_spawn_point(self, spawn_location, radius=5.0):
-        """Remove vehicles from spawn and optionally relocate them"""
+        """Remove vehicles from spawn and check for static obstacles"""
         try:
             all_vehicles = self.world.get_actors().filter('vehicle.*')
             spawn_points = self.map.get_spawn_points()
@@ -181,9 +238,36 @@ class mpcGym(gym.Env):
                 rospy.sleep(0.3)
                 rospy.loginfo(f"Cleared {cleared_count} vehicles from spawn area")
             
+            # Check for static obstacles near spawn point
+            if self.check_static_obstacles_near_spawn(spawn_location, radius):
+                rospy.logwarn(f"Static obstacles detected near spawn point, retrying...")
+                return False
+            
             return True
         except Exception as e:
             rospy.logerr(f"Failed to clear spawn point: {e}")
+            return False
+
+    def check_static_obstacles_near_spawn(self, spawn_location, radius=5.0):
+        """Check if there are static obstacles (poles, walls, etc.) near spawn"""
+        try:
+            # Get all static objects in the world
+            static_objects = self.world.get_actors().filter('static.*')
+            
+            for obj in static_objects:
+                obj_loc = obj.get_location()
+                distance = np.sqrt(
+                    (obj_loc.x - spawn_location.x)**2 + 
+                    (obj_loc.y - spawn_location.y)**2
+                )
+                
+                if distance < radius:
+                    rospy.logwarn(f"Static obstacle '{obj.type_id}' at distance {distance:.2f}m from spawn")
+                    return True
+            
+            return False
+        except Exception as e:
+            rospy.logerr(f"Error checking static obstacles: {e}")
             return False
 
     def _distance_2d(self, loc1, loc2):
@@ -196,6 +280,8 @@ class mpcGym(gym.Env):
             start_time = time.time()
             timeout = 10
             self.emergency_stop()
+            with open(debug_filepath, "a") as file:
+                file.write("Vehicle stop for resetting vehicle\n")
 
             while abs(speed) > 0.5 and not shutdown_requested:
                 if time.time() - start_time > timeout:
@@ -203,45 +289,93 @@ class mpcGym(gym.Env):
                     break
                 
                 self.emergency_stop()
+                with open(debug_filepath, "a") as file:
+                    file.write("Vehicle stop for waiting too long resetting vehicle\n")
                 print("reset_veh emer_stop")
                 speed = self.current_ego_state_info[0]
                 rospy.sleep(0.5)
                 if shutdown_requested:
                     return
 
-            # Generate random spawn and goal points (CARLA format)
-            start_point = self.generate_random_spawn_point_carla()
-            goal_point = self.generate_random_goal_point_carla(start_point)
+            # Try up to 10 times to find a good spawn point
+            max_spawn_attempts = 10
+            spawn_success = False
             
-            print("Start point: ", start_point)
-            print("Goal point: ", goal_point)
+            for attempt in range(max_spawn_attempts):
+                start_point = self.generate_random_spawn_point_carla()
+                goal_point = self.generate_random_goal_point_carla(start_point)
+                
+                print(f"Spawn attempt {attempt + 1}/{max_spawn_attempts}")
+                
+                if not self.clear_spawn_point(
+                    carla.Location(x=start_point.location.x, y=start_point.location.y, z=start_point.location.z), 
+                    radius=10.0
+                ):
+                    rospy.logwarn(f"Clear spawn failed, retrying...")
+                    continue
+                
+                # REQUEST ACADOS REINITIALIZATION (moved earlier)
+                reinit_msg = Int16()
+                reinit_msg.data = 1
+                self.acados_reinit_publisher.publish(reinit_msg)
+                rospy.loginfo("Requested acados reinitialization")
+                
+                # CRITICAL: Mark that we're waiting for a new path
+                with self.data_lock:
+                    self.expected_path_sequence_id = self.path_sequence_id + 1
+                    self.waiting_for_new_path = True
+                    self.ref_path_initialized = False  # Invalidate old path
+                
+                rospy.loginfo(f"Waiting for new path (expecting #{self.expected_path_sequence_id})...")
+                
+                # Spawn vehicle
+                start_point_ros = carla_common.transforms.carla_transform_to_ros_pose(start_point)
+                spawn_pose = self.carla_spawn_to_ros_pose(start_point_ros)
+                self.initial_pose_publisher.publish(spawn_pose)
+                
+                rospy.sleep(0.3)  # Let spawn register
+                
+                # Publish goal
+                goal_point_ros = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
+                goal_pose = self.carla_goal_to_ros_pose(goal_point_ros)
+                self.goal_publisher.publish(goal_pose)
+                
+                rospy.loginfo("Published new goal, waiting for global planner to compute path...")
+                
+                # CRITICAL: Wait for new path to be computed
+                path_wait_start = time.time()
+                path_timeout = 5.0
+                
+                while self.waiting_for_new_path and not shutdown_requested:
+                    if time.time() - path_wait_start > path_timeout:
+                        rospy.logwarn("Timeout waiting for new path from global planner")
+                        break
+                    
+                    rospy.loginfo(f"Waiting for path... (current: #{self.path_sequence_id}, expecting: #{self.expected_path_sequence_id})")
+                    rospy.sleep(0.2)
+                
+                if self.waiting_for_new_path:
+                    continue
+                
+                # Additional wait for systems to stabilize
+                rospy.sleep(0.5)
+                
+                # CHECK IF SPAWN IS VALID
+                if self.is_spawn_valid(start_point.location):
+                    spawn_success = True
+                    break
             
-            self.clear_spawn_point(
-                carla.Location(x=start_point.location.x, y=start_point.location.y, z=start_point.location.z), 
-                radius=10.0
-            )
+            if not spawn_success:
+                with open(debug_filepath, "a") as f:
+                    f.write(f"[{rospy.get_time()}] CRITICAL: Failed to find valid spawn after {max_spawn_attempts} attempts\n")
+                return
             
-            # Convert to ROS format
-            start_point_ros = carla_common.transforms.carla_transform_to_ros_pose(start_point)
-            spawn_pose = self.carla_spawn_to_ros_pose(start_point_ros)
-            self.initial_pose_publisher.publish(spawn_pose)
-            
-            rospy.sleep(0.5)  # Wait for spawn to register
-            
-            # Publish goal
-            goal_point_ros = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
-            goal_pose = self.carla_goal_to_ros_pose(goal_point_ros)
-            self.goal_publisher.publish(goal_pose)
-            
+            # Release emergency stop
             emergency_stop_signal = Int16()
             emergency_stop_signal.data = 0
             self.action_stop_publisher.publish(emergency_stop_signal)
-
-            if rospy.is_shutdown():
-                return
-
-            rospy.loginfo("Resetting the vehicle to a random spawn point and goal point.")
-            rospy.sleep(1.5)  # Increased for path planning
+            
+            rospy.sleep(0.3)
             
         except Exception as e:
             rospy.logerr(f"Error in reset_vehicle: {e}")
@@ -254,26 +388,26 @@ class mpcGym(gym.Env):
                 self.action_stop_publisher.publish(emergency_stop_signal)
                 rospy.loginfo("Emergency stop released")
 
-    def distance(self, p1, p2):
-        return np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
-
-    def generate_random_spawn_point(self):
+    def generate_random_spawn_point_carla(self):
+        """Generate random spawn point in CARLA format (preserves orientation)"""
         spawn_points = self.map.get_spawn_points()
         spawn_point = secure_random.choice(spawn_points) if spawn_points else carla.Transform()
-        spawn_point = carla_common.transforms.carla_transform_to_ros_pose(spawn_point)
         return spawn_point
 
-    def generate_random_goal_point(self, random_spawn_point):
+    def generate_random_goal_point_carla(self, random_spawn_point):
+        """Generate random goal point in CARLA format"""
         spawn_points = self.map.get_spawn_points()
         goal_point = secure_random.choice(spawn_points) if spawn_points else carla.Transform()
-        goal_point = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
-
-        while self.distance(random_spawn_point.position, goal_point.position) < PATH_LENGTH:
+        
+        while self.distance_carla(random_spawn_point.location, goal_point.location) < PATH_LENGTH:
             goal_point = secure_random.choice(spawn_points) if spawn_points else carla.Transform()
-            goal_point = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
             rospy.loginfo("Random goal point is too close to the spawn point. Randomizing goal point again.")
-
+        
         return goal_point
+
+    def distance_carla(self, loc1, loc2):
+        """Calculate distance between two CARLA locations"""
+        return np.sqrt((loc1.x - loc2.x)**2 + (loc1.y - loc2.y)**2 + (loc1.z - loc2.z)**2)
 
     def carla_spawn_to_ros_pose(self, carla_pose):
         ros_pose = PoseWithCovarianceStamped()
@@ -345,11 +479,21 @@ class mpcGym(gym.Env):
 
     def selected_obstacles_callback(self, msg):
         with self.data_lock:
-            self.selected_obstacles = np.ones((self.num_of_obs, 2)) * -1000
+            # Initialize with invalid values
+            self.selected_obstacles = np.ones((self.num_of_obs, 2)) * -100
+            
             for i, marker in enumerate(msg.markers):
-                obstacle_frene_pose = self._get_frenet_pose(marker.pose)
-                # print("Obstacle frenet pose: ", obstacle_frene_pose)
-                self.selected_obstacles[i] = [obstacle_frene_pose.s, obstacle_frene_pose.d]
+                if i >= self.num_of_obs:
+                    break
+                
+                try:
+                    obstacle_frenet_pose = self._get_frenet_pose(marker.pose)
+                    if obstacle_frenet_pose is not None:
+                        self.selected_obstacles[i] = [obstacle_frenet_pose.s, obstacle_frenet_pose.d]
+                except Exception as e:
+                    rospy.logerr(f"Error processing obstacle {i}: {e}")
+                    continue
+            
             self.selected_obstacles_initialized = True
 
     def predicted_path_callback(self, path_msg):
@@ -368,16 +512,26 @@ class mpcGym(gym.Env):
     def reference_path_callback(self, path_msg):
         with self.data_lock:
             rospy.loginfo("Initializing reference path.")
+            
+            # Increment path sequence on each new path
+            self.path_sequence_id += 1
+            rospy.loginfo(f"Received path #{self.path_sequence_id}")
+            
             path_msg.poses = path_msg.poses[::5]
             self.x_ref_spline, self.y_ref_spline, self.path_length, dense_s, _, kappa = parseReference(path_msg)
             if self.x_ref_spline is None or self.y_ref_spline is None or self.path_length is None or dense_s is None or kappa is None:
                 rospy.loginfo("Failed to parse the reference path.")
-                self.reset()
                 return
+            
             print("Path length: ", self.path_length, "Dense_s: ", dense_s[-1])
             self.kappa_spline = make_interp_spline(dense_s, kappa, k=3)
             rospy.loginfo("Reference path initialized.")
             self.ref_path_initialized = True
+            
+            # Signal that we're no longer waiting if this is the expected path
+            if self.waiting_for_new_path and self.path_sequence_id >= self.expected_path_sequence_id:
+                self.waiting_for_new_path = False
+                rospy.loginfo(f"✓ Received expected path #{self.path_sequence_id}")
 
     def collision_callback(self, msg):
         with self.data_lock:
@@ -407,8 +561,7 @@ class mpcGym(gym.Env):
         print("prev s: ", self.prev_s)
         print("Current d: ", d)
         print("Current speed: ", self.current_speed)
-        progress = self.current_s - self.prev_s
-        reward += progress * 10
+        reward += (self.current_s - self.prev_s) * 10
 
         # reward for staying in the lane
         if not (d < 3.5 and d > -0.5):
@@ -417,8 +570,11 @@ class mpcGym(gym.Env):
         for obs in self.selected_obstacles:
             if self.distance_to_obs(obs) < DIST2OBSTACLE:
                 reward -= 5
+        
+        alpha_penalty = abs(self.current_alpha)  # radians
+        reward -= alpha_penalty * 5
 
-        if self.current_speed < 1:
+        if self.current_speed < 1: # stall
             reward -= 10
 
         if s >= self.path_length - 10:
@@ -450,13 +606,15 @@ class mpcGym(gym.Env):
     def _get_obs(self):
         self.print_initialized()
         start_wait_time = time.time()
-        timeout_duration = 5.0
+        timeout_duration = 10.0
         while not rospy.is_shutdown() and not shutdown_requested and (not self.ref_path_initialized or not self.ego_state_initialized or not self.frenet_pose_initialized or \
                 not self.selected_obstacles_initialized or not self.predicted_path_initialized or not self.acados_init):
             
             if time.time() - start_wait_time > timeout_duration:
-                rospy.logwarn("TIMEOUT: Observations not received within 5s. Forcing break to avoid hang.")
+                rospy.logwarn("TIMEOUT: Observations not received within 10s. Forcing break to avoid hang.")
                 emergency_stop_signal = Int16(data=0)
+                with open(debug_filepath, "a") as file:
+                    file.write("Vehicle stop for timeout waiting for observation\n")
                 self.action_stop_publisher.publish(emergency_stop_signal)
                 break
 
@@ -583,9 +741,9 @@ class mpcGym(gym.Env):
 
     def close(self):
         rospy.loginfo("Shutting down mpc gym environment.")
-        with open(file_path, 'a') as file:
-                file.write("close\n")
         self.emergency_stop()
+        with open(debug_filepath, "a") as file:
+            file.write("Vehicle stop for closing env\n")
         rospy.signal_shutdown("Closing the environment")
         if hasattr(self, 'client'):
             self.client = None
@@ -666,17 +824,18 @@ def evaluate_best_model(model_path, num_episodes=5, completion_threshold=97):
     
     print(f"Loading model from: {model_path}")
     print(f"Completion threshold: {completion_threshold*100:.0f}% of path")
-    try:
-        model = SAC.load(model_path)
-        with open(file_path, "a") as file:
-            file.write("Load model successfully\n")
-        print("Model loaded successfully!")
-    except Exception as e:
-        with open(file_path, "a") as file:
-            file.write(f"Failed to load model: {e}\n")
-        print(f"Failed to load model: {e}")
-        env.close()
-        return
+    if model_path != "MPC_only":
+        try:
+            model = SAC.load(model_path)
+            with open(debug_filepath, "a") as file:
+                file.write("Load model successfully\n")
+            print("Model loaded successfully!")
+        except Exception as e:
+            with open(debug_filepath, "a") as file:
+                file.write(f"Failed to load model: {e}\n")
+            print(f"Failed to load model: {e}")
+            env.close()
+            return
     
     # Initialize metrics tracking
     metrics = {
@@ -711,7 +870,10 @@ def evaluate_best_model(model_path, num_episodes=5, completion_threshold=97):
         episode_lane_devs = []
         
         while not done and not rospy.is_shutdown():
-            action, _states = model.predict(obs, deterministic=True)
+            if model_path != "MPC_only":
+                action, _states = model.predict(obs, deterministic=True)
+            else:
+                action = [0, 0]
             
             # Take step
             obs, reward, done, truncated, info = env.step(action)
@@ -732,7 +894,7 @@ def evaluate_best_model(model_path, num_episodes=5, completion_threshold=97):
                     f"Lane Dev={abs(env.unwrapped.current_d):.2f}m, "
                     f"Progress={completion_pct:.1f}%")
                 if completion_pct >= completion_threshold:
-                    with open(file_path, "a") as file:
+                    with open(debug_filepath, "a") as file:
                         file.write(f"Finish with Completion pct: {completion_pct}\n")
                     break
         
@@ -854,7 +1016,10 @@ def evaluate_best_model(model_path, num_episodes=5, completion_threshold=97):
     print(f"Driving Score: {driving_score:.1f}/100")
     
     # Save metrics to file
-    metrics_file = model_path.replace('.zip', '_evaluation_metrics.txt')
+    if model_path != "MPC_only":
+        metrics_file = model_path.replace('.zip', '_evaluation_metrics.txt')
+    else:
+        metrics_file = "/home/ave/Desktop/carla_mpc_residual_learning/mpc_only_evaluation_metrics.txt"
     with open(metrics_file, 'w') as f:
         f.write(f"Evaluation Metrics for {model_path}\n")
         f.write(f"{'='*60}\n\n")
@@ -882,10 +1047,10 @@ def evaluate_best_model(model_path, num_episodes=5, completion_threshold=97):
     
     print(f"\nMetrics saved to: {metrics_file}")
     print("Evaluation complete!")
-    with open(file_path, "a") as file:
+    with open(debug_filepath, "a") as file:
         file.write("Finish Evaluation\n")
     
     return metrics
 
 if __name__ == "__main__":
-    evaluate_best_model("/home/ave/Desktop/carla_mpc_residual_learning/src/mpc_controller/envs/sac_mpc.zip", 5)
+    evaluate_best_model("MPC_only", 15)
