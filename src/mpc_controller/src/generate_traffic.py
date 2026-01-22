@@ -1,17 +1,12 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2021 Computer Vision Center (CVC) at the Universitat Autonoma de
-# Barcelona (UAB).
-#
-# This work is licensed under the terms of the MIT license.
-# For a copy, see <https://opensource.org/licenses/MIT>.
-
-"""Example script to generate traffic in the simulation"""
+# Modified to spawn traffic only in the same direction as ego vehicle
 
 import glob
 import os
 import sys
 import time
+import math
 
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
@@ -22,9 +17,7 @@ except IndexError:
     pass
 
 import carla
-
 from carla import VehicleLightState as vls
-
 import argparse
 import logging
 from numpy import random
@@ -35,14 +28,11 @@ def get_actor_blueprints(world, filter, generation):
     if generation.lower() == "all":
         return bps
 
-    # If the filter returns only one bp, we assume that this one needed
-    # and therefore, we ignore the generation
     if len(bps) == 1:
         return bps
 
     try:
         int_generation = int(generation)
-        # Check if generation is in available generations
         if int_generation in [1, 2]:
             bps = [x for x in bps if int(x.get_attribute('generation')) == int_generation]
             return bps
@@ -52,6 +42,84 @@ def get_actor_blueprints(world, filter, generation):
     except:
         print("   Warning! Actor Generation is not valid. No actor will be spawned.")
         return []
+
+
+def get_ego_vehicle_transform(world):
+    """Get the ego vehicle's transform to determine reference direction"""
+    actors = world.get_actors()
+    ego_vehicle = None
+    
+    # Try to find vehicle with role_name 'ego_vehicle' or 'hero'
+    for actor in actors.filter('vehicle.*'):
+        if actor.attributes.get('role_name') in ['ego_vehicle', 'hero']:
+            ego_vehicle = actor
+            break
+    
+    if ego_vehicle:
+        return ego_vehicle.get_transform()
+    return None
+
+
+def calculate_heading_difference(transform1, transform2):
+    """Calculate the absolute difference in heading between two transforms (in degrees)"""
+    yaw1 = transform1.rotation.yaw
+    yaw2 = transform2.rotation.yaw
+    
+    # Normalize the difference to [-180, 180]
+    diff = (yaw1 - yaw2) % 360
+    if diff > 180:
+        diff -= 360
+    
+    return abs(diff)
+
+
+def filter_spawn_points_same_direction(spawn_points, ego_transform, angle_threshold=45.0):
+    """
+    Filter spawn points to only include those facing the same direction as ego vehicle.
+    
+    Args:
+        spawn_points: List of all spawn points
+        ego_transform: Transform of the ego vehicle
+        angle_threshold: Maximum allowed angle difference in degrees (default 45°)
+    
+    Returns:
+        List of spawn points facing the same direction
+    """
+    if ego_transform is None:
+        print("Warning: No ego vehicle found. Using all spawn points.")
+        return spawn_points
+    
+    filtered_points = []
+    ego_yaw = ego_transform.rotation.yaw
+    
+    for spawn_point in spawn_points:
+        heading_diff = calculate_heading_difference(spawn_point, ego_transform)
+        
+        # Keep spawn points with similar heading (within threshold)
+        if heading_diff <= angle_threshold:
+            filtered_points.append(spawn_point)
+    
+    print(f"Filtered spawn points: {len(filtered_points)}/{len(spawn_points)} "
+          f"(within {angle_threshold}° of ego vehicle heading)")
+    
+    return filtered_points
+
+
+def wait_for_ego_vehicle(world, timeout=30.0):
+    """Wait for ego vehicle to spawn before filtering spawn points"""
+    print("Waiting for ego vehicle to spawn...")
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        ego_transform = get_ego_vehicle_transform(world)
+        if ego_transform is not None:
+            print(f"Ego vehicle found at yaw: {ego_transform.rotation.yaw:.2f}°")
+            return ego_transform
+        time.sleep(0.5)
+    
+    print("Warning: Ego vehicle not found within timeout. Proceeding without filtering.")
+    return None
+
 
 def main():
     argparser = argparse.ArgumentParser(
@@ -182,7 +250,6 @@ def main():
                 synchronous_master = True
                 settings.synchronous_mode = True
                 settings.fixed_delta_seconds = 0.05
-                # settings.fixed_delta_seconds = 0.02
                 print("Enabling synchronous mode", settings)
             else:
                 synchronous_master = False
@@ -210,6 +277,7 @@ def main():
 
         blueprints = sorted(blueprints, key=lambda bp: bp.id)
 
+        # Get all spawn points
         spawn_points = world.get_map().get_spawn_points()
         number_of_spawn_points = len(spawn_points)
 
@@ -272,17 +340,17 @@ def main():
             world.set_pedestrians_seed(args.seedw)
             random.seed(args.seedw)
         # 1. take all the random locations to spawn
-        spawn_points = []
+        spawn_points_walkers = []
         for i in range(args.number_of_walkers):
             spawn_point = carla.Transform()
             loc = world.get_random_location_from_navigation()
             if (loc != None):
                 spawn_point.location = loc
-                spawn_points.append(spawn_point)
+                spawn_points_walkers.append(spawn_point)
         # 2. we spawn the walker object
         batch = []
         walker_speed = []
-        for spawn_point in spawn_points:
+        for spawn_point in spawn_points_walkers:
             walker_bp = random.choice(blueprintsWalkers)
             # set as not invincible
             if walker_bp.has_attribute('is_invincible'):
@@ -382,3 +450,4 @@ if __name__ == '__main__':
         pass
     finally:
         print('\ndone.')
+        

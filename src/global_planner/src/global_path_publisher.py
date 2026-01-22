@@ -34,6 +34,7 @@ from carla_msgs.msg import CarlaWorldInfo
 from carla_waypoint_types.srv import GetWaypoint, GetActorWaypoint
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
+from std_msgs.msg import Float32MultiArray
 
 
 import os
@@ -77,6 +78,11 @@ class CarlaToRosWaypointConverter(CompatibleNode):
         self.right_border_publisher = self.new_publisher(
             Path,
             '/global_planner/{}/right_border'.format(self.role_name),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        
+        self.road_width_publisher = self.new_publisher(
+            Float32MultiArray,
+            '/global_planner/{}/road_widths'.format(self.role_name),
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         
         
@@ -286,22 +292,54 @@ class CarlaToRosWaypointConverter(CompatibleNode):
 
     def publish_waypoints(self):
         """
-        Publish the ROS message containing the waypoints
+        Publish waypoints with CARLA's native lane width
         """
         msg = Path()
         msg.header.frame_id = "map"
         msg.header.stamp = roscomp.ros_timestamp(self.get_time(), from_sec=True)
+        
+        road_widths_left = []
+        road_widths_right = []
+        
         if self.current_route is not None:
-            for wp in self.current_route:
-                # print("center wp:", wp[0].transform)
-
+            for wp_tuple in self.current_route:
+                carla_waypoint = wp_tuple[0]
+                
+                # Get pose
                 pose = PoseStamped()
-                pose.pose = trans.carla_transform_to_ros_pose(wp[0].transform)
+                pose.pose = trans.carla_transform_to_ros_pose(carla_waypoint.transform)
                 msg.poses.append(pose)
-
+                
+                # Initialize with current lane's half width
+                left_width = carla_waypoint.lane_width / 2.0
+                right_width = carla_waypoint.lane_width / 2.0
+                
+                # Check for adjacent lanes
+                left_lane = carla_waypoint.get_left_lane()
+                right_lane = carla_waypoint.get_right_lane()
+                
+                if left_lane and left_lane.lane_type == carla.LaneType.Driving:
+                    left_width += left_lane.lane_width / 2.0
+                
+                if right_lane and right_lane.lane_type == carla.LaneType.Driving:
+                    right_width += right_lane.lane_width / 2.0
+                
+                road_widths_left.append(left_width)
+                road_widths_right.append(right_width)
+        
         self.waypoint_publisher.publish(msg)
         self.loginfo("Published {} waypoints.".format(len(msg.poses)))
-
+        
+        # Publish road widths
+        if road_widths_left and road_widths_right:
+            width_msg = Float32MultiArray()
+            width_msg.data = []
+            for left, right in zip(road_widths_left, road_widths_right):
+                width_msg.data.extend([left, right])
+            
+            self.road_width_publisher.publish(width_msg)
+            self.loginfo("Published road widths for {} waypoints.".format(len(road_widths_left)))
+        
         self.publish_borders()
 
     def connect_to_carla(self):
