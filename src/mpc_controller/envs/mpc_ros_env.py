@@ -265,6 +265,8 @@ class mpcGym(gym.Env):
             return True
         except Exception as e:
             rospy.logerr(f"Failed to clear spawn point: {e}")
+            with open(debug_filepath, "a") as file:
+                file.write("Failed to clear spawn point: {e}\n")
             return False
 
     def check_static_obstacles_near_spawn(self, spawn_location, radius=5.0):
@@ -331,24 +333,6 @@ class mpcGym(gym.Env):
                     rospy.logwarn(f"Clear spawn failed, retrying...")
                     continue
                 
-                # CRITICAL: Get ego vehicle actor and teleport it directly
-                ego_vehicle = None
-                for actor in self.world.get_actors():
-                    if actor.attributes.get('role_name') == 'ego_vehicle':
-                        ego_vehicle = actor
-                        break
-                
-                if ego_vehicle is None:
-                    rospy.logerr("Could not find ego vehicle actor!")
-                    with open(debug_filepath, "a") as file:
-                        file.write(f"Ego vehicle not found on attempt {attempt + 1}\n")
-                    continue
-                
-                # Teleport ego vehicle to spawn point
-                ego_vehicle.set_transform(start_point)
-                rospy.loginfo(f"Teleported ego vehicle to spawn point")
-                rospy.sleep(0.3)  # Give CARLA time to process the teleport
-                
                 # Reset all initialization flags
                 with self.data_lock:
                     old_path_id = self.path_sequence_id
@@ -361,6 +345,12 @@ class mpcGym(gym.Env):
                     self.selected_obstacles_initialized = False
                     self.predicted_path_initialized = False
                     self.frenet_pose_initialized = False
+
+                    # Clear previous data
+                    self.s = 0
+                    self.n = 0
+                    self.current_s = 0
+                    self.current_d = 0
                 
                 rospy.loginfo(f"Reset initialization flags for spawn attempt {attempt + 1}")
                 
@@ -387,7 +377,7 @@ class mpcGym(gym.Env):
                 
                 # Wait for path to be received
                 path_wait_start = time.time()
-                path_timeout = 8.0
+                path_timeout = 10.0
                 path_received = False
                 
                 rospy.loginfo("Waiting for new path...")
@@ -395,7 +385,6 @@ class mpcGym(gym.Env):
                     with self.data_lock:
                         if not self.waiting_for_new_path and self.ref_path_initialized:
                             path_received = True
-                            rospy.loginfo(f"Path received! (ID: #{self.path_sequence_id})")
                             break
                     
                     if time.time() - path_wait_start > path_timeout:
@@ -532,8 +521,6 @@ class mpcGym(gym.Env):
                 return
             
             rospy.loginfo("SPAWN SUCCESSFUL")
-            with open(debug_filepath, "a") as file:
-                file.write(f"Spawn successful after {attempt + 1} attempts\n")
             
             emergency_stop_signal = Int16()
             emergency_stop_signal.data = 0
@@ -648,8 +635,16 @@ class mpcGym(gym.Env):
 
     def selected_obstacles_callback(self, msg):
         with self.data_lock:
-            # Initialize with invalid values
+            # ALWAYS reset obstacles first
             self.selected_obstacles = np.ones((self.num_of_obs, 2)) * -100
+            
+            # If no markers, still set initialized
+            if len(msg.markers) == 0:
+                rospy.loginfo("No obstacle markers received")
+                self.selected_obstacles_initialized = True
+                return
+            
+            successful_conversions = 0
             
             for i, marker in enumerate(msg.markers):
                 if i >= self.num_of_obs:
@@ -659,13 +654,21 @@ class mpcGym(gym.Env):
                     obstacle_frenet_pose = self._get_frenet_pose(marker.pose)
                     if obstacle_frenet_pose is not None:
                         self.selected_obstacles[i] = [obstacle_frenet_pose.s, obstacle_frenet_pose.d]
+                        successful_conversions += 1
                     else:
-                        rospy.logwarn(f"Failed to convert obstacle {i} to Frenet")
+                        # Keep default -100 value for failed conversion
+                        pass
                 except Exception as e:
-                    rospy.logerr(f"Error processing obstacle {i}: {e}")
+                    rospy.logwarn_throttle(2.0, f"Error processing obstacle {i}: {e}")
                     continue
             
+            # CRITICAL: ALWAYS set initialized, regardless of success
             self.selected_obstacles_initialized = True
+            
+            if successful_conversions > 0:
+                rospy.loginfo_throttle(5.0, f"Converted {successful_conversions}/{len(msg.markers)} obstacles")
+            else:
+                rospy.loginfo_throttle(5.0, "No obstacles successfully converted (all will be ignored)")
 
     def predicted_path_callback(self, path_msg):
         with self.data_lock:
@@ -885,8 +888,8 @@ class mpcGym(gym.Env):
         self.current_step += 1
         rospy.sleep(0.04)
         print("step: ", self.current_step)
-        # residual[0] = 0.1 * residual[0]
-        # residual[1] = 0.1 * residual[1]
+        residual[0] = 0.1 * residual[0]
+        residual[1] = 0.1 * residual[1]
         # in case only RL comment 2 line above
         print("Stepping with residual: ", residual)
         residual_msg = Float32MultiArray(data=[residual[0], residual[1]])

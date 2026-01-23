@@ -83,12 +83,34 @@ class FrenetWorldConverter(CompatibleNode):
         for pose in msg.poses:
             waypoints.append([pose.pose.position.x, pose.pose.position.y])
         
-        # print("waypoints:", waypoints)
-        self.loginfo('Received global path with {} waypoints'.format(len(waypoints)))
+        # Remove duplicate consecutive waypoints
+        waypoints = self._remove_duplicates(waypoints)
+        
+        if len(waypoints) < 4:  # Need at least 4 points for cubic spline
+            self.logwarn('Not enough unique waypoints: {}'.format(len(waypoints)))
+            self._lock.release()
+            return
+        
+        self.loginfo('Received global path with {} unique waypoints'.format(len(waypoints)))
         self._frenet_cartesian_converter = FrenetCartesianConverter(waypoints)
-        # self._publish_frenet_path()
         self._global_path_initialized = True
         self._lock.release()
+
+    def _remove_duplicates(self, waypoints, tolerance=1e-4):
+        """Remove duplicate consecutive waypoints"""
+        if len(waypoints) <= 1:
+            return waypoints
+        
+        filtered = [waypoints[0]]
+        for i in range(1, len(waypoints)):
+            dx = waypoints[i][0] - filtered[-1][0]
+            dy = waypoints[i][1] - filtered[-1][1]
+            distance = np.sqrt(dx**2 + dy**2)
+            
+            if distance > tolerance:
+                filtered.append(waypoints[i])
+        
+        return filtered
 
     def _odometry_callback(self, msg):
         # self.loginfo('Received odometry')

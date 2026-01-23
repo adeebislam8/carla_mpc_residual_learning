@@ -12,5 +12,6 @@ sleep 5
 
 python ${PWD}/carla/PythonAPI/examples/generate_traffic.py --asynch --filterv vehicle.toyota* -s 1 -w 0 -n 40 
 
+#python ${PWD}/src/mpc_controller/src/generate_traffic.py --asynch --filterv vehicle.toyota* -s 1 -w 0 -n 40 --same-direction --wait-for-ego --angle-threshold 45 &
 
 
