@@ -28,7 +28,7 @@ from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleStatus, CarlaC
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import Pose, PoseStamped, PoseWithCovarianceStamped
 from std_msgs.msg import Float32MultiArray
-from std_msgs.msg import Float64, Int16
+from std_msgs.msg import Float64, Int16, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from global_planner.msg import FrenetPose, WorldPose
 from global_planner.srv import World2FrenetService, Frenet2WorldService
@@ -95,6 +95,8 @@ class mpcGym(gym.Env):
         self.client.set_timeout(10.0)
         self.world = self.client.get_world()
         self.map = self.world.get_map()
+        self.available_towns = ['Town01', 'Town02', 'Town03', 'Town04']
+        self.current_town = 'Town01'
         self.path_sequence_id = 0  # Track path updates
         self.expected_path_sequence_id = 0  # What we're waiting for
         self.waiting_for_new_path = False
@@ -113,6 +115,9 @@ class mpcGym(gym.Env):
         self.acados_status = "not_started"  # not_started, initializing, ready, failed
         self.acados_init_attempt = 0
         self.max_acados_init_attempts = 3
+        self.episode_count = 0
+        self.episodes_per_town = 99999999  # Change town every 5 episodes
+        self.world_transitioning = False  # Track if we're loading a new world
         self.setup_ros()
 
     def setup_ros(self):
@@ -143,6 +148,7 @@ class mpcGym(gym.Env):
 
         self.world2frenet_service = rospy.ServiceProxy('/world2frenet', World2FrenetService)
         self.frenet2world_service = rospy.ServiceProxy('/frenet2world', Frenet2WorldService)
+        self.pause_pub = rospy.Publisher('/world_loading_flag', Bool, queue_size=1)
         print("Waiting for services")
         rospy.wait_for_service('/world2frenet')
         rospy.wait_for_service('/frenet2world')
@@ -178,6 +184,156 @@ class mpcGym(gym.Env):
         control_msg = Int16()
         control_msg.data = 1
         self.action_stop_publisher.publish(control_msg)
+
+    def safe_sleep(self, duration):
+        """
+        Sleep that works during world transitions when ROS time might jump backwards
+        """
+        if self.world_transitioning:
+            # Use wall clock time during transitions
+            time.sleep(duration)
+        else:
+            # Use ROS time normally
+            try:
+                rospy.sleep(duration)
+            except rospy.exceptions.ROSTimeMovedBackwardsException:
+                # Fallback to wall clock if time jumps
+                rospy.logwarn("ROS time jumped backwards, using wall clock sleep")
+                time.sleep(duration)
+
+    def load_random_town(self):
+        """Load a random CARLA town/world"""
+        try:
+            self.world_transitioning = True
+            available = [t for t in self.available_towns if t != self.current_town]
+            if not available:
+                available = self.available_towns
+            
+            new_town = secure_random.choice(available)
+            
+            rospy.loginfo(f"Loading new town: {new_town}")
+            with open(debug_filepath, "a") as f:
+                f.write(f"[{rospy.get_time()}] Loading town: {new_town}\n")
+            
+            # Publish pause signal
+            self.pause_pub.publish(Bool(data=True))
+            rospy.loginfo("Published pause signal, waiting for propagation...")
+            time.sleep(1.0)
+            
+            old_world = self.world
+            old_map = self.map
+            old_town = self.current_town
+            
+            try:
+                # Load new world
+                self.world = self.client.load_world(new_town)
+                self.map = self.world.get_map()
+                self.current_town = new_town
+                
+                rospy.loginfo("World loaded, waiting for stabilization...")
+                time.sleep(2.0)
+                
+                # Apply settings
+                settings = self.world.get_settings()
+                settings.synchronous_mode = True
+                settings.fixed_delta_seconds = 0.05
+                self.world.apply_settings(settings)
+                
+                # Tick world
+                rospy.loginfo("Ticking world...")
+                for _ in range(10):
+                    self.world.tick()
+                    time.sleep(0.05)
+                
+                # WAIT FOR EGO VEHICLE TO EXIST
+                rospy.loginfo("Waiting for ego vehicle to spawn in new world...")
+                ego_found = False
+                for attempt in range(20):  # 10 seconds max
+                    actors = self.world.get_actors().filter('vehicle.*')
+                    for actor in actors:
+                        if actor.attributes.get('role_name') == 'ego_vehicle':
+                            rospy.loginfo(f"✓ Ego vehicle found (ID: {actor.id})")
+                            ego_found = True
+                            break
+                    
+                    if ego_found:
+                        break
+                    
+                    rospy.loginfo(f"  Waiting for ego vehicle... (attempt {attempt + 1}/20)")
+                    self.world.tick()
+                    time.sleep(0.5)
+                
+                if not ego_found:
+                    rospy.logwarn("Ego vehicle not found after world load, but continuing...")
+                
+                # Wait for ROS nodes
+                rospy.loginfo("Waiting for ROS nodes to reinitialize (8 seconds)...")
+                time.sleep(8.0)
+                
+                # Test Frenet service
+                rospy.loginfo("Testing Frenet service availability...")
+                service_ready = False
+                for attempt in range(5):
+                    try:
+                        test_spawn = self.map.get_spawn_points()[0]
+                        test_pose = Pose()
+                        test_pose.position.x = test_spawn.location.x
+                        test_pose.position.y = test_spawn.location.y
+                        test_pose.position.z = test_spawn.location.z
+                        
+                        yaw_rad = test_spawn.rotation.yaw * np.pi / 180.0
+                        from tf.transformations import quaternion_from_euler
+                        test_pose.orientation.x, test_pose.orientation.y, test_pose.orientation.z, test_pose.orientation.w = \
+                            quaternion_from_euler(0, 0, yaw_rad)
+                        
+                        test_frenet = self._get_frenet_pose(test_pose)
+                        if test_frenet:
+                            rospy.loginfo(f"✓ Frenet service responsive: s={test_frenet.s:.2f}, d={test_frenet.d:.2f}")
+                            service_ready = True
+                            break
+                        else:
+                            rospy.logwarn(f"Frenet service returned None (attempt {attempt + 1}/5)")
+                            time.sleep(1.0)
+                    except Exception as e:
+                        rospy.logwarn(f"Frenet service test failed (attempt {attempt + 1}/5): {e}")
+                        time.sleep(1.0)
+                
+                if not service_ready:
+                    rospy.logwarn("Frenet service not fully ready, but continuing...")
+                
+                # Unpause
+                rospy.loginfo("Unpausing world...")
+                self.pause_pub.publish(Bool(data=False))
+                time.sleep(1.0)
+                
+                rospy.loginfo(f"✓ Town {new_town} fully loaded and ready")
+                with open(debug_filepath, "a") as f:
+                    f.write(f"[{rospy.get_time()}] Town {new_town} loaded, spawn points: {len(self.map.get_spawn_points())}\n")
+                
+                self.world_transitioning = False
+                return True
+                
+            except Exception as e:
+                rospy.logerr(f"Failed to load town {new_town}, rolling back to {old_town}")
+                with open(debug_filepath, "a") as f:
+                    f.write(f"[{rospy.get_time()}] ERROR loading town {new_town}: {e}\n")
+                    traceback.print_exc(file=f)
+                
+                self.world = old_world
+                self.map = old_map
+                self.current_town = old_town
+                self.pause_pub.publish(Bool(data=False))
+                self.world_transitioning = False
+                return False
+                
+        except Exception as e:
+            rospy.logerr(f"Critical error in load_random_town: {e}")
+            with open(debug_filepath, "a") as f:
+                f.write(f"[{rospy.get_time()}] CRITICAL ERROR in load_random_town: {e}\n")
+                traceback.print_exc(file=f)
+            self.world_transitioning = False
+            self.pause_pub.publish(Bool(data=False))
+            return False
     
     def is_spawn_valid(self, spawn_location, radius=10.0):
         """Check if spawn location is safe and valid"""
@@ -297,6 +453,7 @@ class mpcGym(gym.Env):
     
     def reset_vehicle(self):
         try: 
+            self.episode_count += 1
             speed = self.current_ego_state_info[0]
             start_time = time.time()
             timeout = 10
@@ -310,11 +467,39 @@ class mpcGym(gym.Env):
                 
                 self.emergency_stop()
                 speed = self.current_ego_state_info[0]
-                rospy.sleep(0.5)
+                self.safe_sleep(0.5)
                 if shutdown_requested:
                     return
 
             rospy.loginfo(f"Vehicle stopped (speed: {speed:.2f} m/s)")
+            if self.episode_count % self.episodes_per_town == 0 and self.episode_count != 0:
+                rospy.loginfo(f"Episode {self.episode_count}: Changing town")
+                
+                # DIAGNOSTIC: Log current state before transition
+                with open(debug_filepath, "a") as file:
+                    file.write(f"\n{'='*60}\n")
+                    file.write(f"BEFORE TOWN TRANSITION (Episode {self.episode_count}):\n")
+                    file.write(f"  Current town: {self.current_town}\n")
+                    file.write(f"  Current s: {self.current_s:.2f}, d: {self.current_d:.2f}\n")
+                    file.write(f"  Current speed: {self.current_ego_state_info[0]:.2f}\n")
+                    file.write(f"  Path initialized: {getattr(self, 'path_initialized', False)}\n")
+                    file.write(f"  Ref path initialized: {self.ref_path_initialized}\n")
+                    file.write(f"{'='*60}\n")
+                
+                if not self.load_random_town():
+                    rospy.logwarn("Failed to load random town, using current")
+                
+                # DIAGNOSTIC: Log state after transition
+                with open(debug_filepath, "a") as file:
+                    file.write(f"\nAFTER TOWN TRANSITION:\n")
+                    file.write(f"  New town: {self.current_town}\n")
+                    file.write(f"  Available spawn points: {len(self.map.get_spawn_points())}\n")
+                    file.write(f"  World transitioning flag: {self.world_transitioning}\n")
+                    file.write(f"{'='*60}\n\n")
+            else:
+                rospy.loginfo(f"Episode {self.episode_count}: Using current town {self.current_town}")
+
+            self.safe_sleep(1.0)  # Increased from 0.5
 
             max_spawn_attempts = 30
             spawn_success = False
@@ -324,6 +509,12 @@ class mpcGym(gym.Env):
                 goal_point = self.generate_random_goal_point_carla(start_point)
                 
                 print(f"Spawn attempt {attempt + 1}/{max_spawn_attempts}")
+                with open(debug_filepath, "a") as file:
+                    file.write(f"\nSPAWN ATTEMPT {attempt + 1}/{max_spawn_attempts}:\n")
+                    file.write(f"  Town: {self.current_town}\n")
+                    file.write(f"  Start: x={start_point.location.x:.2f}, y={start_point.location.y:.2f}, yaw={start_point.rotation.yaw:.2f}\n")
+                    file.write(f"  Goal: x={goal_point.location.x:.2f}, y={goal_point.location.y:.2f}\n")
+                    file.write(f"  Distance: {self.distance_carla(start_point.location, goal_point.location):.2f}m\n")
                 
                 # Clear spawn area
                 if not self.clear_spawn_point(
@@ -359,7 +550,7 @@ class mpcGym(gym.Env):
                 reinit_msg.data = 1
                 self.acados_reinit_publisher.publish(reinit_msg)
                 rospy.loginfo("Requested acados reinitialization")
-                rospy.sleep(0.2)
+                self.safe_sleep(0.2)
                 
                 # Publish spawn pose (for ROS bridge sync)
                 start_point_ros = carla_common.transforms.carla_transform_to_ros_pose(start_point)
@@ -367,7 +558,7 @@ class mpcGym(gym.Env):
                 self.initial_pose_publisher.publish(spawn_pose)
                 rospy.loginfo("Published spawn pose")
                 
-                rospy.sleep(0.5)
+                self.safe_sleep(0.5)
                 
                 # Publish goal pose
                 goal_point_ros = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
@@ -385,6 +576,10 @@ class mpcGym(gym.Env):
                     with self.data_lock:
                         if not self.waiting_for_new_path and self.ref_path_initialized:
                             path_received = True
+                            with open(debug_filepath, "a") as file:
+                                file.write(f"  ✓ Path received (seq #{self.path_sequence_id})\n")
+                                if hasattr(self, 'path_length'):
+                                    file.write(f"    Path length: {self.path_length:.2f}m\n")
                             break
                     
                     if time.time() - path_wait_start > path_timeout:
@@ -393,12 +588,19 @@ class mpcGym(gym.Env):
                             file.write(f"Path timeout: current_id={self.path_sequence_id}, expected={self.expected_path_sequence_id}\n")
                         break
                     
-                    rospy.sleep(0.3)
+                    self.safe_sleep(0.3)
                 
                 if not path_received:
                     rospy.logwarn("Did not receive new path, retrying spawn...")
+                    
+                    if self.world_transitioning:
+                        rospy.logerr("Still in world transition, aborting spawn attempt")
+                        continue
+                    
                     with open(debug_filepath, "a") as file:
                         file.write(f"Path not received, retrying spawn attempt {attempt + 1}\n")
+                        file.write(f"  world_transitioning: {self.world_transitioning}\n")
+                        file.write(f"  current_town: {self.current_town}\n")
                     continue
                 
                 # Wait for Acados to initialize
@@ -438,7 +640,7 @@ class mpcGym(gym.Env):
                             reinit_msg.data = 1
                             self.acados_reinit_publisher.publish(reinit_msg)
                             acados_wait_start = time.time()
-                            rospy.sleep(0.5)
+                            self.safe_sleep(0.5)
                             continue
                         else:
                             rospy.logerr(f"Max Acados init attempts ({self.max_acados_init_attempts}) reached")
@@ -446,7 +648,13 @@ class mpcGym(gym.Env):
                                 file.write(f"Max Acados init attempts reached on spawn {attempt + 1}\n")
                             break
                     
-                    rospy.sleep(0.5)
+                    self.safe_sleep(0.5)
+
+                    with open(debug_filepath, "a") as file:
+                        file.write(f"  FRENET VALIDATION:\n")
+                        file.write(f"    Current s: {self.current_s:.2f}, d: {self.current_d:.2f}\n")
+                        file.write(f"    Path length: {getattr(self, 'path_length', 'N/A')}\n")
+                        file.write(f"    Lane bounds: [{self.nmin:.2f}, {self.nmax:.2f}]\n")
                 
                 if not acados_ready:
                     rospy.logwarn("Acados not ready, retrying spawn...")
@@ -491,13 +699,13 @@ class mpcGym(gym.Env):
                             file.write(f"System timeout on attempt {attempt + 1}, missing: {missing}\n")
                         break
                     
-                    rospy.sleep(0.2)
+                    self.safe_sleep(0.2)
                 
                 if not all_systems_ready:
                     rospy.logwarn("Not all systems ready, retrying spawn...")
                     continue
                 
-                rospy.sleep(0.5)
+                self.safe_sleep(0.5)
                 
                 # Validate spawn location
                 if self.is_spawn_valid(start_point.location):
@@ -526,7 +734,7 @@ class mpcGym(gym.Env):
             emergency_stop_signal.data = 0
             self.action_stop_publisher.publish(emergency_stop_signal)
             rospy.loginfo("Emergency stop released")
-            rospy.sleep(0.5)
+            self.safe_sleep(0.5)
             
         except Exception as e:
             rospy.logerr(f"Error in reset_vehicle: {e}")
@@ -635,6 +843,7 @@ class mpcGym(gym.Env):
 
     def selected_obstacles_callback(self, msg):
         with self.data_lock:
+            callback_time = rospy.get_time()            
             # ALWAYS reset obstacles first
             self.selected_obstacles = np.ones((self.num_of_obs, 2)) * -100
             
@@ -645,6 +854,7 @@ class mpcGym(gym.Env):
                 return
             
             successful_conversions = 0
+            failed_conversions = 0
             
             for i, marker in enumerate(msg.markers):
                 if i >= self.num_of_obs:
@@ -657,8 +867,12 @@ class mpcGym(gym.Env):
                         successful_conversions += 1
                     else:
                         # Keep default -100 value for failed conversion
-                        pass
+                        failed_conversions += 1
+                        with open(debug_filepath, "a") as f:
+                            f.write(f"[{callback_time}] obstacle {i}: _get_frenet_pose returned None\n")
+                            f.write(f"  marker pose: x={marker.pose.position.x:.2f}, y={marker.pose.position.y:.2f}\n")
                 except Exception as e:
+                    failed_conversions += 1
                     rospy.logwarn_throttle(2.0, f"Error processing obstacle {i}: {e}")
                     continue
             
@@ -702,25 +916,55 @@ class mpcGym(gym.Env):
         with self.data_lock:
             rospy.loginfo("========== NEW PATH RECEIVED ==========")
             
-            # Increment path sequence on each new path
+            # DIAGNOSTIC: Check if path is valid
+            with open(debug_filepath, "a") as file:
+                file.write(f"\nPATH CALLBACK (seq #{self.path_sequence_id + 1}):\n")
+                file.write(f"  Number of poses: {len(path_msg.poses)}\n")
+                if len(path_msg.poses) > 0:
+                    first_pose = path_msg.poses[0].pose.position
+                    last_pose = path_msg.poses[-1].pose.position
+                    file.write(f"  First pose: x={first_pose.x:.2f}, y={first_pose.y:.2f}, z={first_pose.z:.2f}\n")
+                    file.write(f"  Last pose: x={last_pose.x:.2f}, y={last_pose.y:.2f}, z={last_pose.z:.2f}\n")
+                    
+                    # Check if we can convert to Frenet
+                    if len(path_msg.poses) >= 2:
+                        try:
+                            frenet_first = self._get_frenet_pose(path_msg.poses[0].pose)
+                            frenet_last = self._get_frenet_pose(path_msg.poses[-1].pose)
+                            if frenet_first and frenet_last:
+                                file.write(f"  Frenet range: s=[{frenet_first.s:.2f}, {frenet_last.s:.2f}]\n")
+                            else:
+                                file.write(f"  ERROR: Could not convert to Frenet!\n")
+                        except Exception as e:
+                            file.write(f"  ERROR converting to Frenet: {e}\n")
+            
+            # Increment path sequence
             self.path_sequence_id += 1
             
+            # Sparsify path
             path_msg.poses = path_msg.poses[::5]
+            
+            # Try to parse
             self.x_ref_spline, self.y_ref_spline, self.path_length, dense_s, _, kappa = parseReference(path_msg)
-            if self.x_ref_spline is None or self.y_ref_spline is None or self.path_length is None or dense_s is None or kappa is None:
-                rospy.loginfo("Failed to parse the reference path.")
+            
+            if self.x_ref_spline is None or self.y_ref_spline is None:
+                rospy.logwarn(f"Failed to parse path #{self.path_sequence_id}")
                 with open(debug_filepath, "a") as file:
-                    file.write(f"Failed to parse path #{self.path_sequence_id}\n")
+                    file.write(f"  PARSE FAILED for path #{self.path_sequence_id}\n")
                 return
             
-            print("Path length: ", self.path_length, "Dense_s: ", dense_s[-1])
+            # Path parsed successfully
+            with open(debug_filepath, "a") as file:
+                file.write(f"  ✓ Path parsed successfully\n")
+                file.write(f"  Path length: {self.path_length:.2f}m\n")
+            
             self.kappa_spline = make_interp_spline(dense_s, kappa, k=3)
-            rospy.loginfo("Reference path initialized.")
             self.ref_path_initialized = True
             
-            # Signal that we're no longer waiting if this is the expected path
             if self.waiting_for_new_path and self.path_sequence_id >= self.expected_path_sequence_id:
                 self.waiting_for_new_path = False
+                with open(debug_filepath, "a") as file:
+                    file.write(f"  ✓ Path sequence satisfied (got #{self.path_sequence_id}, expected #{self.expected_path_sequence_id})\n")
 
     def collision_callback(self, msg):
         with self.data_lock:
@@ -793,7 +1037,7 @@ class mpcGym(gym.Env):
     def _get_obs(self):
         self.print_initialized()
         start_wait_time = time.time()
-        timeout_duration = 15.0  # Increased timeout
+        timeout_duration = 20.0  # Increased timeout
         
         check_interval = 0.5  # Check every 500ms
         last_check = time.time()
@@ -812,6 +1056,16 @@ class mpcGym(gym.Env):
             if all_ready:
                 rospy.loginfo("All observations ready")
                 break
+
+            # Capture current states for logging
+            current_states = {
+                'ref_path': self.ref_path_initialized,
+                'ego_state': self.ego_state_initialized,
+                'frenet_pose': self.frenet_pose_initialized,
+                'obstacles': self.selected_obstacles_initialized,
+                'predicted_path': self.predicted_path_initialized,
+                'acados': self.acados_init
+            }
             
             # Periodic status logging
             if time.time() - last_check > check_interval:
@@ -833,19 +1087,26 @@ class mpcGym(gym.Env):
                 # Emergency diagnostic
                 with open(debug_filepath, "a") as f:
                     f.write(f"[{rospy.get_time()}] TIMEOUT in _get_obs:\n")
-                    f.write(f"  ref_path: {self.ref_path_initialized}\n")
-                    f.write(f"  ego_state: {self.ego_state_initialized}\n")
-                    f.write(f"  frenet_pose: {self.frenet_pose_initialized}\n")
-                    f.write(f"  obstacles: {self.selected_obstacles_initialized}\n")
-                    f.write(f"  predicted_path: {self.predicted_path_initialized}\n")
-                    f.write(f"  acados_init: {self.acados_init} (status: {self.acados_status})\n")
+                    f.write(f"  ref_path: {current_states['ref_path']}\n")
+                    f.write(f"  ego_state: {current_states['ego_state']}\n")
+                    f.write(f"  frenet_pose: {current_states['frenet_pose']}\n")
+                    f.write(f"  obstacles: {current_states['obstacles']}\n")
+                    f.write(f"  predicted_path: {current_states['predicted_path']}\n")
+                    f.write(f"  acados_init: {current_states['acados']} (status: {self.acados_status})\n")
                     f.write(f"  path_sequence: current={self.path_sequence_id}, expected={self.expected_path_sequence_id}\n")
+                    
+                    # ADD: More obstacle diagnostics
+                    f.write(f"  OBSTACLE DIAGNOSTICS:\n")
+                    f.write(f"    - obstacles_initialized flag: {self.selected_obstacles_initialized}\n")
+                    f.write(f"    - obstacles array: {self.selected_obstacles}\n")
+                    f.write(f"    - last callback time: {getattr(self, 'last_obstacle_callback_time', 'NEVER')}\n")
+                    f.write(f"    - obstacle subscriber active: {self.selected_obstacles_subscriber is not None}\n")
                 
                 # Force emergency stop
                 self.emergency_stop()
                 break
             
-            rospy.sleep(0.1)
+            self.safe_sleep(0.1)
 
         if self.current_s + self.lookahead_distance > self.path_length:
             self.lookahead_distance = self.path_length - self.current_s
@@ -876,10 +1137,10 @@ class mpcGym(gym.Env):
         self.collision = False
         self.lane_invasion = False
         self.mpc_control_initialized = False
-        self.selected_obstacles_initialized = False
-        self.predicted_path_initialized = False
-        self.ego_state_initialized = False
-        self.frenet_pose_initialized = False
+        # self.selected_obstacles_initialized = False
+        # self.predicted_path_initialized = False
+        # self.ego_state_initialized = False
+        # self.frenet_pose_initialized = False
         self.acados_init = False  # force acados reinit
         self.inside_obs = False
         rospy.loginfo("Resetting the observation.")

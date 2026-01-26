@@ -34,7 +34,7 @@ from carla_msgs.msg import CarlaWorldInfo
 from carla_waypoint_types.srv import GetWaypoint, GetActorWaypoint
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Bool
 
 
 import os
@@ -110,6 +110,13 @@ class CarlaToRosWaypointConverter(CompatibleNode):
             "/move_base_simple/goal",
             self.on_goal,
             qos_profile=10)
+        
+        self.world_paused = False
+        self.world_transition_subscriber = self.new_subscription(
+            Bool,
+            '/world_loading_flag',
+            self.world_transition_callback,
+            qos_profile=10)
 
         # use callback to wait for ego vehicle
         self.loginfo("Waiting for ego vehicle...")
@@ -122,6 +129,14 @@ class CarlaToRosWaypointConverter(CompatibleNode):
         self.ego_vehicle = None
         if self.on_tick:
             self.world.remove_on_tick(self.on_tick)
+
+    def world_transition_callback(self, msg):
+        """Handle world pause/unpause during transitions"""
+        self.world_paused = msg.data
+        if self.world_paused:
+            self.logwarn("⏸️  World paused - global planner disabled")
+        else:
+            self.loginfo("▶️  World unpaused - global planner enabled")
 
     def get_waypoint(self, req, response=None):
         """
@@ -169,6 +184,10 @@ class CarlaToRosWaypointConverter(CompatibleNode):
 
         :return:
         """
+        if self.world_paused:
+            self.logwarn("Cannot process goal: world is paused for transition")
+            return
+        
         self.loginfo("Received goal, trigger rerouting...")
         carla_goal = trans.ros_pose_to_carla_transform(goal.pose)
         self.goal = carla_goal
@@ -178,6 +197,10 @@ class CarlaToRosWaypointConverter(CompatibleNode):
         """
         Triggers a rerouting
         """
+        if self.world_paused:
+            self.logwarn("Cannot reroute: world is paused for transition")
+            return
+        
         if self.ego_vehicle is None or self.goal is None:
             # no ego vehicle, remove route if published
             self.current_route = None
@@ -240,6 +263,9 @@ class CarlaToRosWaypointConverter(CompatibleNode):
         """
         Look for an carla actor with name 'ego_vehicle'
         """
+        if self.world_paused:
+            return
+        
         hero = None
         for actor in self.world.get_actors():
             if actor.attributes.get('role_name') == self.role_name:
@@ -277,6 +303,10 @@ class CarlaToRosWaypointConverter(CompatibleNode):
         """
         Calculate a route from the current location to 'goal'
         """
+        if self.world_paused:
+            self.logwarn("Cannot calculate route: world is paused")
+            return None
+        
         self.loginfo("Calculating route to x={}, y={}, z={}".format(
             goal.location.x,
             goal.location.y,
@@ -294,6 +324,10 @@ class CarlaToRosWaypointConverter(CompatibleNode):
         """
         Publish waypoints with CARLA's native lane width
         """
+        if self.world_paused:
+            self.logwarn_throttle(2.0, "Skipping waypoint publish: world is paused")
+            return
+        
         msg = Path()
         msg.header.frame_id = "map"
         msg.header.stamp = roscomp.ros_timestamp(self.get_time(), from_sec=True)

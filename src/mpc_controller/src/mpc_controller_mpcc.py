@@ -40,7 +40,7 @@ from carla_ad_agent.misc import distance_vehicle
 from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleStatus  # pylint: disable=import-error
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import Pose, PoseStamped
-from std_msgs.msg import Float64, Int16, Float32MultiArray
+from std_msgs.msg import Float64, Int16, Float32MultiArray, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import Float32MultiArray
 
@@ -200,6 +200,13 @@ class LocalPlannerMPC(CompatibleNode):
             "/global_planner/{}/road_widths".format(role_name),
             self.road_width_cb,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        
+        self._world_loading_subscriber = self.new_subscription(
+            Bool,
+            '/world_loading_flag',
+            self.world_loading_cb,
+            qos_profile=10
+        )
 
 
         # publishers
@@ -428,8 +435,15 @@ class LocalPlannerMPC(CompatibleNode):
         with self.data_lock:
             self._target_speed = target_speed_msg.data
 
+    def world_loading_cb(self, msg):
+        self.world_loading = msg.data
+
     def path_cb(self, path_msg):
         with self.data_lock:
+            if getattr(self, 'world_loading', False):
+                # Skip processing paths while town is loading
+                self.logwarn("Skipping path update: world loading")
+                return
             self._waypoint_buffer.clear()
             self._waypoints_queue.clear()
             self._waypoints_queue.extend([pose.pose for pose in path_msg.poses])
