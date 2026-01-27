@@ -451,6 +451,47 @@ class mpcGym(gym.Env):
         """Helper to calculate 2D distance"""
         return np.sqrt((loc1.x - loc2.x)**2 + (loc1.y - loc2.y)**2)
     
+    def spawn_ego_vehicle_after_transition(self):
+        """Manually spawn ego vehicle after world transition"""
+        try:
+            # Check if ego vehicle already exists
+            actors = self.world.get_actors().filter('vehicle.*')
+            for actor in actors:
+                if actor.attributes.get('role_name') == 'ego_vehicle':
+                    rospy.loginfo(f"Ego vehicle already exists (ID: {actor.id})")
+                    return True
+            
+            # Ego vehicle doesn't exist - spawn it
+            rospy.loginfo("Spawning new ego vehicle...")
+            
+            # Get spawn point
+            spawn_points = self.map.get_spawn_points()
+            spawn_point = spawn_points[0] if spawn_points else carla.Transform()
+            
+            # Get vehicle blueprint
+            blueprint_library = self.world.get_blueprint_library()
+            vehicle_bp = blueprint_library.filter('vehicle.tesla.model3')[0]
+            vehicle_bp.set_attribute('role_name', 'ego_vehicle')
+            
+            # Spawn vehicle
+            ego_vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
+            
+            if ego_vehicle is None:
+                rospy.logerr("Failed to spawn ego vehicle")
+                return False
+            
+            rospy.loginfo(f"✓ Ego vehicle spawned (ID: {ego_vehicle.id})")
+            
+            # Give CARLA time to register
+            self.safe_sleep(1.0)
+            self.world.tick()
+            
+            return True
+            
+        except Exception as e:
+            rospy.logerr(f"Error spawning ego vehicle: {e}")
+            return False
+    
     def reset_vehicle(self):
         try: 
             self.episode_count += 1
@@ -472,6 +513,8 @@ class mpcGym(gym.Env):
                     return
 
             rospy.loginfo(f"Vehicle stopped (speed: {speed:.2f} m/s)")
+            
+            # ===== IMPROVED WORLD TRANSITION HANDLING =====
             if self.episode_count % self.episodes_per_town == 0 and self.episode_count != 0:
                 rospy.loginfo(f"Episode {self.episode_count}: Changing town")
                 
@@ -486,8 +529,52 @@ class mpcGym(gym.Env):
                     file.write(f"  Ref path initialized: {self.ref_path_initialized}\n")
                     file.write(f"{'='*60}\n")
                 
+                # CRITICAL: Destroy sensors and ego vehicle BEFORE world change
+                rospy.loginfo("Destroying ego vehicle and sensors before world transition...")
+                try:
+                    # if hasattr(self, 'ego_vehicle') and self.ego_vehicle is not None:
+                    #     # Destroy all attached sensors first
+                    #     if hasattr(self.ego_vehicle, 'destroy'):
+                    #         sensors = self.world.get_actors().filter('sensor.*')
+                    #         for sensor in sensors:
+                    #             if sensor.parent and sensor.parent.id == self.ego_vehicle.id:
+                    #                 rospy.loginfo(f"Destroying sensor: {sensor.type_id}")
+                    #                 sensor.destroy()
+                            
+                    #         # Now destroy the vehicle
+                    #         self.ego_vehicle.destroy()
+                    #         self.ego_vehicle = None
+                    #         rospy.loginfo("Ego vehicle destroyed")
+                    
+                    # Give CARLA time to cleanup
+                    self.safe_sleep(1.0)
+                    
+                except Exception as e:
+                    rospy.logwarn(f"Error during cleanup: {e}")
+                
+                # Load new town
                 if not self.load_random_town():
                     rospy.logwarn("Failed to load random town, using current")
+                
+                # CRITICAL: Extended stabilization wait after world load
+                rospy.loginfo("Waiting for world to stabilize after transition...")
+                stabilization_wait = 3.0  # Increased from implicit shorter waits
+                self.safe_sleep(stabilization_wait)
+                
+                # Tick the world multiple times to ensure sensor registration
+                rospy.loginfo("Ticking world to initialize sensors...")
+                for i in range(10):
+                    if hasattr(self, 'world') and self.world:
+                        try:
+                            self.world.tick()
+                            self.safe_sleep(0.1)
+                        except Exception as e:
+                            rospy.logwarn(f"World tick {i} failed: {e}")
+
+                rospy.loginfo("Checking ego vehicle status...")
+                if not self.spawn_ego_vehicle_after_transition():
+                    rospy.logerr("Failed to spawn ego vehicle")
+                    return False
                 
                 # DIAGNOSTIC: Log state after transition
                 with open(debug_filepath, "a") as file:
@@ -499,7 +586,8 @@ class mpcGym(gym.Env):
             else:
                 rospy.loginfo(f"Episode {self.episode_count}: Using current town {self.current_town}")
 
-            self.safe_sleep(1.0)  # Increased from 0.5
+            # Additional wait for system stabilization
+            self.safe_sleep(1.5)  # Increased from 1.0
 
             max_spawn_attempts = 30
             spawn_success = False
@@ -536,6 +624,7 @@ class mpcGym(gym.Env):
                     self.selected_obstacles_initialized = False
                     self.predicted_path_initialized = False
                     self.frenet_pose_initialized = False
+                    self.ego_state_initialized = False  # Added this flag
 
                     # Clear previous data
                     self.s = 0
@@ -550,7 +639,7 @@ class mpcGym(gym.Env):
                 reinit_msg.data = 1
                 self.acados_reinit_publisher.publish(reinit_msg)
                 rospy.loginfo("Requested acados reinitialization")
-                self.safe_sleep(0.2)
+                self.safe_sleep(0.3)  # Increased from 0.2
                 
                 # Publish spawn pose (for ROS bridge sync)
                 start_point_ros = carla_common.transforms.carla_transform_to_ros_pose(start_point)
@@ -558,7 +647,7 @@ class mpcGym(gym.Env):
                 self.initial_pose_publisher.publish(spawn_pose)
                 rospy.loginfo("Published spawn pose")
                 
-                self.safe_sleep(0.5)
+                self.safe_sleep(0.7)  # Increased from 0.5 - critical for sensor initialization
                 
                 # Publish goal pose
                 goal_point_ros = carla_common.transforms.carla_transform_to_ros_pose(goal_point)
@@ -568,7 +657,7 @@ class mpcGym(gym.Env):
                 
                 # Wait for path to be received
                 path_wait_start = time.time()
-                path_timeout = 10.0
+                path_timeout = 15.0  # Increased from 10.0
                 path_received = False
                 
                 rospy.loginfo("Waiting for new path...")
@@ -595,6 +684,8 @@ class mpcGym(gym.Env):
                     
                     if self.world_transitioning:
                         rospy.logerr("Still in world transition, aborting spawn attempt")
+                        # Extra wait if world is still transitioning
+                        self.safe_sleep(2.0)
                         continue
                     
                     with open(debug_filepath, "a") as file:
@@ -605,7 +696,7 @@ class mpcGym(gym.Env):
                 
                 # Wait for Acados to initialize
                 acados_wait_start = time.time()
-                acados_timeout = 10.0
+                acados_timeout = 12.0  # Increased from 10.0
                 acados_ready = False
                 
                 rospy.loginfo("Waiting for Acados initialization...")
@@ -649,12 +740,13 @@ class mpcGym(gym.Env):
                             break
                     
                     self.safe_sleep(0.5)
-
-                    with open(debug_filepath, "a") as file:
-                        file.write(f"  FRENET VALIDATION:\n")
-                        file.write(f"    Current s: {self.current_s:.2f}, d: {self.current_d:.2f}\n")
-                        file.write(f"    Path length: {getattr(self, 'path_length', 'N/A')}\n")
-                        file.write(f"    Lane bounds: [{self.nmin:.2f}, {self.nmax:.2f}]\n")
+                
+                # Log Frenet validation info
+                with open(debug_filepath, "a") as file:
+                    file.write(f"  FRENET VALIDATION:\n")
+                    file.write(f"    Current s: {self.current_s:.2f}, d: {self.current_d:.2f}\n")
+                    file.write(f"    Path length: {getattr(self, 'path_length', 'N/A')}\n")
+                    file.write(f"    Lane bounds: [{self.nmin:.2f}, {self.nmax:.2f}]\n")
                 
                 if not acados_ready:
                     rospy.logwarn("Acados not ready, retrying spawn...")
@@ -665,7 +757,7 @@ class mpcGym(gym.Env):
                 # Wait for all other systems to be ready
                 rospy.loginfo("Waiting for all systems to stabilize...")
                 system_ready_start = time.time()
-                system_ready_timeout = 5.0
+                system_ready_timeout = 8.0  # Increased from 5.0
                 all_systems_ready = False
                 
                 while not shutdown_requested:
@@ -849,7 +941,6 @@ class mpcGym(gym.Env):
             
             # If no markers, still set initialized
             if len(msg.markers) == 0:
-                rospy.loginfo("No obstacle markers received")
                 self.selected_obstacles_initialized = True
                 return
             

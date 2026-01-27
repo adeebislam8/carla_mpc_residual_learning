@@ -14,7 +14,7 @@ from ros_compatibility.qos import QoSProfile, DurabilityPolicy
 
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Bool
 from scipy.interpolate import CubicSpline
 from global_planner.msg import FrenetPose, WorldPose
 from global_planner.srv import World2FrenetService, Frenet2WorldService
@@ -42,6 +42,7 @@ class FrenetWorldConverter(CompatibleNode):
         # self._frenet_pose_pub = rospy.Publisher('/frenet_pose', FrenetPose, queue_size=1)
         super(FrenetWorldConverter, self).__init__("frenet_world_converter")
         role_name = self.get_param("role_name", "ego_vehicle")
+        self._world_transitioning = False
 
         self._global_path_sub = self.new_subscription(
             Path,
@@ -54,6 +55,12 @@ class FrenetWorldConverter(CompatibleNode):
             Odometry,
             "/carla/{}/odometry".format(role_name),
             self._odometry_callback,
+            qos_profile=10)
+        
+        self._world_loading_sub = self.new_subscription(
+            Bool,
+            '/world_loading_flag',
+            self._world_loading_callback,
             qos_profile=10)
 
         self._frenet_pose_pub = self.new_publisher(
@@ -75,6 +82,19 @@ class FrenetWorldConverter(CompatibleNode):
         self._lock = threading.Lock()
         self._global_path_initialized = False
         self._frenet_cartesian_converter = None
+    
+    def _world_loading_callback(self, msg):
+        with self._lock:
+            self._world_transitioning = msg.data
+            
+            if msg.data:
+                # Invalidate converter
+                self.logwarn("⏸️  World transition - invalidating converter")
+                self._global_path_initialized = False
+                self._frenet_cartesian_converter = None
+                self._frenet_ready_pub.publish(Bool(data=False))
+            else:
+                self.loginfo("▶️  World ready - waiting for new path")
 
     def _global_path_callback(self, msg):
         self._lock.acquire()

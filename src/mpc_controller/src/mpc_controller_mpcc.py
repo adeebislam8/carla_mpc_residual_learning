@@ -271,7 +271,7 @@ class LocalPlannerMPC(CompatibleNode):
 
     def obstacle_markers_cb(self, marker_array):
         selected_obstacles = []
-        if self._current_pose is None or self.s == 0:
+        if self._current_pose is None or self.s == 0 or not self.path_initialized:
             self.objects_frenet_points = np.ones((6, 2), dtype=np.float32) * -100
             return
         
@@ -349,7 +349,9 @@ class LocalPlannerMPC(CompatibleNode):
             self._current_speed = math.sqrt(odometry_msg.twist.twist.linear.x ** 2 +
                                             odometry_msg.twist.twist.linear.y ** 2 +
                                             odometry_msg.twist.twist.linear.z ** 2) * 3.6 # m/s to km/h
-            self._draw_reference_point(self._current_pose)
+            if self.path_initialized:
+                self._draw_reference_point(self._current_pose)
+            #self._draw_reference_point(self._current_pose)
 
     def _draw_reference_point(self, pose):
         ref_path = Path()
@@ -359,6 +361,8 @@ class LocalPlannerMPC(CompatibleNode):
         # print("Current pose: ", pose)
         frenet_pose = self._get_frenet_pose(pose)
         # self.loginfo("Frenet pose: {}".format(frenet_pose))
+        if frenet_pose is None:
+            return
         s, d = frenet_pose.s, frenet_pose.d
         # 10 waypoints 10m ahead of the vehicle: 
             # todo: make sure the waypoints are within the length of the path
@@ -444,6 +448,23 @@ class LocalPlannerMPC(CompatibleNode):
                 # Skip processing paths while town is loading
                 self.logwarn("Skipping path update: world loading")
                 return
+            
+            if len(path_msg.poses) > 0:
+                try:
+                    test_pose = path_msg.poses[0].pose
+                    test_frenet = self._get_frenet_pose(test_pose)
+                    
+                    if test_frenet is None:
+                        self.logerr("Cannot convert path to Frenet - rejecting path")
+                        with open(debug_filepath, "a") as file:
+                            file.write("Cannot convert path to Frenet - rejecting path\n")
+                        return
+                        
+                    self.loginfo(f"Path validation: first waypoint at s={test_frenet.s:.2f}")
+                except Exception as e:
+                    self.logerr(f"Path validation failed: {e}")
+                    return
+            
             self._waypoint_buffer.clear()
             self._waypoints_queue.clear()
             self._waypoints_queue.extend([pose.pose for pose in path_msg.poses])
@@ -690,6 +711,10 @@ class LocalPlannerMPC(CompatibleNode):
         # self.loginfo("Starting time: {}".format(rospy.get_time()))
         # self.loginfo("self.time: {}".format(self.time))
         with self.data_lock:
+            if getattr(self, 'world_loading', False):
+                # Don't try to control during world transitions
+                return
+    
 
         # debug info
             while not self.path_initialized:
@@ -738,6 +763,9 @@ class LocalPlannerMPC(CompatibleNode):
             self._mpc_rl_acados_init_publisher.publish(acados_init_signal)   
    
             frenet_pose = self._get_frenet_pose(self._current_pose)
+            if frenet_pose is None:
+                self.logwarn("Cannot get Frenet pose - skipping control step")
+                return
             # self.loginfo("Frenet pose in run step: {}".format(frenet_pose))
             if self._current_brake != 0:
                 D = -self._current_brake
