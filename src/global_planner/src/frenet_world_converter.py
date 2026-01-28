@@ -92,7 +92,6 @@ class FrenetWorldConverter(CompatibleNode):
                 self.logwarn("⏸️  World transition - invalidating converter")
                 self._global_path_initialized = False
                 self._frenet_cartesian_converter = None
-                self._frenet_ready_pub.publish(Bool(data=False))
             else:
                 self.loginfo("▶️  World ready - waiting for new path")
 

@@ -112,6 +112,7 @@ class CarlaToRosWaypointConverter(CompatibleNode):
             qos_profile=10)
         
         self.world_paused = False
+        self._world_lock = threading.Lock()
         self.world_transition_subscriber = self.new_subscription(
             Bool,
             '/world_loading_flag',
@@ -137,6 +138,86 @@ class CarlaToRosWaypointConverter(CompatibleNode):
             self.logwarn("⏸️  World paused - global planner disabled")
         else:
             self.loginfo("▶️  World unpaused - global planner enabled")
+            # threading.Thread(target=self._refresh_world_after_transition, daemon=True).start()
+            self._refresh_world_after_transition()
+
+    def _refresh_world_after_transition(self):
+        """Refresh CARLA world reference and trigger complete re-initialization"""
+        with self._world_lock:
+            old_world = getattr(self, "world", None)
+
+            # Detach old tick callback from old world
+            if old_world is not None and self.on_tick is not None:
+                try:
+                    old_world.remove_on_tick(self.on_tick)
+                    self.on_tick = None  # ← ADDED: Clear reference
+                except Exception as e:
+                    self.logwarn("Failed removing old on_tick callback {}".format(e))
+
+            try:
+                # Reconnect to CARLA and get new world
+                self.connect_to_carla()
+                self.map = self.world.get_map()
+                
+                # Clear ego vehicle references
+                self.ego_vehicle = None
+                self.ego_vehicle_location = None
+                self.current_route = None  # ← ADDED: Clear route
+                
+                # Reseed goal
+                spawn_points = self.map.get_spawn_points()
+                if spawn_points:
+                    self.goal = spawn_points[0]
+                    self.loginfo("Reset goal after transition")
+                
+                self.loginfo("Refreshed CARLA world/map after transition")
+
+            except Exception as e:
+                self.logerr("Failed to refresh CARLA world after transition: {}".format(e))
+                return  # ← ADDED: Don't continue if refresh failed
+
+            # Re-register tick callback on NEW world
+            try:
+                self.on_tick = self.world.on_tick(self.find_ego_vehicle_actor)
+                self.loginfo("Re-registered on_tick callback")
+            except Exception as e:
+                self.logerr("Failed to register on_tick on refreshed world: {}".format(e))
+                return
+            
+            # ===== CRITICAL FIX: Force immediate ego search and path publish =====
+            import rospy
+            rospy.sleep(1.0)  # Give world time to stabilize
+            
+            # Manually search for ego vehicle
+            self.loginfo("Manually searching for ego vehicle after transition...")
+            hero = None
+            for attempt in range(10):  # Try 10 times
+                actors = self.world.get_actors()
+                for actor in actors:
+                    if actor.attributes.get('role_name') == self.role_name:
+                        hero = actor
+                        self.loginfo("Found ego vehicle: ID={}".format(hero.id))
+                        break
+                
+                if hero is not None:
+                    break
+                
+                self.logwarn("Ego vehicle not found, attempt {}/10".format(attempt + 1))
+                rospy.sleep(0.5)
+            
+            if hero is not None:
+                self.ego_vehicle = hero
+                self.ego_vehicle_location = hero.get_location()
+                
+                # CRITICAL: Force reroute to publish initial path
+                self.loginfo("Forcing initial reroute after world transition...")
+                try:
+                    self.reroute()
+                    self.loginfo("✓ Initial path published after transition")
+                except Exception as e:
+                    self.logerr("Failed to publish initial path: {}".format(e))
+            else:
+                self.logwarn("Ego vehicle not found after world transition")
 
     def get_waypoint(self, req, response=None):
         """

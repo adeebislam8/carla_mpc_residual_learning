@@ -16,6 +16,7 @@ from gymnasium.envs.registration import register
 import signal
 import atexit
 import time
+import subprocess
 
 
 from stable_baselines3.common.callbacks import CheckpointCallback
@@ -24,7 +25,8 @@ import rospy
 import numpy as np
 from gymnasium import spaces
 import carla
-from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleStatus, CarlaCollisionEvent, CarlaLaneInvasionEvent  # pylint: disable=import-error
+from carla_msgs.msg import CarlaEgoVehicleControl, CarlaEgoVehicleStatus, CarlaCollisionEvent, CarlaLaneInvasionEvent, CarlaWorldInfo  # pylint: disable=import-error
+from carla_msgs.srv import SpawnObject
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import Pose, PoseStamped, PoseWithCovarianceStamped
 from std_msgs.msg import Float32MultiArray
@@ -200,6 +202,126 @@ class mpcGym(gym.Env):
                 # Fallback to wall clock if time jumps
                 rospy.logwarn("ROS time jumped backwards, using wall clock sleep")
                 time.sleep(duration)
+    
+    def wait_for_ros_bridge_world_sync(self, expected_town, timeout=20.0):
+        """Wait for CARLA ROS Bridge to sync with the new world"""
+        
+        rospy.loginfo(f"Waiting for ROS Bridge to sync with {expected_town}...")
+        with open(debug_filepath, "a") as f:
+            f.write(f"Waiting for ROS Bridge to sync with {expected_town}...\n")
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                world_info_msg = rospy.wait_for_message(
+                    '/carla/world_info',
+                    CarlaWorldInfo,
+                    timeout=1.0
+                )
+                
+                # Extract town name from map name
+                map_name = world_info_msg.map_name
+                current_town = map_name.split('/')[-1]
+                
+                rospy.loginfo(f"ROS Bridge reports world: {current_town}")
+                
+                if current_town == expected_town:
+                    rospy.loginfo(f"✓ ROS Bridge synced with {expected_town}")
+                    with open(debug_filepath, "a") as f:
+                        f.write(f"  ✓ ROS Bridge synced\n")
+                    return True
+                else:
+                    rospy.logwarn(f"ROS Bridge on wrong world: {current_town} (expected {expected_town})")
+                    self.safe_sleep(0.5)
+                    
+            except rospy.exceptions.ROSException:
+                self.safe_sleep(0.5)
+                continue
+        
+        rospy.logerr(f"Timeout waiting for ROS Bridge to sync")
+        with open(debug_filepath, "a") as f:
+            f.write(f"  ✗ ROS Bridge sync timeout\n")
+        return False
+    
+    def wait_for_sensor_data(self, timeout=15.0):
+        """Wait for sensor data to confirm sensors are attached"""
+        rospy.loginfo("Waiting for sensor data...")
+        with open(debug_filepath, "a") as f:
+            f.write("Waiting for sensor data...\n")
+        
+        start_time = time.time()
+        sensors_ready = {
+            'odometry': False,
+            'vehicle_status': False,
+        }
+        
+        def odom_cb(msg):
+            sensors_ready['odometry'] = True
+        
+        def status_cb(msg):
+            sensors_ready['vehicle_status'] = True
+        
+        # Subscribe temporarily
+        odom_sub = rospy.Subscriber('/carla/ego_vehicle/odometry', Odometry, odom_cb, queue_size=1)
+        status_sub = rospy.Subscriber('/carla/ego_vehicle/vehicle_status', CarlaEgoVehicleStatus, status_cb, queue_size=1)
+        
+        try:
+            while time.time() - start_time < timeout:
+                if all(sensors_ready.values()):
+                    rospy.loginfo("✓ All sensors publishing data")
+                    with open(debug_filepath, "a") as f:
+                        f.write("  ✓ All sensors ready\n")
+                    return True
+                
+                missing = [k for k, v in sensors_ready.items() if not v]
+                rospy.loginfo(f"Waiting for sensors: {missing}")
+                self.safe_sleep(0.5)
+            
+            missing = [k for k, v in sensors_ready.items() if not v]
+            rospy.logerr(f"Timeout waiting for sensors: {missing}")
+            with open(debug_filepath, "a") as f:
+                f.write(f"  ✗ Sensor timeout: {missing}\n")
+            return False
+            
+        finally:
+            odom_sub.unregister()
+            status_sub.unregister()
+
+    def spawn_ego_via_ros_service(self, spawn_transform):
+        rospy.loginfo("Attempting to spawn ego via /carla/spawn_object service...")
+
+        rospy.wait_for_service('/carla/spawn_object', timeout=5.0)
+        spawn_srv = rospy.ServiceProxy('/carla/spawn_object', SpawnObject)
+
+        # Build Transform
+        pose = Pose()
+        pose.position.x = spawn_transform.location.x
+        pose.position.y = spawn_transform.location.y
+        pose.position.z = spawn_transform.location.z
+
+        q = quaternion_from_euler(
+            spawn_transform.rotation.roll,
+            spawn_transform.rotation.pitch,
+            spawn_transform.rotation.yaw
+        )
+
+        pose.orientation.x = q[0]
+        pose.orientation.y = q[1]
+        pose.orientation.z = q[2]
+        pose.orientation.w = q[3]
+
+        # Call service
+        response = spawn_srv(
+            type="vehicle.tesla.model3",
+            id="ego_vehicle",
+            attributes=[],
+            transform=pose,
+            attach_to=0,
+            random_pose=False
+        )
+
+        return response.id != 0
 
     def load_random_town(self):
         """Load a random CARLA town/world"""
@@ -213,11 +335,13 @@ class mpcGym(gym.Env):
             
             rospy.loginfo(f"Loading new town: {new_town}")
             with open(debug_filepath, "a") as f:
+                f.write(f"\n{'='*60}\n")
                 f.write(f"[{rospy.get_time()}] Loading town: {new_town}\n")
+                f.write(f"{'='*60}\n")
             
             # Publish pause signal
             self.pause_pub.publish(Bool(data=True))
-            rospy.loginfo("Published pause signal, waiting for propagation...")
+            rospy.loginfo("Published pause signal")
             time.sleep(1.0)
             
             old_world = self.world
@@ -230,7 +354,7 @@ class mpcGym(gym.Env):
                 self.map = self.world.get_map()
                 self.current_town = new_town
                 
-                rospy.loginfo("World loaded, waiting for stabilization...")
+                rospy.loginfo("World loaded, applying settings...")
                 time.sleep(2.0)
                 
                 # Apply settings
@@ -245,82 +369,71 @@ class mpcGym(gym.Env):
                     self.world.tick()
                     time.sleep(0.05)
                 
-                # WAIT FOR EGO VEHICLE TO EXIST
-                rospy.loginfo("Waiting for ego vehicle to spawn in new world...")
-                ego_found = False
-                for attempt in range(20):  # 10 seconds max
-                    actors = self.world.get_actors().filter('vehicle.*')
-                    for actor in actors:
-                        if actor.attributes.get('role_name') == 'ego_vehicle':
-                            rospy.loginfo(f"✓ Ego vehicle found (ID: {actor.id})")
-                            ego_found = True
-                            break
-                    
-                    if ego_found:
-                        break
-                    
-                    rospy.loginfo(f"  Waiting for ego vehicle... (attempt {attempt + 1}/20)")
-                    self.world.tick()
-                    time.sleep(0.5)
+                # ===== SPAWN EGO VEHICLE =====
+                spawn_point = self.map.get_spawn_points()[0]
                 
-                if not ego_found:
-                    rospy.logwarn("Ego vehicle not found after world load, but continuing...")
+                # Try ROS service first, fall back to manual
+                rospy.loginfo("Spawning ego vehicle...")
+                spawn_success = self.spawn_ego_via_ros_service(spawn_point)
                 
-                # Wait for ROS nodes
-                rospy.loginfo("Waiting for ROS nodes to reinitialize (8 seconds)...")
-                time.sleep(8.0)
+                if not spawn_success:
+                    rospy.logwarn("ROS service spawn failed, using manual spawn...")
+                    with open(debug_filepath, "a") as file:
+                        file.write("ROS service spawn failed, using manual spawn.")
+                    spawn_success = self.spawn_ego_vehicle_in_new_world()
                 
-                # Test Frenet service
-                rospy.loginfo("Testing Frenet service availability...")
-                service_ready = False
-                for attempt in range(5):
-                    try:
-                        test_spawn = self.map.get_spawn_points()[0]
-                        test_pose = Pose()
-                        test_pose.position.x = test_spawn.location.x
-                        test_pose.position.y = test_spawn.location.y
-                        test_pose.position.z = test_spawn.location.z
-                        
-                        yaw_rad = test_spawn.rotation.yaw * np.pi / 180.0
-                        from tf.transformations import quaternion_from_euler
-                        test_pose.orientation.x, test_pose.orientation.y, test_pose.orientation.z, test_pose.orientation.w = \
-                            quaternion_from_euler(0, 0, yaw_rad)
-                        
-                        test_frenet = self._get_frenet_pose(test_pose)
-                        if test_frenet:
-                            rospy.loginfo(f"✓ Frenet service responsive: s={test_frenet.s:.2f}, d={test_frenet.d:.2f}")
-                            service_ready = True
-                            break
-                        else:
-                            rospy.logwarn(f"Frenet service returned None (attempt {attempt + 1}/5)")
-                            time.sleep(1.0)
-                    except Exception as e:
-                        rospy.logwarn(f"Frenet service test failed (attempt {attempt + 1}/5): {e}")
-                        time.sleep(1.0)
+                if not spawn_success:
+                    with open(debug_filepath, "a") as file:
+                        file.write("Manual Spawn failed")
+                    raise Exception("Failed to spawn ego vehicle")
                 
-                if not service_ready:
-                    rospy.logwarn("Frenet service not fully ready, but continuing...")
+                rospy.loginfo("Waiting for ROS Bridge to detect new world...")
+                if not self.wait_for_ros_bridge_world_sync(new_town, timeout=30.0):
+                    raise Exception("ROS Bridge failed to sync with new world")
+                
+                rospy.loginfo("Waiting for sensors to initialize...")
+                if not self.wait_for_sensor_data(timeout=15.0):
+                    raise Exception("Sensors failed to initialize")
+                
+                # Additional stabilization
+                rospy.loginfo("Final stabilization (3 seconds)...")
+                self.safe_sleep(3.0)
                 
                 # Unpause
                 rospy.loginfo("Unpausing world...")
                 self.pause_pub.publish(Bool(data=False))
-                time.sleep(1.0)
+                
+                # Wait for global planner to publish path
+                rospy.loginfo("Waiting for global planner (5 seconds)...")
+                time.sleep(5.0)
                 
                 rospy.loginfo(f"✓ Town {new_town} fully loaded and ready")
                 with open(debug_filepath, "a") as f:
-                    f.write(f"[{rospy.get_time()}] Town {new_town} loaded, spawn points: {len(self.map.get_spawn_points())}\n")
+                    f.write(f"[{rospy.get_time()}] ✓ Town {new_town} ready\n")
+                    f.write(f"{'='*60}\n\n")
                 
                 self.world_transitioning = False
                 return True
                 
             except Exception as e:
-                rospy.logerr(f"Failed to load town {new_town}, rolling back to {old_town}")
-                with open(debug_filepath, "a") as f:
-                    f.write(f"[{rospy.get_time()}] ERROR loading town {new_town}: {e}\n")
-                    traceback.print_exc(file=f)
+                rospy.logerr(f"Failed to load town {new_town}: {e}")
+                try:
+                    rospy.loginfo(f"Rolling back to {old_town}...")
+                    self.world = self.client.load_world(old_town)  # Actually reload!
+                    self.map = self.world.get_map()
+                    
+                    # Reapply settings
+                    settings = self.world.get_settings()
+                    settings.synchronous_mode = True
+                    settings.fixed_delta_seconds = 0.05
+                    self.world.apply_settings(settings)
+                    
+                    # Wait for stabilization
+                    self.safe_sleep(3.0)
+                    
+                except Exception as rollback_error:
+                    rospy.logerr(f"Rollback failed: {rollback_error}")
                 
-                self.world = old_world
-                self.map = old_map
                 self.current_town = old_town
                 self.pause_pub.publish(Bool(data=False))
                 self.world_transitioning = False
@@ -329,10 +442,164 @@ class mpcGym(gym.Env):
         except Exception as e:
             rospy.logerr(f"Critical error in load_random_town: {e}")
             with open(debug_filepath, "a") as f:
-                f.write(f"[{rospy.get_time()}] CRITICAL ERROR in load_random_town: {e}\n")
+                f.write(f"[{rospy.get_time()}] CRITICAL: {e}\n")
                 traceback.print_exc(file=f)
             self.world_transitioning = False
             self.pause_pub.publish(Bool(data=False))
+            return False
+        
+    def spawn_ego_vehicle_in_new_world(self):
+        """
+        Spawn ego vehicle with sensors in new world.
+        This replicates what the CARLA ROS Bridge would do.
+        """
+        with open(debug_filepath, "a") as f:
+            f.write("=" * 60 + "\n")
+            f.write("MANUALLY SPAWNING EGO VEHICLE\n")
+            f.write(f"Town: {self.current_town}\n")
+            f.write("=" * 60 + "\n")
+        
+        try:
+            # 1. Check if ego already exists
+            actors = self.world.get_actors().filter('vehicle.*')
+            for actor in actors:
+                if actor.attributes.get('role_name') == 'ego_vehicle':
+                    rospy.loginfo(f"Ego vehicle already exists (ID: {actor.id})")
+                    with open(debug_filepath, "a") as f:
+                        f.write(f"Ego vehicle already exists (ID: {actor.id})\n")
+                    return True
+            
+            # 2. Get blueprint library
+            blueprint_library = self.world.get_blueprint_library()
+            
+            # 3. Get vehicle blueprint - try multiple options
+            vehicle_bp = None
+            vehicle_types = [
+                'vehicle.tesla.model3',
+                'vehicle.lincoln.mkz_2017',
+                'vehicle.audi.a2',
+                'vehicle.toyota.prius'
+            ]
+            
+            for v_type in vehicle_types:
+                try:
+                    bps = blueprint_library.filter(v_type)
+                    if len(bps) > 0:
+                        vehicle_bp = bps[0]
+                        rospy.loginfo(f"Using vehicle blueprint: {v_type}")
+                        with open(debug_filepath, "a") as f:
+                            f.write(f"Using vehicle blueprint: {v_type}\n")
+                        break
+                except:
+                    continue
+            
+            if vehicle_bp is None:
+                rospy.logerr("No suitable vehicle blueprint found!")
+                with open(debug_filepath, "a") as f:
+                    f.write("ERROR: No suitable vehicle blueprint found!\n")
+                return False
+            
+            # 4. Set role name
+            if vehicle_bp.has_attribute('role_name'):
+                vehicle_bp.set_attribute('role_name', 'ego_vehicle')
+            
+            # 5. Get spawn point
+            spawn_points = self.map.get_spawn_points()
+            if not spawn_points:
+                rospy.logerr("No spawn points available!")
+                with open(debug_filepath, "a") as f:
+                    f.write("ERROR: No spawn points available!\n")
+                return False
+            
+            spawn_transform = spawn_points[0]
+            rospy.loginfo(f"Spawn location: x={spawn_transform.location.x:.2f}, y={spawn_transform.location.y:.2f}")
+            with open(debug_filepath, "a") as f:
+                f.write(f"Spawn location: x={spawn_transform.location.x:.2f}, y={spawn_transform.location.y:.2f}\n")
+            
+            # 6. Spawn the vehicle
+            rospy.loginfo("Spawning ego vehicle...")
+            ego_vehicle = None
+            
+            for attempt in range(5):
+                try:
+                    ego_vehicle = self.world.spawn_actor(vehicle_bp, spawn_transform)
+                    if ego_vehicle is not None:
+                        break
+                except RuntimeError as e:
+                    if "collision" in str(e).lower():
+                        # Try next spawn point
+                        if attempt < len(spawn_points) - 1:
+                            spawn_transform = spawn_points[attempt + 1]
+                            rospy.logwarn(f"Spawn collision, trying next point (attempt {attempt + 1})")
+                            continue
+                    rospy.logerr(f"Spawn attempt {attempt + 1} failed: {e}")
+                    with open(debug_filepath, "a") as f:
+                        f.write(f"Spawn attempt {attempt + 1} failed: {e}\n")
+            
+            if ego_vehicle is None:
+                rospy.logerr("Failed to spawn ego vehicle after 5 attempts")
+                with open(debug_filepath, "a") as f:
+                    f.write("ERROR: Failed to spawn ego vehicle\n")
+                return False
+            
+            rospy.loginfo(f"✓ Ego vehicle spawned (ID: {ego_vehicle.id})")
+            with open(debug_filepath, "a") as f:
+                f.write(f"✓ Ego vehicle spawned (ID: {ego_vehicle.id})\n")
+            
+            # 7. Let CARLA register the vehicle
+            self.safe_sleep(0.5)
+            
+            # 8. Tick world to ensure vehicle is fully registered
+            for _ in range(5):
+                self.world.tick()
+                self.safe_sleep(0.05)
+            
+            # 9. Verify ego vehicle exists
+            verify_found = False
+            actors = self.world.get_actors().filter('vehicle.*')
+            for actor in actors:
+                if actor.id == ego_vehicle.id:
+                    verify_found = True
+                    rospy.loginfo(f"✓ Verified ego vehicle in actor list (ID: {actor.id})")
+                    with open(debug_filepath, "a") as f:
+                        f.write(f"✓ Verified in actor list\n")
+                    break
+            
+            if not verify_found:
+                rospy.logerr("Ego spawned but not in actor list!")
+                with open(debug_filepath, "a") as f:
+                    f.write("ERROR: Not in actor list after spawn\n")
+                return False
+            
+            # 10. CRITICAL: The ROS Bridge needs time to detect the vehicle and attach sensors
+            rospy.loginfo("Waiting for ROS Bridge to attach sensors...")
+            with open(debug_filepath, "a") as f:
+                f.write("Waiting for ROS Bridge to attach sensors (5s)...\n")
+            
+            self.safe_sleep(5.0)  # Give ROS Bridge time to:
+                                # - Detect the new ego vehicle
+                                # - Attach camera sensors
+                                # - Attach lidar sensors
+                                # - Start publishing topics
+            
+            # 11. Tick world again to ensure sensors are active
+            for _ in range(10):
+                self.world.tick()
+                self.safe_sleep(0.05)
+            
+            with open(debug_filepath, "a") as f:
+                f.write("=" * 60 + "\n\n")
+            
+            rospy.loginfo("✓ Ego vehicle spawn complete")
+            return True
+            
+        except Exception as e:
+            rospy.logerr(f"Exception spawning ego vehicle: {e}")
+            with open(debug_filepath, "a") as f:
+                f.write(f"EXCEPTION: {e}\n")
+                import traceback
+                traceback.print_exc(file=f)
+                f.write("=" * 60 + "\n\n")
             return False
     
     def is_spawn_valid(self, spawn_location, radius=10.0):
@@ -1009,8 +1276,6 @@ class mpcGym(gym.Env):
             
             # DIAGNOSTIC: Check if path is valid
             with open(debug_filepath, "a") as file:
-                file.write(f"\nPATH CALLBACK (seq #{self.path_sequence_id + 1}):\n")
-                file.write(f"  Number of poses: {len(path_msg.poses)}\n")
                 if len(path_msg.poses) > 0:
                     first_pose = path_msg.poses[0].pose.position
                     last_pose = path_msg.poses[-1].pose.position
@@ -1043,11 +1308,6 @@ class mpcGym(gym.Env):
                 with open(debug_filepath, "a") as file:
                     file.write(f"  PARSE FAILED for path #{self.path_sequence_id}\n")
                 return
-            
-            # Path parsed successfully
-            with open(debug_filepath, "a") as file:
-                file.write(f"  ✓ Path parsed successfully\n")
-                file.write(f"  Path length: {self.path_length:.2f}m\n")
             
             self.kappa_spline = make_interp_spline(dense_s, kappa, k=3)
             self.ref_path_initialized = True
