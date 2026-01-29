@@ -132,43 +132,56 @@ class FrenetWorldConverter(CompatibleNode):
         return filtered
 
     def _odometry_callback(self, msg):
-        # self.loginfo('Received odometry')
-
-        if not self._global_path_initialized:
+        if not self._global_path_initialized or self._frenet_cartesian_converter is None:
             return
-        # self.loginfo('Received odometry')
+        
         self._lock.acquire()
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        orientation = msg.pose.pose.orientation
-        orientation = [orientation.x, orientation.y, orientation.z, orientation.w]
-        roll, pitch, yaw = euler_from_quaternion(orientation)
-        # self.loginfo('x: {}, y: {}, yaw: {}'.format(x, y, yaw))
-        s, d, alpha = self._frenet_cartesian_converter.get_frenet([x, y, yaw])
-        # self.loginfo('s: {}, d: {}, alpha: {}'.format(s, d, alpha)) 
-        self._frenet_pose_pub.publish(FrenetPose(s=s, d=d, yaw_s=alpha))
-        self._lock.release()
+        try:
+            x = msg.pose.pose.position.x
+            y = msg.pose.pose.position.y
+            orientation = msg.pose.pose.orientation
+            orientation = [orientation.x, orientation.y, orientation.z, orientation.w]
+            roll, pitch, yaw = euler_from_quaternion(orientation)
+            
+            s, d, alpha = self._frenet_cartesian_converter.get_frenet([x, y, yaw])
+            self._frenet_pose_pub.publish(FrenetPose(s=s, d=d, yaw_s=alpha))
+        except Exception as e:
+            self.logerr(f"Error in odometry callback: {e}")
+        finally:
+            self._lock.release()
 
     def _world2frenet_callback(self, req):
-        if not self._global_path_initialized:
+        # Check if converter is available
+        if not self._global_path_initialized or self._frenet_cartesian_converter is None:
+            self.logwarn("Frenet converter not initialized - cannot convert")
             return None
-        # self.loginfo("sercive test {}" .format(req))
+        
         req = req.world_pose
         self._lock.acquire()
-        s, d, alpha = self._frenet_cartesian_converter.get_frenet([req.x, req.y, req.yaw])
-        # self.loginfo("SERVICE: s: {}, d: {}, alpha: {}".format(s, d, alpha))
-        self._lock.release()
-        
-        return FrenetPose(s=s, d=d, yaw_s=alpha)
-    
-    def _frenet2world_callback(self, req):
-        if not self._global_path_initialized:
+        try:
+            s, d, alpha = self._frenet_cartesian_converter.get_frenet([req.x, req.y, req.yaw])
+            self._lock.release()
+            return FrenetPose(s=s, d=d, yaw_s=alpha)
+        except Exception as e:
+            self.logerr(f"Error in world2frenet conversion: {e}")
+            self._lock.release()
             return None
+
+    def _frenet2world_callback(self, req):
+        if not self._global_path_initialized or self._frenet_cartesian_converter is None:
+            self.logwarn("Frenet converter not initialized - cannot convert")
+            return None
+        
         req = req.frenet_pose
         self._lock.acquire()
-        x, y, yaw = self._frenet_cartesian_converter.get_cartesian([req.s, req.d, req.yaw_s])
-        self._lock.release()
-        return WorldPose(x=x, y=y, yaw=yaw)
+        try:
+            x, y, yaw = self._frenet_cartesian_converter.get_cartesian([req.s, req.d, req.yaw_s])
+            self._lock.release()
+            return WorldPose(x=x, y=y, yaw=yaw)
+        except Exception as e:
+            self.logerr(f"Error in frenet2world conversion: {e}")
+            self._lock.release()
+            return None
 
     # def _publish_frenet_path(self):
     #     # need to publish dense s values and kappa(curvature) values

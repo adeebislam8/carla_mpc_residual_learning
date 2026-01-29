@@ -3,7 +3,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import sys
-sys.path.append('/home/adeeb/carla-ros-bridge/catkin_ws/')
+sys.path.append('/home/ave/Desktop/carla_mpc_residual_learning/')
 import gymnasium as gym
 import rospy
 from stable_baselines3 import SAC,PPO
@@ -118,7 +118,7 @@ class mpcGym(gym.Env):
         self.acados_init_attempt = 0
         self.max_acados_init_attempts = 3
         self.episode_count = 0
-        self.episodes_per_town = 99999999  # Change town every 5 episodes
+        self.episodes_per_town = 3  # Change town every 5 episodes
         self.world_transitioning = False  # Track if we're loading a new world
         self.setup_ros()
 
@@ -322,6 +322,33 @@ class mpcGym(gym.Env):
         )
 
         return response.id != 0
+    
+    def restart_ros_bridge(self):
+        """Restart CARLA ROS Bridge to sync with new world"""
+        rospy.loginfo("Restarting CARLA ROS Bridge...")
+        
+        try:
+            # Kill existing bridge
+            subprocess.run(['rosnode', 'kill', '/carla_ros_bridge'], 
+                        timeout=5.0, check=False)
+            rospy.loginfo("Killed old ROS Bridge")
+            time.sleep(5.0)
+            
+            # Start new bridge
+            bridge_launch = subprocess.Popen([
+                'roslaunch', 
+                'carla_ros_bridge', 
+                'carla_ros_bridge.launch',
+                f'town:={self.current_town}'
+            ])
+            
+            rospy.loginfo("Started new ROS Bridge")
+            time.sleep(5.0)  # Give it time to initialize
+            
+            return True
+        except Exception as e:
+            rospy.logerr(f"Failed to restart ROS Bridge: {e}")
+            return False
 
     def load_random_town(self):
         """Load a random CARLA town/world"""
@@ -368,6 +395,16 @@ class mpcGym(gym.Env):
                 for _ in range(10):
                     self.world.tick()
                     time.sleep(0.05)
+                
+                rospy.loginfo("Restarting ROS Bridge for new world...")
+                if not self.restart_ros_bridge():
+                    with open(debug_filepath,"a") as file:
+                        file.write("Failed to restart ROS Bridge\n")
+                    raise Exception("Failed to restart ROS Bridge")
+                
+                rospy.loginfo("Waiting for ROS Bridge to sync...")
+                if not self.wait_for_ros_bridge_world_sync(new_town, timeout=30.0):
+                    raise Exception("ROS Bridge failed to sync with new world")
                 
                 # ===== SPAWN EGO VEHICLE =====
                 spawn_point = self.map.get_spawn_points()[0]
@@ -1224,23 +1261,18 @@ class mpcGym(gym.Env):
                         self.selected_obstacles[i] = [obstacle_frenet_pose.s, obstacle_frenet_pose.d]
                         successful_conversions += 1
                     else:
-                        # Keep default -100 value for failed conversion
                         failed_conversions += 1
-                        with open(debug_filepath, "a") as f:
-                            f.write(f"[{callback_time}] obstacle {i}: _get_frenet_pose returned None\n")
-                            f.write(f"  marker pose: x={marker.pose.position.x:.2f}, y={marker.pose.position.y:.2f}\n")
+                        # **IMPORTANT**: Don't spam logs during transitions
+                        if not self.world_transitioning:
+                            rospy.logwarn_throttle(2.0, f"Obstacle {i}: conversion returned None")
                 except Exception as e:
                     failed_conversions += 1
-                    rospy.logwarn_throttle(2.0, f"Error processing obstacle {i}: {e}")
+                    if not self.world_transitioning:
+                        rospy.logwarn_throttle(2.0, f"Error processing obstacle {i}: {e}")
                     continue
             
             # CRITICAL: ALWAYS set initialized, regardless of success
             self.selected_obstacles_initialized = True
-            
-            if successful_conversions > 0:
-                rospy.loginfo_throttle(5.0, f"Converted {successful_conversions}/{len(msg.markers)} obstacles")
-            else:
-                rospy.loginfo_throttle(5.0, "No obstacles successfully converted (all will be ignored)")
 
     def predicted_path_callback(self, path_msg):
         with self.data_lock:
