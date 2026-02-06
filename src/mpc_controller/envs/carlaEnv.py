@@ -25,24 +25,6 @@ class CarlaMPCEnv(gym.Env):
         port: int = 2000,
         timeout: float = 10.0,
         towns: List[str] = ['Town01', 'Town02', 'Town03', 'Town04'],
-        # Available town is:
-        # /Game/Carla/Maps/Town04
-        # /Game/Carla/Maps/Town05_Opt
-        # /Game/Carla/Maps/Town10HD
-        # /Game/Carla/Maps/Town07
-        # /Game/Carla/Maps/Town06
-        # /Game/Carla/Maps/Town01_Opt
-        # /Game/Carla/Maps/Town02_Opt
-        # /Game/Carla/Maps/Town02
-        # /Game/Carla/Maps/Town07_Opt
-        # /Game/Carla/Maps/Town06_Opt
-        # /Game/Carla/Maps/Town03_Opt
-        # /Game/Carla/Maps/Town10HD_Opt
-        # /Game/Carla/Maps/Town03
-        # /Game/Carla/Maps/Town01
-        # /Game/Carla/Maps/Town05
-        # /Game/Carla/Maps/Town04_Opt
-        # /Game/Carla/Maps/Town11/Town11
         episodes_per_town: int = 99999,
         target_speed: float = 8.33,  # m/s
         max_steps: int = 1000,
@@ -246,14 +228,13 @@ class CarlaMPCEnv(gym.Env):
         y = transform.location.y
         yaw = np.deg2rad(transform.rotation.yaw)
         
-        self.current_s, self.current_d, self.current_alpha = \
-            self.frenet_converter.world_to_frenet(x, y, yaw)
+        self.current_s, self.current_d, self.current_alpha = self.frenet_converter.world_to_frenet(x, y, yaw)
         
         # Vehicle dynamics
         self.current_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
         self.current_throttle = control.throttle
         self.current_brake = control.brake
-        self.current_steering = control.steer
+        self.current_steering = control.steer * (45 * np.pi / 180) # Change to radians
     
     def _detect_obstacles(self):
         """Detect and select closest obstacles in Frenet frame"""
@@ -415,171 +396,316 @@ class CarlaMPCEnv(gym.Env):
         super().reset(seed=seed)
         
         # Town rotation
-        self.episode_count += 1
-        if self.episode_count % self.episodes_per_town == 0:
-            self._load_random_town()
-        
-        # Destroy old vehicle and sensors
-        self._destroy_actors()
-        
-        # Find valid spawn and goal
-        max_attempts = 30
-        for attempt in range(max_attempts):
-            spawn_points = self.map.get_spawn_points()
-            spawn_point = random.choice(spawn_points)
-            goal_point = random.choice(spawn_points)
+        try:
+            self.episode_count += 1
+            if self.episode_count % self.episodes_per_town == 0 and self.episode_count > 0:
+                self._load_random_town()
             
-            # Ensure minimum distance
-            dist = np.sqrt(
-                (spawn_point.location.x - goal_point.location.x)**2 +
-                (spawn_point.location.y - goal_point.location.y)**2
-            )
+            # Destroy old vehicle and sensors
+            self._destroy_actors()
             
-            if dist > 100.0:  # At least 100m
-                # Spawn vehicle
-                if not self._spawn_ego_vehicle(spawn_point):
-                    continue
+            # Find valid spawn and goal
+            max_attempts = 30
+            for attempt in range(max_attempts):
+                spawn_points = self.map.get_spawn_points()
+                spawn_point = random.choice(spawn_points)
+                goal_point = random.choice(spawn_points)
                 
-                # Attach sensors
-                self._attach_sensors()
+                # Ensure minimum distance
+                dist = np.sqrt(
+                    (spawn_point.location.x - goal_point.location.x)**2 +
+                    (spawn_point.location.y - goal_point.location.y)**2
+                )
                 
-                # Generate path
-                if not self._generate_path(spawn_point, goal_point):
-                    self.vehicle.destroy()
-                    continue
-                
-                # Initialize MPC
-                self._initialize_mpc()
-                
-                # Success!
-                break
-        else:
-            raise RuntimeError("Failed to find valid spawn after 30 attempts")
-        
-        # Reset state
-        self.current_step = 0
-        self.collision = False
-        self.lane_invasion = False
-        self.start_time = time.time()
-        self.prev_s = 0.0
-        
-        # Initial tick
-        self.world.tick()
-        self._update_vehicle_state()
-        self._detect_obstacles()
-        
-        obs = self._get_observation()
-        return obs, {}
+                if dist > 100.0:
+                    # Spawn vehicle
+                    if not self._spawn_ego_vehicle(spawn_point):
+                        continue
+                    
+                    # Attach sensors
+                    self._attach_sensors()
+                    
+                    # Generate path
+                    if not self._generate_path(spawn_point, goal_point):
+                        self.vehicle.destroy()
+                        continue
+                    
+                    # Initialize MPC
+                    self._initialize_mpc()
+                    self._visualize_path_and_goal(goal_point)
+
+                    break
+            else:
+                raise RuntimeError("Failed to find valid spawn after 30 attempts")
+            
+            # Reset state
+            self.current_step = 0
+            self.collision = False
+            self.lane_invasion = False
+            self.start_time = time.time()
+            self.prev_s = 0.0
+            
+            # Initial tick
+            self.world.tick()
+            self._update_vehicle_state()
+            self._detect_obstacles()
+            
+            obs = self._get_observation()
+            return obs, {}
+        except Exception as e:
+            print(f"Error at reset with {e}")
     
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """Execute one timestep"""
-        self.current_step += 1
-        self.prev_s = self.current_s
-        
-        # Run MPC to get base control
-        self._update_vehicle_state()
-        self._detect_obstacles()
+        try:
+            # vehicles = self.world.get_actors().filter('vehicle.*')
+            # print("Vehicles in world:", len(vehicles))
+            # for v in vehicles:
+            #     print(v.id, v.type_id)
 
-        mpc_throttle, mpc_steering = self.mpc_controller.solve(
-            s=self.current_s,
-            d=self.current_d,
-            alpha=self.current_alpha,
-            v=self.current_speed,
-            obstacles=self.selected_obstacles,
-            D=self.current_throttle,
-            delta=self.current_steering,
-            road_widths=self._road_widths  # None is okay, MPC will use defaults
-        )
-        
-        # Apply residual from RL
-        residual_throttle = action[0] * 0.1  # Scale down residual
-        residual_steering = action[1] * 0.1
-        
-        final_throttle = np.clip(mpc_throttle + residual_throttle, -1.0, 1.0)
-        final_steering = np.clip(mpc_steering + residual_steering, -1.0, 1.0)
-        
-        # Apply control to vehicle
-        control = carla.VehicleControl()
-        if final_throttle >= 0:
-            control.throttle = final_throttle
-            control.brake = 0.0
-        else:
-            control.throttle = 0.0
-            control.brake = -final_throttle
-        control.steer = final_steering
-        
-        self.vehicle.apply_control(control)
-        
-        # Tick world
-        self.world.tick()
-        
-        # Get new observation
-        obs = self._get_observation()
-        reward = self._calculate_reward(action)
-        done, info = self._check_done()
-        
-        return obs, reward, done, False, info
+            self.current_step += 1
+            self.prev_s = self.current_s
+            
+            # Run MPC to get base control
+            self._update_vehicle_state()
+            self._detect_obstacles()
+
+            mpc_throttle, mpc_steering = self.mpc_controller.solve(
+                s=self.current_s,
+                d=self.current_d,
+                alpha=self.current_alpha,
+                v=self.current_speed,
+                obstacles=self.selected_obstacles,
+                D=self.current_throttle,
+                delta=self.current_steering,
+                road_widths=None#self._road_widths  # None is okay, MPC will use defaults
+            )
+
+            # print("="*20)
+            # print(f"MPC Throttle: {mpc_throttle}\n MPC Steering: {mpc_steering}")
+            # print("="*20)
+
+            # Apply residual from RL
+            residual_throttle = action[0] * 0.1
+            residual_steering = action[1] * 0.1
+            
+            final_throttle = np.clip(mpc_throttle + residual_throttle, -1.0, 1.0)
+            final_steering = np.clip(mpc_steering + residual_steering, -1.0, 1.0)
+            
+            # Apply control to vehicle
+            control = carla.VehicleControl()
+            if final_throttle >= 0:
+                control.throttle = final_throttle
+                control.brake = 0.0
+            else:
+                control.throttle = 0.0
+                control.brake = final_throttle
+            control.steer = - final_steering
+            
+            self.vehicle.apply_control(control)
+            
+            # Tick world
+            self.world.tick()
+            
+            # Get new observation
+            obs = self._get_observation()
+            reward = self._calculate_reward(action)
+            done, info = self._check_done()
+
+            if hasattr(self, 'render_mode') and self.render_mode == 'human':
+                self._draw_vehicle_info()
+            
+            return obs, reward, done, False, info
+        except Exception as e:
+            print(f"Error at step function with {e}")
     
     def _destroy_actors(self):
-        for actor in [self.collision_sensor, self.lane_invasion_sensor, self.vehicle]:
-            if actor is not None:
-                try:
-                    actor.stop() if hasattr(actor, "stop") else None
-                    actor.destroy()
-                except RuntimeError:
-                    pass
-
-        self.collision_sensor = None
-        self.lane_invasion_sensor = None
-        self.vehicle = None
-
-        self.world.tick()
+        """Safely destroy all actors"""
+        actors_to_destroy = []
+        
+        # Collect actors
+        if self.collision_sensor is not None:
+            actors_to_destroy.append(self.collision_sensor)
+            self.collision_sensor = None
+        
+        if self.lane_invasion_sensor is not None:
+            actors_to_destroy.append(self.lane_invasion_sensor)
+            self.lane_invasion_sensor = None
+        
+        if self.vehicle is not None:
+            actors_to_destroy.append(self.vehicle)
+            self.vehicle = None
+        
+        # Destroy in batch
+        for actor in actors_to_destroy:
+            if actor.is_alive:  # Check if still valid
+                actor.destroy()
+        
+        # Clear MPC controller to avoid stale references
+        self.mpc_controller = None
+        self.frenet_converter = None
+        self.path_planner = None
+        
+        if hasattr(self, 'world') and self.world is not None:
+            self.world.tick()
 
     
     def _load_random_town(self):
-        print("Destroying actors before loading new town...")
+        print("Preparing to load new town...")
+        if self.collision_sensor is not None:
+            self.collision_sensor.stop()
+        if self.lane_invasion_sensor is not None:
+            self.lane_invasion_sensor.stop()
+        
         self._destroy_actors()
+        for _ in range(5):
+            self.world.tick()
+            time.sleep(0.02)
 
         available = [t for t in self.available_towns if t != self.current_town]
         new_town = random.choice(available) if available else random.choice(self.available_towns)
-
-        print(f"Loading new town: {new_town}")
-        self.world = self.client.load_world(new_town)
-        self.map = self.world.get_map()
-        self.current_town = new_town
-
-        self._setup_world()
-
-        for _ in range(10):
-            self.world.tick()
-            time.sleep(0.05)
-
-    
-    def close(self):
-        """Clean up resources"""
-        if self.collision_sensor is not None:
-            self.collision_sensor.destroy()
-        if self.lane_invasion_sensor is not None:
-            self.lane_invasion_sensor.destroy()
-        if self.vehicle is not None:
-            self.vehicle.destroy()
         
-        # Reset to async mode
-        settings = self.world.get_settings()
-        settings.synchronous_mode = False
-        self.world.apply_settings(settings)
+        print(f"Loading new town: {new_town}")
+        
+        try:
+            self.world = self.client.load_world(new_town)
+            self.map = self.world.get_map()
+            self.current_town = new_town
+            self._setup_world()
+            
+            print("Waiting for world to stabilize...")
+            for _ in range(20):
+                self.world.tick()
+                time.sleep(0.05)
+            
+            print(f"✓ Successfully loaded {new_town}")
+            
+        except Exception as e:
+            print(f"❌ Error loading new town: {e}")
+            
+            # Try to recover by reloading current town
+            try:
+                self.world = self.client.load_world(self.current_town)
+                self.map = self.world.get_map()
+                self._setup_world()
+                for _ in range(20):
+                    self.world.tick()
+                    time.sleep(0.05)
+            except:
+                raise RuntimeError(f"Failed to load town and unable to recover: {e}")
 
-    def render(self, mode='human'):
+    def render(self, mode='human', camera_mode='top_down'):
+        """
+        Args:
+            mode: Rendering mode
+            camera_mode: 'top_down', 'follow', 'side', 'first_person'
+        """
         if self.vehicle is None:
             return
         
-        # Get vehicle transform
         vehicle_transform = self.vehicle.get_transform()
-        
-        # Position spectator camera behind and above vehicle
         spectator = self.world.get_spectator()
-        spectator_transform = carla.Transform(
-            vehicle_transform.location + carla.Location(z=50),  # 50m above
-            carla.Rotation(pitch=-90)  # Look straight down
-        )
+        
+        if camera_mode == 'top_down':
+            # Bird's eye view
+            spectator_transform = carla.Transform(
+                vehicle_transform.location + carla.Location(z=50),
+                carla.Rotation(pitch=-90)
+            )
+        
+        elif camera_mode == 'follow':
+            # Behind and above the vehicle
+            forward = vehicle_transform.get_forward_vector()
+            spectator_transform = carla.Transform(
+                vehicle_transform.location - forward * 10 + carla.Location(z=5),
+                carla.Rotation(pitch=-15, yaw=vehicle_transform.rotation.yaw)
+            )
+        
+        elif camera_mode == 'side':
+            # Side view
+            right = vehicle_transform.get_right_vector()
+            spectator_transform = carla.Transform(
+                vehicle_transform.location + right * 10 + carla.Location(z=3),
+                carla.Rotation(pitch=-10, yaw=vehicle_transform.rotation.yaw - 90)
+            )
+        
+        elif camera_mode == 'first_person':
+            # Driver's perspective
+            spectator_transform = carla.Transform(
+                vehicle_transform.location + carla.Location(z=1.5),
+                vehicle_transform.rotation
+            )
+        
+        else:
+            # Default to top down
+            spectator_transform = carla.Transform(
+                vehicle_transform.location + carla.Location(z=50),
+                carla.Rotation(pitch=-90)
+            )
+        
         spectator.set_transform(spectator_transform)
+    
+    def _visualize_path_and_goal(self, goal_point: carla.Transform):
+        """Draw the path and goal in CARLA world"""
+        debug = self.world.debug
+        
+        # 1. Draw goal point as a big red sphere
+        debug.draw_point(
+            goal_point.location,
+            size=0.5,
+            color=carla.Color(255, 0, 0),  # Red
+            life_time=20.0  # Use 0.0 for a permanent marking
+        )
+        
+        # 3. Draw the entire path as green dots
+        if self.frenet_converter is not None:
+            s_samples = np.linspace(0, self.path_length, 100)
+            for s in s_samples:
+                x, y, _ = self.frenet_converter.frenet_to_world(s, 0, 0)
+                location = carla.Location(x=x, y=y, z=0.5)
+                debug.draw_point(
+                    location,
+                    size=0.1,
+                    color=carla.Color(0, 255, 0),  # Green
+                    life_time=20.0
+                )
+        
+        # 4. Draw start point as blue sphere
+        if self.vehicle is not None:
+            start_location = self.vehicle.get_transform().location
+            debug.draw_point(
+                start_location,
+                size=0.5,
+                color=carla.Color(0, 0, 255),  # Blue
+                life_time=20.0
+            )
+
+    def close(self):
+        try:
+            # Stop sensors
+            if self.collision_sensor is not None:
+                self.collision_sensor.stop()
+            if self.lane_invasion_sensor is not None:
+                self.lane_invasion_sensor.stop()
+
+            # Destroy ego + sensors
+            self._destroy_actors()
+
+            # Extra safety: remove any leftover vehicles
+            if self.world is not None:
+                for v in self.world.get_actors().filter('vehicle.*'):
+                    try:
+                        v.destroy()
+                    except:
+                        pass
+                self.world.tick()
+
+            # Restore async mode so CARLA isn't stuck in sync
+            if self.world is not None:
+                settings = self.world.get_settings()
+                settings.synchronous_mode = False
+                settings.fixed_delta_seconds = None
+                self.world.apply_settings(settings)
+
+            print("✅ CARLA cleaned up")
+        except Exception as e:
+            print("⚠️ Error during env.close():", e)

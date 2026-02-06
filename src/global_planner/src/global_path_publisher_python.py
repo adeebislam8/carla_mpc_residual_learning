@@ -1,21 +1,7 @@
-"""
-PathPlanner: CARLA path planning without ROS
-
-Replaces: global_path_publisher.py (ROS-based)
-Features:
-- Uses CARLA's GlobalRoutePlanner
-- Returns waypoints as Python objects
-- No ROS dependencies
-"""
 import os
 import sys
 
-current_file = os.path.abspath(__file__)
-project_root = os.path.abspath(os.path.join(os.path.dirname(current_file), '../../..'))
-
-# Add CARLA PythonAPI
-sys.path.append(os.path.join(project_root, 'carla/PythonAPI/carla'))
-sys.path.append(os.path.join(project_root, 'carla/PythonAPI'))
+sys.path.append('/home/ave/Desktop/carla_mpc_residual_learning/carla/PythonAPI/carla')
 
 import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner
@@ -23,9 +9,6 @@ from typing import List, Tuple
 
 
 class PathPlanner:
-    """
-    Generate global paths using CARLA's navigation API
-    """
     def __init__(self, world: carla.World, carla_map: carla.Map, sampling_resolution: float = 1.0):
         """
         Args:
@@ -42,16 +25,6 @@ class PathPlanner:
         start: carla.Location, 
         goal: carla.Location
     ) -> List[carla.Waypoint]:
-        """
-        Calculate route from start to goal
-        
-        Args:
-            start: Start location
-            goal: Goal location
-            
-        Returns:
-            List of waypoints along the route
-        """
         route = self.grp.trace_route(start, goal)
         
         if not route:
@@ -62,16 +35,9 @@ class PathPlanner:
         return waypoints
     
     def get_spawn_points(self) -> List[carla.Transform]:
-        """Get all spawn points in the map"""
         return self.map.get_spawn_points()
     
     def get_road_width_at_waypoint(self, waypoint: carla.Waypoint) -> Tuple[float, float]:
-        """
-        Get road width at a waypoint
-        
-        Returns:
-            (left_width, right_width) relative to waypoint
-        """
         left_width = waypoint.lane_width / 2.0
         right_width = waypoint.lane_width / 2.0
         

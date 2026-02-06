@@ -1,14 +1,5 @@
-"""
-Training script for MPC + Residual RL
-
-Replaces: train_sac() function from mpc_ros_env.py
-Features:
-- No ROS dependencies
-- Clean Stable-Baselines3 integration
-- Simple Python execution
-"""
-
 import gymnasium as gym
+import time
 from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 from stable_baselines3.common.env_checker import check_env
@@ -56,7 +47,7 @@ def test_environment():
         host='localhost',
         port=2000,
         towns=['Town01'],
-        episodes_per_town=1,
+        episodes_per_town=99999,
         max_steps=500
     )
     
@@ -98,8 +89,8 @@ def train_sac(
     env = CarlaMPCEnv(
         host='localhost',
         port=2000,
-        towns=['Town01', 'Town02', 'Town03', 'Town04'],
-        episodes_per_town=3,
+        towns=['Town01'],
+        episodes_per_town=9999999,
         target_speed=8.33,
         max_steps=1000
     )
@@ -109,7 +100,7 @@ def train_sac(
         host='localhost',
         port=2000,
         towns=['Town01'],
-        episodes_per_town=1,
+        episodes_per_town=999999,
         max_steps=1000
     )
     
@@ -301,13 +292,81 @@ def evaluate_model(model_path: str, num_episodes: int = 10):
     print(f"  Success rate: {success_count}/{num_episodes} ({100*success_count/num_episodes:.1f}%)")
     print("="*60)
 
+def test_mpc_only(num_steps=200, camera_mode='follow'):
+    try:
+        print("="*60)
+        print("Testing MPC Controller (No RL)")
+        print("="*60)
+        
+        env = CarlaMPCEnv(
+            host='localhost',
+            port=2000,
+            towns=['Town01'],
+            episodes_per_town=999999,
+            max_steps=1000,
+            #render_mode='human'
+        )
+        
+        obs, info = env.reset()
+        
+        print(f"Path length: {env.path_length:.1f}m")
+        print(f"Starting position: s={env.current_s:.1f}, d={env.current_d:.1f}")
+        print("\nWatching MPC drive (no RL residuals)...\n")
+        
+        done = False
+        step = 0
+        total_reward = 0
+        
+        while not done and step < num_steps:
+            action = np.array([0.0, 0.0])
+            
+            try:
+                obs, reward, done, truncated, info = env.step(action)
+            except Exception as e:
+                print(f"Error unpacking: {e}")
+                break
+            env.render(camera_mode=camera_mode)
+            
+            total_reward += reward
+            step += 1
+
+            if step % 20 == 0:
+                print(f"Step {step:3d}: "
+                    f"speed={env.current_speed:4.1f} m/s, "
+                    f"progress={env.current_s:5.1f}/{env.path_length:.1f}m "
+                    f"({100*env.current_s/env.path_length:5.1f}%), "
+                    f"lateral={env.current_d:4.2f}m, "
+                    f"reward={reward:6.2f}")
+            
+            time.sleep(0.02)
+        
+        print(f"\n{'='*60}")
+        print(f"Test finished!")
+        print(f"  Reason: {info.get('done_reason', 'max steps')}")
+        print(f"  Total steps: {step}")
+        print(f"  Total reward: {total_reward:.2f}")
+        print(f"  Final progress: {env.current_s:.1f}/{env.path_length:.1f}m "
+            f"({100*env.current_s/env.path_length:.1f}%)")
+        
+        if 'lap_time' in info:
+            print(f"  Time: {info['lap_time']:.2f}s")
+        
+        print(f"{'='*60}")
+        
+        env.close()
+    except KeyboardInterrupt:
+        env.close()
+    except Exception as e:
+        print(f"Error in test mpc only: {e}")
+
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Train or evaluate MPC+RL agent')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test', 'eval'],
-                       help='Mode: train, test, or eval')
+    parser.add_argument('--mode', type=str, default='train', 
+                       choices=['train', 'test', 'eval', 'test_mpc'],
+                       help='Mode: train, test, eval, or test_mpc')
     parser.add_argument('--algo', type=str, default='sac', choices=['sac', 'ppo'],
                        help='Algorithm: SAC or PPO')
     parser.add_argument('--timesteps', type=int, default=100000,
@@ -331,3 +390,5 @@ if __name__ == "__main__":
             print("Error: --model required for evaluation")
         else:
             evaluate_model(args.model)
+    elif args.mode == 'test_mpc':
+        test_mpc_only(num_steps=10000)
