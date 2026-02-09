@@ -81,7 +81,7 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     v_diffdot = MX.sym("v_diffdot")
     Ddot = MX.sym("Ddot")
     deltadot = MX.sym("deltadot")
-    thetadot = MX.sym("thetador")
+    thetadot = MX.sym("thetadot")
     xdot = vertcat(sdot, ndot, alphadot, vdot, Ddot, deltadot, thetadot)
 
     # algebraic variables
@@ -172,12 +172,12 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     #all_dist_next = Function('all_dist_next', [s_next, n_next, s_obs1, n_obs1, s_obs2, n_obs2, s_obs3, n_obs3, s_obs4, n_obs4, s_obs5, n_obs5, s_obs6, n_obs6], [b1_next, b2_next, b3_next, b4_next, b5_next, b6_next])
 
 
-    dist_obs1 = b1_next - b1 + gamma * b1
-    dist_obs2 = b2_next - b2 + gamma * b2
-    dist_obs3 = b3_next - b3 + gamma * b3
-    dist_obs4 = b4_next - b4 + gamma * b4
-    dist_obs5 = b5_next - b5 + gamma * b5
-    dist_obs6 = b6_next - b6 + gamma * b6
+    dist_obs1 = (b1_next - b1)/dt_ + gamma * b1
+    dist_obs2 = (b2_next - b2)/dt_ + gamma * b2
+    dist_obs3 = (b3_next - b3)/dt_ + gamma * b3
+    dist_obs4 = (b4_next - b4)/dt_ + gamma * b4
+    dist_obs5 = (b5_next - b5)/dt_ + gamma * b5
+    dist_obs6 = (b6_next - b6)/dt_ + gamma * b6
     """ wrong """
 
 
@@ -206,8 +206,8 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     model.dtheta_max = 200
 
     # nonlinear constraint
-    constraint.alat_min = -35  # minimum lateral force [m/s^2]
-    constraint.alat_max =  35 # maximum lateral force [m/s^1]
+    constraint.alat_min = -5  # minimum lateral force [m/s^2]
+    constraint.alat_max =  5 # maximum lateral force [m/s^1]
 
     constraint.along_min = -5  # minimum longitudinal force [m/s^2]
     constraint.along_max = 5 # maximum longitudinal force [m/s^2]
@@ -241,6 +241,7 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     model.x0 = np.array([0, 0, 0, 0, 0, 0, 0])
     ql = 1e-2     ## if this is low, the car starts to lag; theta is further than s
     qc = 1e-3
+    qa = 1e-1      # Weight for heading error (alpha)
     gamma = 2e-1  ## TODO: Need to check what is the max
     r1 = 1e-1
     r2 = 1e-1
@@ -252,6 +253,7 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     model.cost_expr_ext_cost = (
         (ql * (s - theta) ** 2) 
         + qc * n**2 
+        + qa * alpha**2
         - gamma * derTheta * fmax(0, sign(path_length - s - DIST2STOP))
         + r1 * derD**2 * fmax(0, sign(path_length - s - DIST2STOP))
         + r2 * derDelta**2 * fmax(0, sign(path_length - s - DIST2STOP))

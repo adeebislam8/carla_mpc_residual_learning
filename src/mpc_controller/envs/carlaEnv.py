@@ -31,7 +31,7 @@ class CarlaMPCEnv(gym.Env):
         lookahead_distance: float = 100.0,
         num_obstacles: int = 6,
         state_dim: int = 66,
-        mpc_horizon: int = 10,
+        mpc_horizon: int = 30,
         mpc_dt: float = 0.05,
         discrete_actions: bool = False,
         render_mode: Optional[str] = None,
@@ -410,6 +410,15 @@ class CarlaMPCEnv(gym.Env):
                 spawn_points = self.map.get_spawn_points()
                 spawn_point = random.choice(spawn_points)
                 goal_point = random.choice(spawn_points)
+                # spawn_point = carla.Transform(
+                #     carla.Location(x=10.912545, y=-57.401386, z=0.600000),
+                #     carla.Rotation(pitch=0.0, yaw=-0.023438, roll=0.0)
+                # )
+
+                # goal_point = carla.Transform(
+                #     carla.Location(x=-66.794197, y=12.998389, z=0.600000),
+                #     carla.Rotation(pitch=0.0, yaw=-179.840790, roll=0.0)
+                # )
                 
                 # Ensure minimum distance
                 dist = np.sqrt(
@@ -418,6 +427,8 @@ class CarlaMPCEnv(gym.Env):
                 )
                 
                 if dist > 100.0:
+                    # print(f"spawn: {spawn_point}")
+                    # print(f"goal: {goal_point}")
                     # Spawn vehicle
                     if not self._spawn_ego_vehicle(spawn_point):
                         continue
@@ -477,11 +488,11 @@ class CarlaMPCEnv(gym.Env):
                 obstacles=self.selected_obstacles,
                 D=self.current_throttle,
                 delta=self.current_steering,
-                road_widths=None#self._road_widths  # None is okay, MPC will use defaults
+                road_widths=self._road_widths  # None is okay, MPC will use defaults
             )
 
             # print("="*20)
-            # print(f"MPC Throttle: {mpc_throttle}\n MPC Steering: {mpc_steering}")
+            # print(f"MPC Throttle: {mpc_throttle}\nMPC Steering: {mpc_steering}")
             # print("="*20)
 
             # Apply residual from RL
@@ -498,7 +509,7 @@ class CarlaMPCEnv(gym.Env):
                 control.brake = 0.0
             else:
                 control.throttle = 0.0
-                control.brake = final_throttle
+                control.brake = abs(final_throttle)
             control.steer = - final_steering
             
             self.vehicle.apply_control(control)
@@ -513,6 +524,10 @@ class CarlaMPCEnv(gym.Env):
 
             if hasattr(self, 'render_mode') and self.render_mode == 'human':
                 self._draw_vehicle_info()
+                
+            if self.current_step % 5 == 0:
+                self._visualize_mpc_prediction()
+
             
             return obs, reward, done, False, info
         except Exception as e:
@@ -677,6 +692,42 @@ class CarlaMPCEnv(gym.Env):
                 size=0.5,
                 color=carla.Color(0, 0, 255),  # Blue
                 life_time=20.0
+            )
+
+    def _visualize_mpc_prediction(self):
+        if self.mpc_controller is None:
+            return
+        
+        debug = self.world.debug
+        traj = self.mpc_controller.get_predicted_trajectory()
+
+        # Draw current car position in frenet coordination
+        loc = self.vehicle.get_transform().location
+        debug.draw_point(
+            loc,
+            size=0.15,
+            color=carla.Color(255, 255, 0),
+            life_time=15.0
+        )
+
+        # Draw current car position in world coordination
+        s0, d0, a0 = self.current_s, self.current_d, self.current_alpha
+        x0, y0, _ = self.frenet_converter.frenet_to_world(s0, d0, a0)
+        debug.draw_point(
+            carla.Location(x=x0, y=y0, z=0.8),
+            size=0.12,
+            color=carla.Color(0, 255, 255),  # cyan
+            life_time=15.0
+        )
+
+        # Draw MPC predicted trajectory (small yellow dots)
+        for s, d in traj:
+            x, y, _ = self.frenet_converter.frenet_to_world(s, d, 0.0)
+            debug.draw_point(
+                carla.Location(x=x, y=y, z=0.7),
+                size=0.08,
+                color=carla.Color(255, 255, 0),  # yellow
+                life_time=0.2
             )
 
     def close(self):

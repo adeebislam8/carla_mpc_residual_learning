@@ -102,7 +102,7 @@ class FrenetCartesianConverter:
         
         # Determine sign of d (left or right of path)
         cross = dx * dy_ds - dy * dx_ds
-        d = d if cross >= 0 else -d
+        d = - d if cross >= 0 else d
         
         # Heading error
         alpha = self._normalize_angle(yaw - yaw_ref)

@@ -14,7 +14,7 @@ from scipy.integrate import solve_ivp
 class MPCController:
     def __init__(
         self,
-        horizon: int = 10,
+        horizon: int = 20,
         dt: float = 0.05,
         frenet_converter = None,
         target_speed: float = 8.33,
@@ -75,7 +75,8 @@ class MPCController:
         obstacles: np.ndarray,  # Shape (num_obstacles, 2) [s, d]
         D: float = 0.0, 
         delta: float = 0.0,
-        road_widths: Optional[np.ndarray] = None  # Optional road width data
+        road_widths: Optional[np.ndarray] = None,
+        target_lane_d: Optional[float] = None
     ) -> Tuple[float, float]:
         """
         Args:
@@ -87,6 +88,7 @@ class MPCController:
             D: Current throttle/brake
             delta: Current steering angle
             road_widths: Optional road width constraints
+            target_lane_d: Target lateral position (None = stay in current lane)
             
         Returns:
             (throttle, steering): Control outputs in [-1, 1]
@@ -101,24 +103,54 @@ class MPCController:
         u0p = np.array([self.derD, self.derDelta, self.derTheta])
         propagated_x = self.propagate_time_delay(x0p, u0p)
         
-        # 2. Set initial constraints (allow small forward movement)
+        # 2. IMPROVED: Relaxed initial constraints to allow lateral movement
         propagated_x_lower = propagated_x.copy()
         propagated_x_upper = propagated_x.copy()
-        propagated_x_upper[0] += 2.0  # Allow up to 2m forward movement in s
+        #propagated_x_upper[0] += 2.0  # Allow up to 2m forward movement in s
+        propagated_x_lower[1] -= 1.5  # IMPROVED: Allow 1.5m lateral movement LEFT
+        propagated_x_upper[1] += 1.5  # IMPROVED: Allow 1.5m lateral movement RIGHT
         
         self.acados_solver.set(0, "lbx", propagated_x_lower)
         self.acados_solver.set(0, "ubx", propagated_x_upper)
         
         # 3. Set initial state
         self.acados_solver.set(0, "x", np.array([s, d, alpha, v, D, delta, s]))
-        
-        # 4. Set obstacle parameters
+
+        # Set obstacle parameters for stage 0
         self.acados_solver.set(0, "p", obstacles.flatten())
         
-        # 5. Count valid obstacles (those with s > -50)
+        # 4. Warm-start with trajectory toward target lane
+        if target_lane_d is not None:
+            # Create a trajectory that smoothly transitions to target lane
+            for i in range(self.N):
+                progress = i / self.N  # 0 to 1
+                
+                # Linear interpolation from current d to target_lane_d
+                interp_d = d + progress * (target_lane_d - d)
+                interp_s = s + self.target_speed * self.dt * i
+                interp_alpha = 0.0  # Assume heading aligns with path
+                interp_v = self.target_speed  # Maintain target speed
+                
+                # Warm-start state guess
+                x_warmstart = np.array([
+                    interp_s,
+                    interp_d,
+                    interp_alpha,
+                    interp_v,
+                    D,
+                    delta,
+                    interp_s
+                ])
+                
+                self.acados_solver.set(i, "x", x_warmstart)
+        
+        # 5. Set obstacle parameters
+        self.acados_solver.set(0, "p", obstacles.flatten())
+        
+        # 6. Count valid obstacles (those with s > -50)
         valid_obs_count = np.sum(obstacles[:, 0] > -50)
         
-        # 6. Set constraints for each horizon step
+        # 7. Set constraints for each horizon step
         for i in range(1, self.N):
             # Predict arc length at timestep i
             s_pred = s + self.target_speed * (self.Tf / self.N) * i
@@ -132,11 +164,11 @@ class MPCController:
                 n_right = -road_widths[idx, 1]
             else:
                 # Default road bounds
-                n_left = 3.0
+                n_left = 0.5
                 n_right = -0.5
             
             # Add safety margin
-            safety_margin = 0.4
+            safety_margin = 0.2  # IMPROVED: Reduced from 0.4 for more flexibility
             n_min_adaptive = n_right + safety_margin
             n_max_adaptive = n_left - safety_margin
             
@@ -188,7 +220,14 @@ class MPCController:
             # Set obstacle parameters for this timestep
             self.acados_solver.set(i, "p", obstacles.flatten())
         
-        # 7. Solve ACADOS OCP
+        distance2stop = 0.5 * v
+        s_target = s + self.target_speed * self.Tf
+        
+        if hasattr(self, '_global_path_length') and self._global_path_length is not None:
+            if s_target > self._global_path_length:
+                s_target = self._global_path_length - distance2stop
+
+        # 8. Solve ACADOS OCP
         status = self.acados_solver.solve()
         
         if status != 0:
@@ -197,7 +236,7 @@ class MPCController:
                 print("    QP solver failed - constraints may be infeasible")
             return self._fallback_controller(d, alpha, v)
         
-        # 8. Extract control from solution
+        # 9. Extract control from solution
         x0 = self.acados_solver.get(1, "x")
         u0 = self.acados_solver.get(1, "u")
         
@@ -234,6 +273,7 @@ class MPCController:
         print("Use control fallback")
         steering = -0.3 * d - 0.5 * alpha
         steering = np.clip(steering, -1.0, 1.0)
+        steering = - steering
         
         # Longitudinal control
         speed_error = self.target_speed - v

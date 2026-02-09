@@ -330,7 +330,7 @@ def test_mpc_only(num_steps=200, camera_mode='follow'):
             total_reward += reward
             step += 1
 
-            if step % 20 == 0:
+            if step % 5 == 0:
                 print(f"Step {step:3d}: "
                     f"speed={env.current_speed:4.1f} m/s, "
                     f"progress={env.current_s:5.1f}/{env.path_length:.1f}m "
