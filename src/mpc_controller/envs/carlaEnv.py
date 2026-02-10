@@ -197,6 +197,107 @@ class CarlaMPCEnv(gym.Env):
         
         return True
     
+    def _spawn_frenet_racers(self, num_cars=5, min_gap=12.0, ego_buffer=15.0):
+        vehicles = []
+        blueprints = self.world.get_blueprint_library().filter('vehicle.bmw.*')
+
+        used_s = []
+        for _ in range(num_cars):
+            for _try in range(20):  # retry sampling
+                s = random.uniform(2.0, self.path_length - 5.0)
+
+                # Keep distance from ego
+                if abs(s - self.current_s) < ego_buffer:
+                    continue
+
+                # Keep distance from other NPCs
+                if any(abs(s - s_used) < min_gap for s_used in used_s):
+                    continue
+
+                used_s.append(s)
+                break
+
+            x, y, yaw = self.frenet_converter.frenet_to_world(s, 0.0, 0.0)
+
+            transform = carla.Transform(
+                carla.Location(x=x, y=y, z=0.5),
+                carla.Rotation(yaw=np.rad2deg(yaw))
+            )
+
+            bp = random.choice(blueprints)
+            npc = self.world.spawn_actor(bp, transform)
+
+            vehicles.append({
+                "actor": npc,
+                "s": s,
+                "target_speed": 8.0 + random.uniform(-1.5, 1.5)
+            })
+
+        self.world.tick()
+        return vehicles
+
+    def _frenet_follow_controller(self, npc_data, dt):
+        npc = npc_data["actor"]
+
+        transform = npc.get_transform()
+        x = transform.location.x
+        y = transform.location.y
+        yaw = np.deg2rad(transform.rotation.yaw)
+
+        s, d, alpha = self.frenet_converter.world_to_frenet(x, y, yaw)
+
+        # Lookahead along Frenet path
+        lookahead = 6.0
+        s_ref = s + lookahead
+        if s_ref > self.path_length:
+            s_ref -= self.path_length
+
+        x_ref, y_ref, yaw_ref = self.frenet_converter.frenet_to_world(s_ref, 0.0, 0.0)
+
+        # Heading error
+        heading_error = (yaw_ref - yaw + np.pi) % (2*np.pi) - np.pi
+
+        # Lateral correction from Frenet d
+        k_d = 0.6
+        k_yaw = 1.2
+
+        steer = k_yaw * heading_error + k_d * (-d)
+        steer = np.clip(steer, -1.0, 1.0)
+
+        # Speed control
+        v = npc.get_velocity()
+        speed = np.linalg.norm([v.x, v.y])
+        target_speed = npc_data["target_speed"]
+
+        throttle = 0.5 + 0.5 * (target_speed - speed)
+        throttle = np.clip(throttle, 0.0, 0.75)
+
+        control = carla.VehicleControl()
+        control.throttle = throttle
+        control.steer = steer
+        control.brake = 0.0
+
+        npc.apply_control(control)
+
+        # Update s (for looping)
+        npc_data["s"] = s
+
+    def _respawn_if_finished(self, npc_data):
+        s = npc_data["s"]
+
+        if s > self.path_length - 3.0:
+            s_new = 2.0
+            x, y, yaw = self.frenet_converter.frenet_to_world(s_new, 0.0, 0.0)
+
+            npc = npc_data["actor"]
+            npc.set_transform(carla.Transform(
+                carla.Location(x=x, y=y, z=0.5),
+                carla.Rotation(yaw=np.rad2deg(yaw))
+            ))
+
+            npc_data["s"] = s_new
+
+
     def _initialize_mpc(self):
         """Initialize ACADOS MPC controller"""
         if self.frenet_converter is None:
@@ -470,6 +571,8 @@ class CarlaMPCEnv(gym.Env):
                     self._initialize_mpc()
                     self._visualize_path_and_goal(goal_point)
 
+                    self.racing_npcs = self._spawn_frenet_racers(num_cars=5)
+
                     break
             else:
                 raise RuntimeError("Failed to find valid spawn after 30 attempts")
@@ -500,6 +603,10 @@ class CarlaMPCEnv(gym.Env):
 
             self.current_step += 1
             self.prev_s = self.current_s
+
+            for npc_data in self.racing_npcs:
+                self._frenet_follow_controller(npc_data, self.mpc_dt)
+                self._respawn_if_finished(npc_data)
             
             # Run MPC to get base control
             self._update_vehicle_state()
@@ -577,11 +684,22 @@ class CarlaMPCEnv(gym.Env):
             actors_to_destroy.append(self.vehicle)
             self.vehicle = None
         
-        # Destroy in batch
+        # NPC racers (stored as dicts)
+        if hasattr(self, 'racing_npcs'):
+            for npc_data in self.racing_npcs:
+                npc = npc_data.get("actor", None)
+                if npc is not None and npc.is_alive:
+                    actors_to_destroy.append(npc)
+            self.racing_npcs = []
+
+        # Destroy everything safely
         for actor in actors_to_destroy:
-            if actor.is_alive:  # Check if still valid
-                actor.destroy()
-        
+            try:
+                if actor.is_alive:
+                    actor.destroy()
+            except RuntimeError:
+                pass
+
         # Clear MPC controller to avoid stale references
         self.mpc_controller = None
         self.frenet_converter = None
@@ -695,7 +813,7 @@ class CarlaMPCEnv(gym.Env):
             goal_point.location,
             size=0.5,
             color=carla.Color(255, 0, 0),  # Red
-            life_time=20.0  # Use 0.0 for a permanent marking
+            life_time=30.0  # Use 0.0 for a permanent marking
         )
         
         # 3. Draw the entire path as green dots
@@ -708,7 +826,7 @@ class CarlaMPCEnv(gym.Env):
                     location,
                     size=0.1,
                     color=carla.Color(0, 255, 0),  # Green
-                    life_time=20.0
+                    life_time=30.0
                 )
         
         # 4. Draw start point as blue sphere
@@ -733,7 +851,7 @@ class CarlaMPCEnv(gym.Env):
         debug.draw_point(
             loc,
             size=0.15,
-            color=carla.Color(255, 0, 255),
+            color=carla.Color(255, 0, 255), # pink
             life_time=15.0
         )
 
