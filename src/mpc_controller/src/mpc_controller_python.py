@@ -107,8 +107,8 @@ class MPCController:
         propagated_x_lower = propagated_x.copy()
         propagated_x_upper = propagated_x.copy()
         #propagated_x_upper[0] += 2.0  # Allow up to 2m forward movement in s
-        propagated_x_lower[1] -= 1.5  # IMPROVED: Allow 1.5m lateral movement LEFT
-        propagated_x_upper[1] += 1.5  # IMPROVED: Allow 1.5m lateral movement RIGHT
+        #propagated_x_lower[1] -= 1.5  # IMPROVED: Allow 1.5m lateral movement LEFT
+        #propagated_x_upper[1] += 1.5  # IMPROVED: Allow 1.5m lateral movement RIGHT
         
         self.acados_solver.set(0, "lbx", propagated_x_lower)
         self.acados_solver.set(0, "ubx", propagated_x_upper)

@@ -240,8 +240,8 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     # Define initial conditions
     model.x0 = np.array([0, 0, 0, 0, 0, 0, 0])
     ql = 1e-2     ## if this is low, the car starts to lag; theta is further than s
-    qc = 1e-3
-    qa = 1e-1      # Weight for heading error (alpha)
+    qc = 1e-3      # lateral penalty
+    qa = 3e-1      # Weight for heading error (alpha)
     gamma = 2e-1  ## TODO: Need to check what is the max
     r1 = 1e-1
     r2 = 1e-1

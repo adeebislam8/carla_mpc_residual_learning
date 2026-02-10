@@ -232,7 +232,10 @@ class CarlaMPCEnv(gym.Env):
         
         # Vehicle dynamics
         self.current_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-        self.current_throttle = control.throttle
+        if control.brake > 0:
+            self.current_throttle = -control.brake
+        else:
+            self.current_throttle = control.throttle
         self.current_brake = control.brake
         self.current_steering = control.steer * (45 * np.pi / 180) # Change to radians
     
@@ -240,37 +243,59 @@ class CarlaMPCEnv(gym.Env):
         """Detect and select closest obstacles in Frenet frame"""
         self.selected_obstacles = np.ones((self.num_obstacles, 2)) * -100
         
-        # Get all vehicles in world
-        vehicles = self.world.get_actors().filter('vehicle.*')
         ego_location = self.vehicle.get_location()
-        
         obstacles = []
+    
+        vehicles = self.world.get_actors().filter('vehicle.*')
         for vehicle in vehicles:
             if vehicle.id == self.vehicle.id:
                 continue
             
             loc = vehicle.get_location()
-            
-            # Euclidean distance check
             distance = np.sqrt(
                 (ego_location.x - loc.x)**2 + 
                 (ego_location.y - loc.y)**2
             )
             
             if distance < 50.0:  # Within 50m
-                # Convert to Frenet
                 s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
                     loc.x, loc.y, 0
                 )
                 
-                # Must be ahead and in relevant lateral range
                 if s_obs > self.current_s and abs(d_obs) < 5.0:
-                    obstacles.append([s_obs, d_obs, s_obs - self.current_s])
+                    obstacles.append({
+                        's': s_obs, 
+                        'd': d_obs, 
+                        'distance': s_obs - self.current_s,
+                        'type': 'vehicle'
+                    })
+
+        static_obstacles = self.world.get_actors().filter('static.prop.*')
+        for prop in static_obstacles:
+            loc = prop.get_location()
+            distance = np.sqrt(
+                (ego_location.x - loc.x)**2 + 
+                (ego_location.y - loc.y)**2
+            )
+            
+            if distance < 40.0:
+                s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
+                    loc.x, loc.y, 0
+                )
+                
+                if s_obs > self.current_s and abs(d_obs) < 5.0:
+                    obstacles.append({
+                        's': s_obs, 
+                        'd': d_obs, 
+                        'distance': s_obs - self.current_s,
+                        'type': 'static'
+                    })
         
         # Sort by distance and select closest N
-        obstacles.sort(key=lambda x: x[2])
+        obstacles.sort(key=lambda x: x['distance'])
+        
         for i, obs in enumerate(obstacles[:self.num_obstacles]):
-            self.selected_obstacles[i] = [obs[0], obs[1]]
+            self.selected_obstacles[i] = [obs['s'], obs['d']]
     
     def _get_observation(self) -> np.ndarray:
         """
@@ -293,7 +318,7 @@ class CarlaMPCEnv(gym.Env):
         s_samples = np.linspace(
             self.current_s,
             min(self.current_s + self.lookahead_distance, self.path_length),
-            20
+            30
         )
         kappa_samples = np.array([
             self.frenet_converter.get_curvature(s) for s in s_samples
@@ -411,13 +436,13 @@ class CarlaMPCEnv(gym.Env):
                 spawn_point = random.choice(spawn_points)
                 goal_point = random.choice(spawn_points)
                 # spawn_point = carla.Transform(
-                #     carla.Location(x=10.912545, y=-57.401386, z=0.600000),
-                #     carla.Rotation(pitch=0.0, yaw=-0.023438, roll=0.0)
+                #     carla.Location(x=-45.235935, y=-36.500095, z=0.600000),
+                #     carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000)
                 # )
 
                 # goal_point = carla.Transform(
-                #     carla.Location(x=-66.794197, y=12.998389, z=0.600000),
-                #     carla.Rotation(pitch=0.0, yaw=-179.840790, roll=0.0)
+                #     carla.Location(x=-114.432091, y=56.850296, z=0.600000),
+                #     carla.Rotation(pitch=0.000000, yaw=90.642235, roll=0.000000)
                 # )
                 
                 # Ensure minimum distance
@@ -427,8 +452,8 @@ class CarlaMPCEnv(gym.Env):
                 )
                 
                 if dist > 100.0:
-                    # print(f"spawn: {spawn_point}")
-                    # print(f"goal: {goal_point}")
+                    print(f"spawn: {spawn_point}")
+                    print(f"goal: {goal_point}")
                     # Spawn vehicle
                     if not self._spawn_ego_vehicle(spawn_point):
                         continue
@@ -524,6 +549,8 @@ class CarlaMPCEnv(gym.Env):
 
             if hasattr(self, 'render_mode') and self.render_mode == 'human':
                 self._draw_vehicle_info()
+            
+            self._draw_road_boundaries_ahead()
                 
             if self.current_step % 5 == 0:
                 self._visualize_mpc_prediction()
@@ -706,7 +733,7 @@ class CarlaMPCEnv(gym.Env):
         debug.draw_point(
             loc,
             size=0.15,
-            color=carla.Color(255, 255, 0),
+            color=carla.Color(255, 0, 255),
             life_time=15.0
         )
 
@@ -728,6 +755,46 @@ class CarlaMPCEnv(gym.Env):
                 size=0.08,
                 color=carla.Color(255, 255, 0),  # yellow
                 life_time=0.2
+            )
+
+    def _draw_road_boundaries_ahead(self, lookahead_distance=30.0):
+        """Draw road boundaries ahead of the vehicle"""
+        if self._road_widths is None or self.frenet_converter is None:
+            return
+        
+        debug = self.world.debug
+        
+        # Sample points ahead
+        num_points = 30
+        s_samples = np.linspace(
+            self.current_s,
+            min(self.current_s + lookahead_distance, self.path_length),
+            num_points
+        )
+        
+        for s in s_samples:
+            # Get road width at this s
+            idx = int(s / 1.0)
+            idx = np.clip(idx, 0, len(self._road_widths) - 1)
+            n_left = self._road_widths[idx, 0]
+            n_right = -self._road_widths[idx, 1]
+            
+            # Left boundary
+            x_left, y_left, _ = self.frenet_converter.frenet_to_world(s, n_left, 0)
+            debug.draw_point(
+                carla.Location(x=x_left, y=y_left, z=0.3),
+                size=0.08,
+                color=carla.Color(255, 100, 100),
+                life_time=15.0
+            )
+            
+            # Right boundary
+            x_right, y_right, _ = self.frenet_converter.frenet_to_world(s, n_right, 0)
+            debug.draw_point(
+                carla.Location(x=x_right, y=y_right, z=0.3),
+                size=0.08,
+                color=carla.Color(100, 100, 255),
+                life_time=15.0
             )
 
     def close(self):
