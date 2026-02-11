@@ -99,6 +99,7 @@ class FrenetCartesianConverter:
         dx = x - x_ref
         dy = y - y_ref
         d = np.sqrt(dx**2 + dy**2)
+        d = np.clip(d, -50.0, 50.0)   # prevent insane MPC values
         
         # Determine sign of d (left or right of path)
         cross = dx * dy_ds - dy * dx_ds
@@ -180,34 +181,37 @@ class FrenetCartesianConverter:
         
         return s_samples[idx]
     
-    def _refine_s(self, x: float, y: float, s_init: float, max_iter: int = 10) -> float:
-        """Refine s estimate using Newton's method"""
-        s = s_init
-        
+    def _refine_s(self, x, y, s_init, max_iter=10):
+        s = float(np.clip(s_init, 0, self.s_max))
+
         for _ in range(max_iter):
-            # Path point and derivatives
             x_ref = self.x_spline(s)
             y_ref = self.y_spline(s)
             dx_ds = self.x_spline.derivative()(s)
             dy_ds = self.y_spline.derivative()(s)
-            
-            # Error vector
+
+            if not np.isfinite(dx_ds) or not np.isfinite(dy_ds):
+                return s_init  # fallback to coarse guess
+
             ex = x_ref - x
             ey = y_ref - y
-            
-            # Newton step
-            numerator = ex * dx_ds + ey * dy_ds
-            denominator = dx_ds**2 + dy_ds**2 + 1e-6
-            
-            s_new = s - numerator / denominator
-            s_new = np.clip(s_new, 0, self.s_max)
-            
-            # Check convergence
+
+            denominator = dx_ds**2 + dy_ds**2
+
+            if denominator < 1e-6:
+                return s_init  # tangent too small → unsafe Newton
+
+            s_new = s - (ex * dx_ds + ey * dy_ds) / denominator
+            s_new = float(np.clip(s_new, 0, self.s_max))
+
+            if not np.isfinite(s_new):
+                return s_init
+
             if abs(s_new - s) < 1e-4:
                 break
-            
+
             s = s_new
-        
+
         return s
     
     @staticmethod
