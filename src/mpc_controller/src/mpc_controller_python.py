@@ -117,7 +117,7 @@ class MPCController:
         self.acados_solver.set(0, "x", np.array([s, d, alpha, v, D, delta, s]))
 
         # Set obstacle parameters for stage 0
-        self.acados_solver.set(0, "p", obstacles.flatten())
+        # self.acados_solver.set(0, "p", obstacles.flatten())
         
         # 4. Warm-start with trajectory toward target lane
         if target_lane_d is not None:
@@ -164,7 +164,7 @@ class MPCController:
                 n_right = -road_widths[idx, 1]
             else:
                 # Default road bounds
-                n_left = 0.5
+                n_left = 3.8
                 n_right = -0.5
             
             # Add safety margin
@@ -350,17 +350,22 @@ class MPCController:
         # Initial condition on the ODE
         x0 = np.concatenate((states, inputs), axis=0)
         
-        solution = solve_ivp(
-            self._dynamics_of_car,
-            t_span=[0, self.t_delay],
-            y0=x0,
-            method="RK45",
-            atol=1e-8,
-            rtol=1e-8,
-        )
+        # OPTION 1: Fast Forward Euler (recommended for t_delay < 0.05s)
+        if self.t_delay < 0.05:
+            xdot = self._dynamics_of_car(0, x0)
+            solution = x0 + self.t_delay * np.array(xdot)
+        else:
+            # OPTION 2: RK45 for longer delays
+            solution = solve_ivp(
+                self._dynamics_of_car,
+                t_span=[0, self.t_delay],
+                y0=x0,
+                method="RK45",
+                atol=1e-8,
+                rtol=1e-8,
+            )
+            solution = [x[-1] for x in solution.y]
         
-        solution = [x[-1] for x in solution.y]
-
         # Extract states and apply constraints
         s, n, alpha, v, D, delta, theta = solution[:7]
         

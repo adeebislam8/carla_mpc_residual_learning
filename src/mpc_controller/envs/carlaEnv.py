@@ -317,6 +317,7 @@ class CarlaMPCEnv(gym.Env):
         
         # Initialize ACADOS
         self.mpc_controller.initialize_acados(kappa_spline, path_msg=None)
+        self.mpc_controller._global_path_length = self.path_length
     
     def _update_vehicle_state(self):
         """Update vehicle state from CARLA"""

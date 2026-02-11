@@ -252,7 +252,7 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     # closest_distance = fmin(dist_obs1, fmin(dist_obs2, fmin(dist_obs3, fmin(dist_obs4, fmin(dist_obs5, dist_obs6)))))
     model.cost_expr_ext_cost = (
         (ql * (s - theta) ** 2) 
-        + qc * n**2 
+        + qc * n**2 # * fmax(0, sign((s_obs1 - s) - 5.0)) # Only add cost when obstacle is 5m in front of ego
         + qa * alpha**2
         - gamma * derTheta * fmax(0, sign(path_length - s - DIST2STOP))
         + r1 * derD**2 * fmax(0, sign(path_length - s - DIST2STOP))
@@ -267,6 +267,9 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     model.cost_expr_ext_cost_e =    (     0
 
     )
+    # overtake_zone = exp(-0.2 * (s_obs1 - s)**2)
+    # model.cost_expr_ext_cost += -3.0 * overtake_zone * fabs(n)
+
     # Define model struct
     params = types.SimpleNamespace()
     params.C1 = C1

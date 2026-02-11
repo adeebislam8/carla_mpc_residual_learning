@@ -205,15 +205,21 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3):
     ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     ocp.solver_options.nlp_solver_type = "SQP_RTI"
     # ocp.solver_options.nlp_solver_type = "SQP"
+    # ocp.solver_options.nlp_solver_max_iter = 5
     # ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     # ocp.solver_options.levenberg_marquardt = 1e-6
     # ocp.solver_options.integrator_type = "ERK"
     # ocp.solver_options.sim_method_num_stages = 4
     # ocp.solver_options.sim_method_num_steps = 4
     # ocp.solver_options.nlp_solver_step_length = 0.05
-    ocp.solver_options.nlp_solver_max_iter = 50
+    ocp.solver_options.qp_solver_iter_max = 100  # Prevent infinite QP iterations
+    ocp.solver_options.qp_solver_cond_N = 5      # Condensing horizon   
     # ocp.solver_options.tol = 1e-3
     # ocp.solver_options.nlp_solver_tol_comp = 1e-1
+    ocp.solver_options.nlp_solver_tol_stat = 1e-4
+    ocp.solver_options.nlp_solver_tol_eq = 1e-4
+    ocp.solver_options.nlp_solver_tol_ineq = 1e-4
+    ocp.solver_options.nlp_solver_tol_comp = 1e-4
 
     # create solver
     acados_solver = AcadosOcpSolver(ocp, json_file="acados_ocp.json")
