@@ -7,6 +7,7 @@ from gymnasium import spaces
 from typing import Dict, Tuple, Optional, List
 from scipy.interpolate import make_interp_spline
 import sys
+import weakref
 
 sys.path.append('/home/ave/Desktop/carla_mpc_residual_learning/src')
 
@@ -30,7 +31,7 @@ class CarlaMPCEnv(gym.Env):
         max_steps: int = 1000,
         lookahead_distance: float = 100.0,
         num_obstacles: int = 6,
-        state_dim: int = 66,
+        state_dim: int = 116,
         mpc_horizon: int = 30,
         mpc_dt: float = 0.05,
         discrete_actions: bool = False,
@@ -94,6 +95,7 @@ class CarlaMPCEnv(gym.Env):
         # Episode state
         self.collision = False
         self.lane_invasion = False
+        self.sensor_detected_obstacles = []
         self.start_time = 0.0
         
         # Gymnasium spaces
@@ -127,6 +129,24 @@ class CarlaMPCEnv(gym.Env):
         
     def _spawn_ego_vehicle(self, spawn_point: carla.Transform) -> bool:
         """Spawn ego vehicle at given spawn point"""
+        try:
+            all_vehicles = self.world.get_actors().filter('vehicle.*')
+            for vehicle in all_vehicles:
+                try:
+                    if vehicle.is_alive:
+                        vehicle.destroy()
+                except:
+                    pass
+            
+            # Tick a few times to ensure cleanup
+            for _ in range(3):
+                self.world.tick()
+                time.sleep(0.02)
+            
+            print("✓ All vehicles cleared")
+        except Exception as e:
+            print(f"Warning: Error while clearing vehicles: {e}")
+        
         blueprint_library = self.world.get_blueprint_library()
         vehicle_bp = blueprint_library.filter('vehicle.tesla.model3')[0]
         vehicle_bp.set_attribute('role_name', 'ego_vehicle')
@@ -160,6 +180,26 @@ class CarlaMPCEnv(gym.Env):
             attach_to=self.vehicle
         )
         self.lane_invasion_sensor.listen(lambda event: self._on_lane_invasion(event))
+
+        # Obstacle detection sensor
+        obstacle_bp = blueprint_library.find('sensor.other.obstacle')
+        obstacle_bp.set_attribute('distance', '150')
+        obstacle_bp.set_attribute('hit_radius', '3.0')
+        obstacle_bp.set_attribute('debug_linetrace', 'true')
+        
+        self.obstacle_sensor = self.world.spawn_actor(
+            obstacle_bp,
+            carla.Transform(carla.Location(x=2.5, z=1.0)),
+            attach_to=self.vehicle
+        )
+        
+        # Store detected obstacles from sensor
+        self.sensor_detected_obstacles = []
+        # Use a weak listener to avoid issues during cleanup
+        weak_self = weakref.ref(self)
+        self.obstacle_sensor.listen(
+            lambda event: CarlaMPCEnv._on_obstacle_detected_static(weak_self, event)
+        )
         
         self.world.tick()
     
@@ -173,6 +213,27 @@ class CarlaMPCEnv(gym.Env):
             if marking.type == carla.LaneMarkingType.Solid:
                 self.lane_invasion = True
                 break
+    
+    @staticmethod
+    def _on_obstacle_detected_static(weak_self, event):
+        """Static callback for obstacle detection to handle cleanup gracefully"""
+        self = weak_self()
+        if self is not None:
+            self._on_obstacle_detected(event)
+
+    def _on_obstacle_detected(self, event):
+        """Callback for obstacle detection sensor"""
+        try:
+            if event.other_actor is not None and hasattr(self, 'sensor_detected_obstacles'):
+                self.sensor_detected_obstacles.append({
+                    'actor': event.other_actor,
+                    'distance': event.distance,
+                    'location': event.other_actor.get_location(),
+                    'timestamp': time.time()
+                })
+        except (RuntimeError, AttributeError):
+            # Sensor or actor may be destroyed during callback
+            pass
     
     def _generate_path(self, start: carla.Transform, goal: carla.Transform):
         """Generate global path from start to goal"""
@@ -287,6 +348,24 @@ class CarlaMPCEnv(gym.Env):
 
         if s > self.path_length - 3.0:
             s_new = 2.0
+            respawn_buffer = 5.0
+            
+            # Check if ego vehicle is too close to the spawn point
+            ego_in_respawn_zone = (self.current_s < s_new + respawn_buffer)
+            
+            if ego_in_respawn_zone:
+                npc = npc_data["actor"]
+                try:
+                    if npc.is_alive:
+                        npc.destroy()
+                except:
+                    pass
+                
+                # Mark this NPC as destroyed
+                npc_data["actor"] = None
+                return
+            
+            # Safe to respawn
             x, y, yaw = self.frenet_converter.frenet_to_world(s_new, 0.0, 0.0)
 
             npc = npc_data["actor"]
@@ -347,10 +426,53 @@ class CarlaMPCEnv(gym.Env):
         
         ego_location = self.vehicle.get_location()
         obstacles = []
-    
+        
+        # Clean up old sensor detections (older than 0.5 seconds)
+        current_time = time.time()
+        self.sensor_detected_obstacles = [
+            obs for obs in self.sensor_detected_obstacles 
+            if current_time - obs.get('timestamp', 0) < 0.5
+        ]
+        
+        # 1. Process obstacles from the sensor
+        for obs_data in self.sensor_detected_obstacles:
+            try:
+                actor = obs_data['actor']
+                
+                # Check if actor is still alive
+                if not actor.is_alive:
+                    continue
+                
+                loc = actor.get_location()
+                distance = np.sqrt(
+                    (ego_location.x - loc.x)**2 + 
+                    (ego_location.y - loc.y)**2
+                )
+                
+                if distance < 50.0:
+                    s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
+                        loc.x, loc.y, 0
+                    )
+                    
+                    if s_obs > self.current_s - 5.0 and abs(d_obs) < 8.0:
+                        obstacles.append({
+                            's': s_obs, 
+                            'd': d_obs, 
+                            'distance': s_obs - self.current_s,
+                            'type': 'sensor_detected',
+                            'actor_id': actor.id
+                        })
+            except:
+                pass
+        
+        # 2. Add vehicles (manual detection as backup)
         vehicles = self.world.get_actors().filter('vehicle.*')
         for vehicle in vehicles:
             if vehicle.id == self.vehicle.id:
+                continue
+            
+            # Skip if already detected by sensor
+            if any(obs.get('actor_id') == vehicle.id for obs in obstacles):
                 continue
             
             loc = vehicle.get_location()
@@ -359,40 +481,48 @@ class CarlaMPCEnv(gym.Env):
                 (ego_location.y - loc.y)**2
             )
             
-            if distance < 50.0:  # Within 50m
-                s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
-                    loc.x, loc.y, 0
-                )
-                
-                if s_obs > self.current_s and abs(d_obs) < 5.0:
-                    obstacles.append({
-                        's': s_obs, 
-                        'd': d_obs, 
-                        'distance': s_obs - self.current_s,
-                        'type': 'vehicle'
-                    })
-
-        static_obstacles = self.world.get_actors().filter('static.prop.*')
-        for prop in static_obstacles:
+            if distance < 50.0:
+                try:
+                    s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
+                        loc.x, loc.y, 0
+                    )
+                    
+                    if s_obs > self.current_s - 5.0 and abs(d_obs) < 8.0:
+                        obstacles.append({
+                            's': s_obs, 
+                            'd': d_obs, 
+                            'distance': s_obs - self.current_s,
+                            'type': 'vehicle',
+                            'actor_id': vehicle.id
+                        })
+                except:
+                    pass
+        
+        # 3. Add static objects (manual detection for those not caught by sensor)
+        static_objects = self.world.get_actors().filter('static.*')
+        for prop in static_objects:
             loc = prop.get_location()
             distance = np.sqrt(
                 (ego_location.x - loc.x)**2 + 
                 (ego_location.y - loc.y)**2
             )
             
-            if distance < 40.0:
-                s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
-                    loc.x, loc.y, 0
-                )
-                
-                if s_obs > self.current_s and abs(d_obs) < 5.0:
-                    obstacles.append({
-                        's': s_obs, 
-                        'd': d_obs, 
-                        'distance': s_obs - self.current_s,
-                        'type': 'static'
-                    })
-        
+            if distance < 50.0:
+                try:
+                    s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
+                        loc.x, loc.y, 0
+                    )
+                    
+                    if s_obs > self.current_s - 5.0 and abs(d_obs) < 8.0:
+                        obstacles.append({
+                            's': s_obs, 
+                            'd': d_obs, 
+                            'distance': s_obs - self.current_s,
+                            'type': 'static'
+                        })
+                except:
+                    pass
+
         # Sort by distance and select closest N
         obstacles.sort(key=lambda x: x['distance'])
         
@@ -570,7 +700,7 @@ class CarlaMPCEnv(gym.Env):
                     
                     # Initialize MPC
                     self._initialize_mpc()
-                    self._visualize_path_and_goal(goal_point)
+                    # self._visualize_path_and_goal(goal_point)
 
                     self.racing_npcs = self._spawn_frenet_racers(num_cars=5)
 
@@ -606,8 +736,9 @@ class CarlaMPCEnv(gym.Env):
             self.prev_s = self.current_s
 
             for npc_data in self.racing_npcs:
-                self._frenet_follow_controller(npc_data, self.mpc_dt)
-                self._respawn_if_finished(npc_data)
+                if npc_data["actor"] is not None and npc_data["actor"].is_alive:
+                    self._frenet_follow_controller(npc_data, self.mpc_dt)
+                    self._respawn_if_finished(npc_data)
             
             # Run MPC to get base control
             self._update_vehicle_state()
@@ -634,6 +765,9 @@ class CarlaMPCEnv(gym.Env):
             
             final_throttle = np.clip(mpc_throttle + residual_throttle, -1.0, 1.0)
             final_steering = np.clip(mpc_steering + residual_steering, -1.0, 1.0)
+
+            if final_throttle < 0 and self.current_speed < 0.3:
+                final_throttle = 0.5  # Prevent Stalling
             
             # Apply control to vehicle
             control = carla.VehicleControl()
@@ -658,10 +792,11 @@ class CarlaMPCEnv(gym.Env):
             if hasattr(self, 'render_mode') and self.render_mode == 'human':
                 self._draw_vehicle_info()
             
-            self._draw_road_boundaries_ahead()
+            # self._draw_road_boundaries_ahead()
+            self._visualize_detected_obstacles()
                 
-            if self.current_step % 5 == 0:
-                self._visualize_mpc_prediction()
+            # if self.current_step % 5 == 0:
+            #      self._visualize_mpc_prediction()
 
             
             return obs, reward, done, False, info
@@ -672,34 +807,46 @@ class CarlaMPCEnv(gym.Env):
         """Safely destroy all actors"""
         actors_to_destroy = []
         
-        # Collect actors
-        if self.collision_sensor is not None:
+        # Collect sensors FIRST (destroy them before the vehicle they're attached to)
+        if hasattr(self, 'collision_sensor') and self.collision_sensor is not None:
             actors_to_destroy.append(self.collision_sensor)
-            self.collision_sensor = None
         
-        if self.lane_invasion_sensor is not None:
+        if hasattr(self, 'lane_invasion_sensor') and self.lane_invasion_sensor is not None:
             actors_to_destroy.append(self.lane_invasion_sensor)
-            self.lane_invasion_sensor = None
         
+        if hasattr(self, 'obstacle_sensor') and self.obstacle_sensor is not None:
+            actors_to_destroy.append(self.obstacle_sensor)
+        
+        # Then collect the vehicle
         if self.vehicle is not None:
             actors_to_destroy.append(self.vehicle)
-            self.vehicle = None
         
         # NPC racers (stored as dicts)
         if hasattr(self, 'racing_npcs'):
             for npc_data in self.racing_npcs:
                 npc = npc_data.get("actor", None)
-                if npc is not None and npc.is_alive:
-                    actors_to_destroy.append(npc)
-            self.racing_npcs = []
+                if npc is not None:
+                    try:
+                        if npc.is_alive:
+                            actors_to_destroy.append(npc)
+                    except (RuntimeError, AttributeError):
+                        pass
 
-        # Destroy everything safely
+        # Destroy everything safely BEFORE setting to None
         for actor in actors_to_destroy:
             try:
                 if actor.is_alive:
                     actor.destroy()
-            except RuntimeError:
+            except (RuntimeError, AttributeError):
                 pass
+
+        # NOW set references to None AFTER destruction
+        self.collision_sensor = None
+        self.lane_invasion_sensor = None
+        self.obstacle_sensor = None
+        self.sensor_detected_obstacles = []
+        self.vehicle = None
+        self.racing_npcs = []
 
         # Clear MPC controller to avoid stale references
         self.mpc_controller = None
@@ -708,19 +855,22 @@ class CarlaMPCEnv(gym.Env):
         
         if hasattr(self, 'world') and self.world is not None:
             self.world.tick()
-
     
     def _load_random_town(self):
         print("Preparing to load new town...")
-        if self.collision_sensor is not None:
-            self.collision_sensor.stop()
-        if self.lane_invasion_sensor is not None:
-            self.lane_invasion_sensor.stop()
+        try:
+            settings = self.world.get_settings()
+            settings.synchronous_mode = False
+            settings.fixed_delta_seconds = None
+            self.world.apply_settings(settings)
+
+            tm = self.client.get_trafficmanager(8000)
+            tm.set_synchronous_mode(False)
+        except:
+            pass
         
         self._destroy_actors()
-        for _ in range(5):
-            self.world.tick()
-            time.sleep(0.02)
+        time.sleep(1.0)
 
         available = [t for t in self.available_towns if t != self.current_town]
         new_town = random.choice(available) if available else random.choice(self.available_towns)
@@ -736,7 +886,15 @@ class CarlaMPCEnv(gym.Env):
             print("Waiting for world to stabilize...")
             for _ in range(20):
                 self.world.tick()
-                time.sleep(0.05)
+                time.sleep(0.1)
+
+            # Wait for spawn points to become valid
+            for _ in range(50):
+                spawn_points = self.map.get_spawn_points()
+                if len(spawn_points) > 10:
+                    break
+                self.world.tick()
+                time.sleep(0.1)
             
             print(f"✓ Successfully loaded {new_town}")
             
@@ -916,27 +1074,78 @@ class CarlaMPCEnv(gym.Env):
                 life_time=15.0
             )
 
+    def _visualize_detected_obstacles(self):
+        """Visualize obstacles with different colors based on detection method"""
+        if self.frenet_converter is None or self.vehicle is None:
+            return
+        
+        debug = self.world.debug
+        ego_loc = self.vehicle.get_transform().location
+        
+        # Visualize sensor-detected obstacles
+        for obs_data in self.sensor_detected_obstacles:
+            try:
+                if obs_data['actor'].is_alive:
+                    loc = obs_data['location']
+                    # Green for sensor-detected
+                    debug.draw_point(
+                        carla.Location(x=loc.x, y=loc.y, z=1.0),
+                        size=0.25,
+                        color=carla.Color(0, 255, 0),  # Green
+                        life_time=0.1
+                    )
+
+                        # Draw line from ego to obstacle
+                    debug.draw_line(
+                        ego_loc,
+                        obs_loc,
+                        thickness=0.03,
+                        color=carla.Color(255, 255, 0),  # Yellow
+                        life_time=0.1
+                    )
+            except:
+                pass
+        
+        # Visualize selected obstacles (in observation)
+        for i, obs in enumerate(self.selected_obstacles):
+            if obs[0] > -50:  # Valid obstacle
+                s_obs, d_obs = obs[0], obs[1]
+                
+                x, y, _ = self.frenet_converter.frenet_to_world(s_obs, d_obs, 0.0)
+                obs_loc = carla.Location(x=x, y=y, z=1.0)
+                
+                # Red for obstacles in observation
+                debug.draw_point(
+                    obs_loc,
+                    size=0.2,
+                    color=carla.Color(255, 0, 0),  # Red
+                    life_time=0.1
+                )
+                
+                # Draw line from ego to obstacle
+                debug.draw_line(
+                    ego_loc,
+                    obs_loc,
+                    thickness=0.03,
+                    color=carla.Color(255, 255, 0),  # Yellow
+                    life_time=0.1
+                )
+
     def close(self):
         try:
-            # Stop sensors
-            if self.collision_sensor is not None:
-                self.collision_sensor.stop()
-            if self.lane_invasion_sensor is not None:
-                self.lane_invasion_sensor.stop()
-
-            # Destroy ego + sensors
             self._destroy_actors()
 
             # Extra safety: remove any leftover vehicles
             if self.world is not None:
                 for v in self.world.get_actors().filter('vehicle.*'):
                     try:
-                        v.destroy()
+                        if v.is_alive:
+                            v.destroy()
                     except:
                         pass
                 self.world.tick()
 
-            # Restore async mode so CARLA isn't stuck in sync
+            # Restore async mode
             if self.world is not None:
                 settings = self.world.get_settings()
                 settings.synchronous_mode = False

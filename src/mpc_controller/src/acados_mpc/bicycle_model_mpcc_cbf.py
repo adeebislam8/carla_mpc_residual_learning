@@ -6,19 +6,38 @@ from casadi import *
 # from tracks.readDataFcn import getTrack
 from utils.convert_traj_track import parseReference, parseGlobal
 import math
-SAFETY_DISTANCE = 2.8
+SAFETY_DISTANCE = 1.0 # At ellipse boundary
 DEG2RAD = math.pi/180.0
 RAD2DEG = 180.0/math.pi
 DIST2STOP = 0
 
 
-def distance2obs_casadi(s, n, s_obs, n_obs):
-    # Define the condition for the large distance return
+def distance2obs_casadi_elliptical(s, n, s_obs, n_obs, a=3.5, b=1.4):
+    """
+    Elliptical safety zone around obstacle
+    
+    Args:
+        s, n: Ego vehicle position in Frenet frame
+        s_obs, n_obs: Obstacle position in Frenet frame
+        a: Longitudinal semi-axis (meters) - controls fore/aft safety
+        b: Lateral semi-axis (meters) - controls side-to-side safety
+    
+    Returns:
+        Normalized distance in elliptical metric
+        - distance = 1.0 means exactly at safety boundary
+        - distance > 1.0 means safe
+        - distance < 1.0 means violation
+    """
+    # Ignore obstacles that are far behind (same as before)
     condition = s > (s_obs + 5)
-    # Use CasADi's if_else to handle conditional expressions
-    distance = if_else(condition, 
-                          999999,  # Large number instead of infinity
-                          sqrt((s - s_obs)**2 + (n - n_obs)**2))  # Calculate Euclidean distance
+    
+    # Elliptical distance formula:
+    # sqrt((Δs/a)² + (Δn/b)²)
+    distance = if_else(
+        condition, 
+        999999,  # Ignore obstacles behind
+        sqrt(((s - s_obs)/a)**2 + ((n - n_obs)/b)**2)  # ELLIPTICAL
+    )
     return distance
 
 
@@ -142,6 +161,8 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     a_lat = C2 * v * v * delta + a_long * sin(C1 * delta)
 
     gamma = 0.7
+    a_long = 3.5  # Longitudinal semi-axis (meters)
+    b_lat = 1.4   # Lateral semi-axis (meters)
 
 
     """ wrong """
@@ -151,22 +172,22 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3):
     b4 = sqrt(((s - s_obs4)/1.0)**2 + ((n - n_obs4)/1.0)**2) 
     b5 = sqrt(((s - s_obs5)/1.0)**2 + ((n - n_obs5)/1.0)**2) 
     b6 = sqrt(((s - s_obs6)/1.0)**2 + ((n - n_obs6)/1.0)**2) 
-    b1 = distance2obs_casadi(s, n, s_obs1, n_obs1)
-    b2 = distance2obs_casadi(s, n, s_obs2, n_obs2)
-    b3 = distance2obs_casadi(s, n, s_obs3, n_obs3)
-    b4 = distance2obs_casadi(s, n, s_obs4, n_obs4)
-    b5 = distance2obs_casadi(s, n, s_obs5, n_obs5)
-    b6 = distance2obs_casadi(s, n, s_obs6, n_obs6)
+    b1 = distance2obs_casadi_elliptical(s, n, s_obs1, n_obs1, a_long, b_lat)
+    b2 = distance2obs_casadi_elliptical(s, n, s_obs2, n_obs2, a_long, b_lat)
+    b3 = distance2obs_casadi_elliptical(s, n, s_obs3, n_obs3, a_long, b_lat)
+    b4 = distance2obs_casadi_elliptical(s, n, s_obs4, n_obs4, a_long, b_lat)
+    b5 = distance2obs_casadi_elliptical(s, n, s_obs5, n_obs5, a_long, b_lat)
+    b6 = distance2obs_casadi_elliptical(s, n, s_obs6, n_obs6, a_long, b_lat)
     #all_dist = Function('all_dist', [s, n, s_obs1, n_obs1, s_obs2, n_obs2, s_obs3, n_obs3, s_obs4, n_obs4, s_obs5, n_obs5, s_obs6, n_obs6], [b1, b2, b3, b4, b5, b6])
     s_next = s + sdot * dt_
     n_next = n + ndot * dt_
 
-    b1_next = distance2obs_casadi(s_next, n_next, s_obs1, n_obs1)
-    b2_next = distance2obs_casadi(s_next, n_next, s_obs2, n_obs2)
-    b3_next = distance2obs_casadi(s_next, n_next, s_obs3, n_obs3)
-    b4_next = distance2obs_casadi(s_next, n_next, s_obs4, n_obs4)
-    b5_next = distance2obs_casadi(s_next, n_next, s_obs5, n_obs5)
-    b6_next = distance2obs_casadi(s_next, n_next, s_obs6, n_obs6)
+    b1_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs1, n_obs1, a_long, b_lat)
+    b2_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs2, n_obs2, a_long, b_lat)
+    b3_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs3, n_obs3, a_long, b_lat)
+    b4_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs4, n_obs4, a_long, b_lat)
+    b5_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs5, n_obs5, a_long, b_lat)
+    b6_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs6, n_obs6, a_long, b_lat)
     print("s_next_type: ", type(s_next))
     print("n_next_type: ", type(n_next))
     #all_dist_next = Function('all_dist_next', [s_next, n_next, s_obs1, n_obs1, s_obs2, n_obs2, s_obs3, n_obs3, s_obs4, n_obs4, s_obs5, n_obs5, s_obs6, n_obs6], [b1_next, b2_next, b3_next, b4_next, b5_next, b6_next])

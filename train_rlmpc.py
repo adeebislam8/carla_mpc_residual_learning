@@ -292,72 +292,96 @@ def evaluate_model(model_path: str, num_episodes: int = 10):
     print(f"  Success rate: {success_count}/{num_episodes} ({100*success_count/num_episodes:.1f}%)")
     print("="*60)
 
-def test_mpc_only(num_steps=200, camera_mode='follow'):
+def test_mpc_only(num_steps=1000, camera_mode='follow'):
+    env = None
     try:
         print("="*60)
         print("Testing MPC Controller (No RL)")
+        print("Press Ctrl+C to stop")
         print("="*60)
         
         env = CarlaMPCEnv(
             host='localhost',
             port=2000,
-            towns=['Town01'],
+            towns=['Town01', 'Town02', 'Town03', 'Town04'],
             episodes_per_town=999999,
             max_steps=1000,
             #render_mode='human'
         )
         
-        obs, info = env.reset()
-        
-        print(f"Path length: {env.path_length:.1f}m")
-        print(f"Starting position: s={env.current_s:.1f}, d={env.current_d:.1f}")
-        print("\nWatching MPC drive (no RL residuals)...\n")
-        
-        done = False
-        step = 0
-        total_reward = 0
-        
-        while not done and step < num_steps:
-            action = np.array([0.0, 0.0])
-            
-            try:
-                obs, reward, done, truncated, info = env.step(action)
-            except Exception as e:
-                print(f"Error unpacking: {e}")
-                break
-            env.render(camera_mode=camera_mode)
-            
-            total_reward += reward
-            step += 1
+        episode_num = 0
 
-            if step % 5 == 0:
-                print(f"Step {step:3d}: "
-                    f"speed={env.current_speed:4.1f} m/s, "
-                    f"progress={env.current_s:5.1f}/{env.path_length:.1f}m "
-                    f"({100*env.current_s/env.path_length:5.1f}%), "
-                    f"lateral={env.current_d:4.2f}m, "
-                    f"reward={reward:6.2f}")
+        while True:
+            episode_num += 1
+            print(f"\n{'='*60}")
+            print(f"Starting Episode {episode_num}")
+            print(f"{'='*60}")
             
-            time.sleep(0.02)
+            obs, info = env.reset()
+            
+            print(f"Path length: {env.path_length:.1f}m")
+            print(f"Starting position: s={env.current_s:.1f}, d={env.current_d:.1f}")
+            print("\nWatching MPC drive (no RL residuals)...\n")
+            
+            done = False
+            step = 0
+            total_reward = 0
+            
+            # Episode loop
+            while not done and step < num_steps:
+                action = np.array([0.0, 0.0])
+                
+                try:
+                    obs, reward, done, truncated, info = env.step(action)
+                except Exception as e:
+                    print(f"Error during step: {e}")
+                    break
+                
+                env.render(camera_mode=camera_mode)
+                
+                total_reward += reward
+                step += 1
+
+                if step % 5 == 0:
+                    print(f"Step {step:3d}: "
+                        f"speed={env.current_speed:4.1f} m/s, "
+                        f"progress={env.current_s:5.1f}/{env.path_length:.1f}m "
+                        f"({100*env.current_s/env.path_length:5.1f}%), "
+                        f"lateral={env.current_d:4.2f}m, "
+                        f"reward={reward:6.2f}")
+                
+                time.sleep(0.02)
+            
+            # Episode summary
+            print(f"\n{'='*60}")
+            print(f"Episode {episode_num} finished!")
+            print(f"  Reason: {info.get('done_reason', 'max steps')}")
+            print(f"  Total steps: {step}")
+            print(f"  Total reward: {total_reward:.2f}")
+            print(f"  Final progress: {env.current_s:.1f}/{env.path_length:.1f}m "
+                f"({100*env.current_s/env.path_length:.1f}%)")
+            
+            if 'lap_time' in info:
+                print(f"  Time: {info['lap_time']:.2f}s")
+            
+            print(f"{'='*60}")
+            print("Respawning in 2 seconds...")
+            time.sleep(2)
         
-        print(f"\n{'='*60}")
-        print(f"Test finished!")
-        print(f"  Reason: {info.get('done_reason', 'max steps')}")
-        print(f"  Total steps: {step}")
-        print(f"  Total reward: {total_reward:.2f}")
-        print(f"  Final progress: {env.current_s:.1f}/{env.path_length:.1f}m "
-            f"({100*env.current_s/env.path_length:.1f}%)")
-        
-        if 'lap_time' in info:
-            print(f"  Time: {info['lap_time']:.2f}s")
-        
-        print(f"{'='*60}")
-        
-        env.close()
     except KeyboardInterrupt:
-        env.close()
+        print("\n\n" + "="*60)
+        print("⚠ Testing stopped by user (Ctrl+C)")
+        print(f"Total episodes completed: {episode_num}")
+        print("="*60)
     except Exception as e:
-        print(f"Error in test mpc only: {e}")
+        print(f"\n❌ Error in test_mpc_only: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if env is not None:
+            print("\nClosing environment...")
+            env.close()
+            print("✓ Environment closed")
 
 
 if __name__ == "__main__":
