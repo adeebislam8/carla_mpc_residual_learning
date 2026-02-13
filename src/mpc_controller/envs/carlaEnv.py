@@ -24,7 +24,7 @@ class CarlaMPCEnv(gym.Env):
         self,
         host: str = 'localhost',
         port: int = 2000,
-        timeout: float = 10.0,
+        timeout: float = 100.0,
         towns: List[str] = ['Town01', 'Town02', 'Town03', 'Town04'],
         episodes_per_town: int = 99999,
         target_speed: float = 8.33,  # m/s
@@ -45,7 +45,7 @@ class CarlaMPCEnv(gym.Env):
         self.timeout = timeout
         self.client = carla.Client(host, port)
         self.client.set_timeout(timeout)
-        self.world = self.client.get_world()
+        self.world = self.client.load_world('Town01')
         self.map = self.world.get_map()
         
         # Multi-town setup
@@ -121,6 +121,8 @@ class CarlaMPCEnv(gym.Env):
         settings = self.world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = self.mpc_dt
+        settings.tile_stream_distance = 5000  # Load tiles within 5km (was probably 2000 default)
+        settings.actor_active_distance = 5000  # Keep actors active within 5km
         self.world.apply_settings(settings)
         
         # Enable traffic manager in sync mode
@@ -184,7 +186,7 @@ class CarlaMPCEnv(gym.Env):
         # Obstacle detection sensor
         obstacle_bp = blueprint_library.find('sensor.other.obstacle')
         obstacle_bp.set_attribute('distance', '150')
-        obstacle_bp.set_attribute('hit_radius', '3.0')
+        obstacle_bp.set_attribute('hit_radius', '250.0')
         obstacle_bp.set_attribute('debug_linetrace', 'true')
         
         self.obstacle_sensor = self.world.spawn_actor(
@@ -216,10 +218,22 @@ class CarlaMPCEnv(gym.Env):
     
     @staticmethod
     def _on_obstacle_detected_static(weak_self, event):
-        """Static callback for obstacle detection to handle cleanup gracefully"""
+        """Static callback with proper None checks"""
         self = weak_self()
         if self is not None:
-            self._on_obstacle_detected(event)
+            try:
+                # Check if sensor data still exists
+                if hasattr(self, 'sensor_detected_obstacles'):
+                    if event.other_actor is not None and event.other_actor.is_alive:
+                        self.sensor_detected_obstacles.append({
+                            'actor': event.other_actor,
+                            'distance': event.distance,
+                            'location': event.other_actor.get_location(),
+                            'timestamp': time.time()
+                        })
+            except (RuntimeError, AttributeError):
+                # Gracefully handle destroyed actors/sensors
+                pass
 
     def _on_obstacle_detected(self, event):
         """Callback for obstacle detection sensor"""
@@ -655,17 +669,19 @@ class CarlaMPCEnv(gym.Env):
         # Town rotation
         try:
             self.episode_count += 1
-            if self.episode_count % self.episodes_per_town == 0 and self.episode_count > 0:
-                self._load_random_town()
+            # if self.episode_count % self.episodes_per_town == 0 and self.episode_count > 0:
+            #     self._load_random_town()
+            # Disable because of resource
             
             # Destroy old vehicle and sensors
             self._destroy_actors()
             
             # Find valid spawn and goal
-            max_attempts = 30
+            max_attempts = 500
             for attempt in range(max_attempts):
                 spawn_points = self.map.get_spawn_points()
                 spawn_point = random.choice(spawn_points)
+                spawn_point.location.z += 1.0 #avoid collision
                 goal_point = random.choice(spawn_points)
                 # spawn_point = carla.Transform(
                 #     carla.Location(x=-45.235935, y=-36.500095, z=0.600000),
@@ -683,7 +699,7 @@ class CarlaMPCEnv(gym.Env):
                     (spawn_point.location.y - goal_point.location.y)**2
                 )
                 
-                if dist > 100.0:
+                if dist < 900 and dist > 100.0:
                     print(f"spawn: {spawn_point}")
                     print(f"goal: {goal_point}")
                     # Spawn vehicle
@@ -706,7 +722,7 @@ class CarlaMPCEnv(gym.Env):
 
                     break
             else:
-                raise RuntimeError("Failed to find valid spawn after 30 attempts")
+                raise RuntimeError(f"Failed to find valid spawn after {max_attempts} attempts")
             
             # Reset state
             self.current_step = 0
@@ -767,7 +783,7 @@ class CarlaMPCEnv(gym.Env):
             final_steering = np.clip(mpc_steering + residual_steering, -1.0, 1.0)
 
             if final_throttle < 0 and self.current_speed < 0.3:
-                final_throttle = 0.5  # Prevent Stalling
+                final_throttle = 1.0  # Prevent Stalling
             
             # Apply control to vehicle
             control = carla.VehicleControl()
@@ -796,7 +812,7 @@ class CarlaMPCEnv(gym.Env):
             self._visualize_detected_obstacles()
                 
             # if self.current_step % 5 == 0:
-            #      self._visualize_mpc_prediction()
+            #     self._visualize_mpc_prediction()
 
             
             return obs, reward, done, False, info
@@ -858,6 +874,19 @@ class CarlaMPCEnv(gym.Env):
     
     def _load_random_town(self):
         print("Preparing to load new town...")
+        
+        # 1. STOP all sensor callbacks FIRST
+        if hasattr(self, 'obstacle_sensor') and self.obstacle_sensor is not None:
+            self.obstacle_sensor.stop()  # Stop listening before destroy
+        if hasattr(self, 'collision_sensor') and self.collision_sensor is not None:
+            self.collision_sensor.stop()
+        if hasattr(self, 'lane_invasion_sensor') and self.lane_invasion_sensor is not None:
+            self.lane_invasion_sensor.stop()
+        
+        # 2. Clear sensor data to prevent callback access
+        self.sensor_detected_obstacles = []
+        
+        # 3. Switch to async BEFORE destroying
         try:
             settings = self.world.get_settings()
             settings.synchronous_mode = False
@@ -866,51 +895,47 @@ class CarlaMPCEnv(gym.Env):
 
             tm = self.client.get_trafficmanager(8000)
             tm.set_synchronous_mode(False)
-        except:
+            
+            # Let async mode settle
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"Switch to async failed with {e}")
             pass
         
+        # 4. Destroy actors (now safely in async)
         self._destroy_actors()
-        time.sleep(1.0)
-
+        
+        # 5. Wait for destruction to complete
+        time.sleep(0.5)
+        
+        # 6. Load new world
         available = [t for t in self.available_towns if t != self.current_town]
         new_town = random.choice(available) if available else random.choice(self.available_towns)
         
         print(f"Loading new town: {new_town}")
         
         try:
+            # Load world (this creates a completely new world object)
             self.world = self.client.load_world(new_town)
             self.map = self.world.get_map()
             self.current_town = new_town
+            
+            # 7. Wait for world to stabilize BEFORE re-enabling sync
+            time.sleep(3.0)
+            
+            # 8. NOW re-enable sync mode
             self._setup_world()
             
-            print("Waiting for world to stabilize...")
+            # 9. Tick to stabilize
             for _ in range(20):
                 self.world.tick()
-                time.sleep(0.1)
-
-            # Wait for spawn points to become valid
-            for _ in range(50):
-                spawn_points = self.map.get_spawn_points()
-                if len(spawn_points) > 10:
-                    break
-                self.world.tick()
-                time.sleep(0.1)
+                time.sleep(0.05)
             
             print(f"✓ Successfully loaded {new_town}")
             
         except Exception as e:
             print(f"❌ Error loading new town: {e}")
-            
-            # Try to recover by reloading current town
-            try:
-                self.world = self.client.load_world(self.current_town)
-                self.map = self.world.get_map()
-                self._setup_world()
-                for _ in range(20):
-                    self.world.tick()
-                    time.sleep(0.05)
-            except:
-                raise RuntimeError(f"Failed to load town and unable to recover: {e}")
+            raise
 
     def render(self, mode='human', camera_mode='top_down'):
         """
