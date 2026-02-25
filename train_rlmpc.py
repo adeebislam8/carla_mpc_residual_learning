@@ -3,10 +3,83 @@ import time
 from stable_baselines3 import SAC, PPO
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.monitor import Monitor
 import numpy as np
 
 from src.mpc_controller.envs.carlaEnv import CarlaMPCEnv
 from racing_score_metrics import RacingMetricsTracker, RacingScoreCalculator
+
+import tracemalloc
+import linecache
+
+import gc
+from collections import Counter
+
+class ObjectCountCallback(BaseCallback):
+    def __init__(self, check_freq=1000, verbose=0):
+        super().__init__(verbose)
+        self.check_freq = check_freq
+        self.baseline_counts = None
+        
+    def _on_step(self):
+        if self.num_timesteps % self.check_freq == 0:
+            gc.collect()
+            
+            # Count objects by type
+            counts = Counter(type(obj).__name__ for obj in gc.get_objects())
+            
+            if self.baseline_counts is None:
+                self.baseline_counts = counts
+                print(f"📊 Baseline object counts at step {self.num_timesteps}")
+            else:
+                print(f"\n📊 Object count changes at step {self.num_timesteps}:")
+                diffs = {k: counts[k] - self.baseline_counts.get(k, 0) 
+                         for k in counts 
+                         if counts[k] - self.baseline_counts.get(k, 0) > 50}
+                
+                for obj_type, diff in sorted(diffs.items(), key=lambda x: -x[1])[:15]:
+                    print(f"  +{diff:6d}  {obj_type}  (total: {counts[obj_type]})")
+        
+        return True
+
+class MemoryLeakCallback(BaseCallback):
+    def __init__(self, snapshot_freq=500, top_n=20, verbose=0):
+        super().__init__(verbose)
+        self.snapshot_freq = snapshot_freq
+        self.snapshots = []
+        
+    def _on_training_start(self):
+        tracemalloc.start(25)  # 25 frames of traceback
+        print("🔍 tracemalloc started")
+        
+    def _on_step(self):
+        if self.num_timesteps % self.snapshot_freq == 0:
+            snapshot = tracemalloc.take_snapshot()
+            self.snapshots.append((self.num_timesteps, snapshot))
+            
+            # Compare with previous snapshot to find what GREW
+            if len(self.snapshots) >= 2:
+                prev_step, prev_snap = self.snapshots[-2]
+                curr_step, curr_snap = self.snapshots[-1]
+                
+                top_stats = curr_snap.compare_to(prev_snap, 'lineno')
+                
+                print(f"\n📈 Memory diff: step {prev_step} → {curr_step}")
+                for stat in top_stats[:10]:
+                    if stat.size_diff > 0:  # Only show growing allocations
+                        print(f"  +{stat.size_diff/1024:.1f} KB | {stat.count_diff} objects | {stat.traceback.format()[0]}")
+            
+            # Also print top absolute consumers
+            top_stats_abs = snapshot.statistics('lineno')
+            print(f"\n🔝 Top absolute memory consumers at step {self.num_timesteps}:")
+            for stat in top_stats_abs[:5]:
+                print(f"  {stat.size/1024/1024:.2f} MB | {stat.count} objects | {stat.traceback.format()[0]}")
+        
+        return True
+    
+    def _on_training_end(self):
+        tracemalloc.stop()
+
 
 
 class RewardLoggerCallback(BaseCallback):
@@ -90,20 +163,20 @@ def train_sac(
     env = CarlaMPCEnv(
         host='localhost',
         port=2000,
-        towns=['Town01'],
-        episodes_per_town=9999999,
-        target_speed=8.33,
+        towns=['Town01', 'Town02', 'Town03', 'Town04'],
+        episodes_per_town=99999999,
+        target_speed=15,
         max_steps=1000
     )
     
     # Create evaluation environment
-    eval_env = CarlaMPCEnv(
+    eval_env = Monitor(CarlaMPCEnv(
         host='localhost',
         port=2000,
-        towns=['Town01'],
-        episodes_per_town=999999,
+        towns=['Town01', 'Town02', 'Town03'],
+        episodes_per_town=9999999,
         max_steps=1000
-    )
+    ))
     
     # Create SAC model
     model = SAC(
@@ -113,7 +186,13 @@ def train_sac(
         buffer_size=buffer_size,
         batch_size=batch_size,
         verbose=1,
-        tensorboard_log="./sac_mpc_tensorboard/"
+        tensorboard_log="./sac_mpc_tensorboard/",
+        gradient_steps=1,        # Don't over-update per step
+        learning_starts=1000,    # Collect more experience before training
+        policy_kwargs=dict(
+            net_arch=[256, 256],
+            optimizer_kwargs=dict(eps=1e-5),  # Applied to all optimizers at init
+        ),
     )
     
     # Callbacks
@@ -125,7 +204,7 @@ def train_sac(
     
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path='./sac_mpc_best/',
+        best_model_save_path='./sac_mpc_suboptimalbest/',
         log_path='./sac_mpc_eval/',
         eval_freq=eval_freq,
         deterministic=True,
@@ -139,7 +218,7 @@ def train_sac(
         print(f"\nStarting training for {total_timesteps} timesteps...")
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[checkpoint_callback, eval_callback, reward_logger],
+            callback=[checkpoint_callback, eval_callback, reward_logger, MemoryLeakCallback(snapshot_freq=500), ObjectCountCallback(check_freq=1000)],
             log_interval=10,
             progress_bar=True
         )
@@ -164,8 +243,8 @@ def train_ppo(
     learning_rate: float = 3e-4,
     n_steps: int = 2048,
     batch_size: int = 64,
-    save_freq: int = 5000,
-    eval_freq: int = 5000
+    save_freq: int = 2000,
+    eval_freq: int = 2000
 ):
     """Train PPO agent (alternative to SAC)"""
     print("="*60)
@@ -180,13 +259,13 @@ def train_ppo(
         max_steps=1000
     )
     
-    eval_env = CarlaMPCEnv(
+    eval_env = Monitor(CarlaMPCEnv(
         host='localhost',
         port=2000,
         towns=['Town01'],
         episodes_per_town=1,
         max_steps=1000
-    )
+    ))
     
     model = PPO(
         'MlpPolicy',

@@ -77,7 +77,7 @@ class RacingScoreCalculator:
         """
         Official CARLA Leaderboard Driving Score
         DS = RC * penalty_factor
-        where penalty_factor = Π (1 - β_i)
+        where penalty_factor = Π (1 - β_i)^n_i
         """
         route_completion = metrics.route_completion
         
@@ -97,7 +97,11 @@ class RacingScoreCalculator:
         penalty_factor *= (1 - penalties['collision_layout']) ** metrics.collisions_layout
         penalty_factor *= (1 - penalties['collision_vehicle']) ** metrics.collisions_vehicles
         penalty_factor *= (1 - penalties['collision_pedestrian']) ** metrics.collisions_pedestrians
-        # ... apply other penalties
+        penalty_factor *= (1 - penalties['red_light']) ** metrics.red_light_violations
+        penalty_factor *= (1 - penalties['stop_sign']) ** metrics.stop_sign_violations
+        penalty_factor *= (1 - penalties['off_road']) ** metrics.off_road_infractions
+        penalty_factor *= (1 - penalties['route_deviation']) ** metrics.route_deviations
+        penalty_factor *= (1 - penalties['route_timeout']) ** metrics.route_timeouts
         
         driving_score = route_completion * penalty_factor
         return driving_score * 100  # Scale to 0-100
@@ -132,7 +136,7 @@ class RacingScoreCalculator:
         
         # 2. SPEED SCORE (0-200 points)
         # Based on average speed and consistency
-        target_speed = 8.33  # m/s
+        target_speed = 15  # m/s
         
         # Speed achievement (0-100)
         speed_ratio = min(metrics.avg_speed / target_speed, 1.2)
@@ -280,7 +284,7 @@ class RacingMetricsTracker:
             
             # Calculate time at target speed
             # Target is 8.33 m/s, we accept ±10% (7.5 to 9.16 m/s)
-            target_speed = 8.33
+            target_speed = 15
             tolerance = 0.10  # 10%
             lower_bound = target_speed * (1 - tolerance)  # 7.497
             upper_bound = target_speed * (1 + tolerance)  # 9.163
@@ -325,7 +329,7 @@ class RacingMetricsTracker:
         if self.lane_violations > 20:  # More than 1 second off-road
             metrics.off_road_infractions = int(self.lane_violations / 20)
         
-        target_speed = 8.33  # m/s
+        target_speed = 15  # m/s
         expected_time = path_length / target_speed
         
         if metrics.lap_time > 2.0 * expected_time and not metrics.success:

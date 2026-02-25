@@ -231,9 +231,9 @@ class MPCController:
         status = self.acados_solver.solve()
         
         if status != 0:
-            print(f"⚠️  ACADOS solver failed with status {status}")
-            if status == 4:
-                print("    QP solver failed - constraints may be infeasible")
+            # print(f"⚠️  ACADOS solver failed with status {status}")
+            # if status == 4:
+            #     print("    QP solver failed - constraints may be infeasible")
             return self._fallback_controller(d, alpha, v)
         
         # 9. Extract control from solution
@@ -270,7 +270,7 @@ class MPCController:
     def _fallback_controller(self, d: float, alpha: float, v: float) -> Tuple[float, float]:
         """Simple P controller as fallback"""
         # Lateral control
-        print("Use control fallback")
+        # print("Use control fallback")
         steering = -0.3 * d - 0.5 * alpha
         steering = np.clip(steering, -1.0, 1.0)
         steering = - steering
@@ -376,3 +376,28 @@ class MPCController:
             D = np.sign(D) * self.model.throttle_max
 
         return np.array([s, n, alpha, v, D, delta, theta])
+
+    def update_path(self, kappa_spline, path_length: float):
+        """
+        Update path parameters without recompiling ACADOS.
+        Call this each episode instead of initialize_acados.
+        """
+        self._global_path_length = path_length
+        
+        # Update the curvature spline in the model
+        # ACADOS uses the spline coefficients as parameters
+        # We just need to update them in the solver at each stage
+        for i in range(self.N + 1):
+            self.acados_solver.set(i, "p", np.zeros(12))  # reset params first
+        
+        # Update the kapparef in the model so dynamics use new path
+        self.model.kapparef_s = kappa_spline
+        
+        # Reset control history for new episode
+        self.last_control = np.zeros(2)
+        self.previous_control = np.zeros(2)
+        self.derD = 0.0
+        self.derDelta = 0.0
+        self.derTheta = 0.0
+        
+        print("✓ MPC path updated (no recompile)")

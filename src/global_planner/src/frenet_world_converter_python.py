@@ -41,7 +41,7 @@ class FrenetCartesianConverter:
     
     @staticmethod
     def _remove_duplicate_points(x_coords: np.ndarray, y_coords: np.ndarray, 
-                                 min_distance: float = 0.1) -> Tuple[np.ndarray, np.ndarray]:
+                                min_distance: float = 0.1) -> Tuple[np.ndarray, np.ndarray]:
         """
         Remove consecutive waypoints that are too close together
         """

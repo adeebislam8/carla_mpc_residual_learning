@@ -8,6 +8,8 @@ from typing import Dict, Tuple, Optional, List
 from scipy.interpolate import make_interp_spline
 import sys
 import weakref
+import traceback
+import gc
 
 sys.path.append('/home/ave/Desktop/carla_mpc_residual_learning/src')
 
@@ -19,6 +21,7 @@ from mpc_controller.src.mpc_controller_python import MPCController
 
 class CarlaMPCEnv(gym.Env):
     metadata = {'render.modes': ['human']}
+    _shared_planner_cache = {}  # Shared across ALL instances
     
     def __init__(
         self,
@@ -45,12 +48,12 @@ class CarlaMPCEnv(gym.Env):
         self.timeout = timeout
         self.client = carla.Client(host, port)
         self.client.set_timeout(timeout)
-        self.world = self.client.load_world('Town01')
+        self.world = self.client.load_world('Town04')
         self.map = self.world.get_map()
         
         # Multi-town setup
         self.available_towns = towns
-        self.current_town = towns[0]
+        self.current_town = 'Town04'
         self.episodes_per_town = episodes_per_town
         self.episode_count = 0
         
@@ -185,8 +188,8 @@ class CarlaMPCEnv(gym.Env):
 
         # Obstacle detection sensor
         obstacle_bp = blueprint_library.find('sensor.other.obstacle')
-        obstacle_bp.set_attribute('distance', '150')
-        obstacle_bp.set_attribute('hit_radius', '250.0')
+        obstacle_bp.set_attribute('distance', '50')
+        obstacle_bp.set_attribute('hit_radius', '2.0')
         obstacle_bp.set_attribute('debug_linetrace', 'true')
         
         self.obstacle_sensor = self.world.spawn_actor(
@@ -249,26 +252,35 @@ class CarlaMPCEnv(gym.Env):
             # Sensor or actor may be destroyed during callback
             pass
     
-    def _generate_path(self, start: carla.Transform, goal: carla.Transform):
-        """Generate global path from start to goal"""
-        self.path_planner = PathPlanner(self.world, self.map)
+    def _generate_path(self, start, goal):
+        cache_key = self.current_town  # e.g. 'Town12'
+        
+        if cache_key not in CarlaMPCEnv._shared_planner_cache:
+            CarlaMPCEnv._shared_planner_cache[cache_key] = PathPlanner(
+                self.world, self.map
+            )
+        
+        self.path_planner = CarlaMPCEnv._shared_planner_cache[cache_key]
+        
         waypoints = self.path_planner.calculate_route(start.location, goal.location)
         
         if not waypoints or len(waypoints) < 4:
-            print("Failed to generate valid path")
+            del waypoints
             return False
         
-        # Initialize Frenet converter with waypoints
-        waypoint_coords = [[wp.transform.location.x, wp.transform.location.y] 
-                        for wp in waypoints]
+        waypoint_coords = []
+        road_widths = []
+        for wp in waypoints:
+            waypoint_coords.append([wp.transform.location.x, wp.transform.location.y])
+            lw, rw = self.path_planner.get_road_width_at_waypoint(wp)
+            road_widths.append([lw, rw])
+        
+        del waypoints  # Free CARLA Waypoint objects
+        gc.collect()
+        
         self.frenet_converter = FrenetConverter(waypoint_coords)
         self.path_length = self.frenet_converter.get_path_length()
-        
-        self._road_widths = []
-        for wp in waypoints:
-            left_width, right_width = self.path_planner.get_road_width_at_waypoint(wp)
-            self._road_widths.append([left_width, right_width])
-        self._road_widths = np.array(self._road_widths)
+        self._road_widths = np.array(road_widths)
         
         return True
     
@@ -278,37 +290,43 @@ class CarlaMPCEnv(gym.Env):
 
         used_s = []
         for _ in range(num_cars):
-            for _try in range(20):  # retry sampling
+            spawned = False
+            for _try in range(20):
                 s = random.uniform(2.0, self.path_length - 5.0)
 
                 # Keep distance from ego
                 if abs(s - self.current_s) < ego_buffer:
                     continue
-
-                # Keep distance from other NPCs
                 if any(abs(s - s_used) < min_gap for s_used in used_s):
                     continue
 
-                used_s.append(s)
-                break
+                x, y, yaw = self.frenet_converter.frenet_to_world(s, 0.0, 0.0)
+                transform = carla.Transform(
+                    carla.Location(x=x, y=y, z=0.5),
+                    carla.Rotation(yaw=np.rad2deg(yaw))
+                )
 
-            x, y, yaw = self.frenet_converter.frenet_to_world(s, 0.0, 0.0)
+                bp = random.choice(blueprints)
+                try:
+                    npc = self.world.try_spawn_actor(bp, transform)  # Returns None instead of raising
+                    if npc is not None:
+                        used_s.append(s)
+                        vehicles.append({
+                            "actor": npc,
+                            "s": s,
+                            "target_speed": 8.0 + random.uniform(-1.5, 1.5)
+                        })
+                        spawned = True
+                        break
+                except Exception as e:
+                    print(f"NPC spawn attempt failed: {e}")
+                    continue
 
-            transform = carla.Transform(
-                carla.Location(x=x, y=y, z=0.5),
-                carla.Rotation(yaw=np.rad2deg(yaw))
-            )
+            if not spawned:
+                print(f"Warning: Could not spawn NPC after 20 attempts, skipping.")
 
-            bp = random.choice(blueprints)
-            npc = self.world.spawn_actor(bp, transform)
-
-            vehicles.append({
-                "actor": npc,
-                "s": s,
-                "target_speed": 8.0 + random.uniform(-1.5, 1.5)
-            })
-
-        self.world.tick()
+        if vehicles:
+            self.world.tick()
         return vehicles
 
     def _frenet_follow_controller(self, npc_data, dt):
@@ -513,6 +531,28 @@ class CarlaMPCEnv(gym.Env):
                     pass
         
         # 3. Add static objects (manual detection for those not caught by sensor)
+        all_actors = self.world.get_actors()
+        print("="*50)
+        print(f"Total actors: {len(all_actors)}")
+        print("="*50)
+
+        # Group by type prefix
+        from collections import Counter
+        type_counts = Counter()
+        for actor in all_actors:
+            # Get the category prefix (e.g. 'vehicle', 'sensor', 'static', 'prop')
+            prefix = actor.type_id.split('.')[0]
+            type_counts[prefix] += 1
+
+        print("\nActor counts by category:")
+        for category, count in sorted(type_counts.items()):
+            print(f"  {category}: {count}")
+
+        print("\nAll unique type_ids:")
+        unique_types = sorted(set(actor.type_id for actor in all_actors))
+        for t in unique_types:
+            print(f"  {t}")
+        print("="*50)
         static_objects = self.world.get_actors().filter('static.*')
         for prop in static_objects:
             loc = prop.get_location()
@@ -542,6 +582,9 @@ class CarlaMPCEnv(gym.Env):
         
         for i, obs in enumerate(obstacles[:self.num_obstacles]):
             self.selected_obstacles[i] = [obs['s'], obs['d']]
+
+        if len(self.sensor_detected_obstacles) > 200:
+            self.sensor_detected_obstacles = self.sensor_detected_obstacles[-100:]
     
     def _get_observation(self) -> np.ndarray:
         """
@@ -586,7 +629,13 @@ class CarlaMPCEnv(gym.Env):
             mpc_pred_flat  # MPC prediction
         ])
         
-        return obs.astype(np.float64)
+        obs = obs.astype(np.float64)
+
+        # Catch NaN/Inf before they enter the buffer
+        if not np.isfinite(obs).all():
+            obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        return np.clip(obs, -1e6, 1e6)
     
     def _calculate_reward(self, action: np.ndarray) -> float:
         reward = 0.0
@@ -678,8 +727,8 @@ class CarlaMPCEnv(gym.Env):
             
             # Find valid spawn and goal
             max_attempts = 500
+            spawn_points = self.map.get_spawn_points()
             for attempt in range(max_attempts):
-                spawn_points = self.map.get_spawn_points()
                 spawn_point = random.choice(spawn_points)
                 spawn_point.location.z += 1.0 #avoid collision
                 goal_point = random.choice(spawn_points)
@@ -699,9 +748,9 @@ class CarlaMPCEnv(gym.Env):
                     (spawn_point.location.y - goal_point.location.y)**2
                 )
                 
-                if dist < 900 and dist > 100.0:
-                    print(f"spawn: {spawn_point}")
-                    print(f"goal: {goal_point}")
+                if dist > 100.0:
+                    # print(f"spawn: {spawn_point}")
+                    # print(f"goal: {goal_point}")
                     # Spawn vehicle
                     if not self._spawn_ego_vehicle(spawn_point):
                         continue
@@ -711,7 +760,8 @@ class CarlaMPCEnv(gym.Env):
                     
                     # Generate path
                     if not self._generate_path(spawn_point, goal_point):
-                        self.vehicle.destroy()
+                        self._destroy_actors()
+                        #self.vehicle.destroy()
                         continue
                     
                     # Initialize MPC
@@ -742,6 +792,11 @@ class CarlaMPCEnv(gym.Env):
             print(f"Error at reset with {e}")
     
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
+        # if self.current_step % 100 == 0:
+        #     print(f"[LEAK DIAG] step={self.current_step} | "
+        #         f"sensor_obstacles={len(self.sensor_detected_obstacles)} | "
+        #         f"racing_npcs={len(self.racing_npcs)} | "
+        #         f"gc_objects={len(gc.get_objects())}")
         try:
             # vehicles = self.world.get_actors().filter('vehicle.*')
             # print("Vehicles in world:", len(vehicles))
@@ -818,9 +873,36 @@ class CarlaMPCEnv(gym.Env):
             return obs, reward, done, False, info
         except Exception as e:
             print(f"Error at step function with {e}")
+            traceback.print_exc()
+            last_valid_obs = self._get_safe_observation()
+            return last_valid_obs, -100.0, True, False, {"done_reason": "error"}
+        
+    def _get_safe_observation(self):
+        """Return a safe fallback observation - never zeros"""
+        try:
+            return self._get_observation()
+        except:
+            # Return a neutral observation - not zeros which can cause NaN
+            obs = np.zeros(self.state_dim, dtype=np.float64)
+            obs[0] = 100.0   # remaining distance - nonzero
+            obs[3] = 5.0     # speed - nonzero  
+            return obs
     
     def _destroy_actors(self):
         """Safely destroy all actors"""
+        if hasattr(self, 'obstacle_sensor') and self.obstacle_sensor is not None:
+            try:
+                self.obstacle_sensor.stop()
+            except: pass
+        if hasattr(self, 'collision_sensor') and self.collision_sensor is not None:
+            try:
+                self.collision_sensor.stop()
+            except: pass
+        if hasattr(self, 'lane_invasion_sensor') and self.lane_invasion_sensor is not None:
+            try:
+                self.lane_invasion_sensor.stop()
+            except: pass
+
         actors_to_destroy = []
         
         # Collect sensors FIRST (destroy them before the vehicle they're attached to)
@@ -865,12 +947,25 @@ class CarlaMPCEnv(gym.Env):
         self.racing_npcs = []
 
         # Clear MPC controller to avoid stale references
-        self.mpc_controller = None
+        if self.mpc_controller is not None:
+            if hasattr(self.mpc_controller, 'acados_solver') and self.mpc_controller.acados_solver is not None:
+                del self.mpc_controller.acados_solver
+                self.mpc_controller.acados_solver = None
+
+        # self.mpc_controller = None
+        if self.mpc_controller is not None:
+            self.mpc_controller.last_control = np.zeros(2)
+            self.mpc_controller.previous_control = np.zeros(2)
         self.frenet_converter = None
-        self.path_planner = None
+        # self.path_planner = None
         
         if hasattr(self, 'world') and self.world is not None:
-            self.world.tick()
+            try:
+                self.world.tick()
+            except RuntimeError:
+                pass
+
+        gc.collect()
     
     def _load_random_town(self):
         print("Preparing to load new town...")
