@@ -10,7 +10,7 @@ from src.mpc_controller.envs.carlaEnv import CarlaMPCEnv
 from racing_score_metrics import RacingMetricsTracker, RacingScoreCalculator
 
 import tracemalloc
-import linecache
+from tqdm import tqdm
 
 import gc
 from collections import Counter
@@ -120,7 +120,7 @@ def test_environment():
     env = CarlaMPCEnv(
         host='localhost',
         port=2000,
-        towns=['Town01'],
+        towns=['Town02'],
         episodes_per_town=99999,
         max_steps=500
     )
@@ -149,8 +149,8 @@ def test_environment():
 
 def train_sac(
     total_timesteps: int = 100000,
-    learning_rate: float = 3e-4,
-    buffer_size: int = 100000,
+    learning_rate: float = 1e-4,
+    buffer_size: int = 200000,
     batch_size: int = 256,
     save_freq: int = 5000,
     eval_freq: int = 5000
@@ -163,19 +163,20 @@ def train_sac(
     env = CarlaMPCEnv(
         host='localhost',
         port=2000,
-        towns=['Town01', 'Town02', 'Town03', 'Town04'],
+        towns=['Town01'],
         episodes_per_town=99999999,
         target_speed=15,
-        max_steps=1000
+        max_steps=1500
     )
     
     # Create evaluation environment
     eval_env = Monitor(CarlaMPCEnv(
         host='localhost',
         port=2000,
-        towns=['Town01', 'Town02', 'Town03'],
+        towns=['Town01'],
         episodes_per_town=9999999,
-        max_steps=1000
+        target_speed=15,
+        max_steps=1500
     ))
     
     # Create SAC model
@@ -188,24 +189,27 @@ def train_sac(
         verbose=1,
         tensorboard_log="./sac_mpc_tensorboard/",
         gradient_steps=1,        # Don't over-update per step
-        learning_starts=1000,    # Collect more experience before training
+        learning_starts=5000,    # Collect more experience before training
         policy_kwargs=dict(
             net_arch=[256, 256],
             optimizer_kwargs=dict(eps=1e-5),  # Applied to all optimizers at init
         ),
+        ent_coef='auto', 
+        tau=0.005,                    # default, fine
+        gamma=0.99,                   # fine
     )
     
     # Callbacks
     checkpoint_callback = CheckpointCallback(
         save_freq=save_freq,
-        save_path='./sac_mpc_checkpoints/',
+        save_path='./sac_mpc_rl_' + str(total_timesteps) + '_checkpoints/',
         name_prefix='sac_mpc_model'
     )
     
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path='./sac_mpc_suboptimalbest/',
-        log_path='./sac_mpc_eval/',
+        best_model_save_path='./sac_mpc_rl_'+ str(total_timesteps)+ '_best/',
+        log_path='./sac_mpc_rl_'+ str(total_timesteps)+'_eval/',
         eval_freq=eval_freq,
         deterministic=True,
         render=False
@@ -218,13 +222,13 @@ def train_sac(
         print(f"\nStarting training for {total_timesteps} timesteps...")
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[checkpoint_callback, eval_callback, reward_logger, MemoryLeakCallback(snapshot_freq=500), ObjectCountCallback(check_freq=1000)],
+            callback=[checkpoint_callback, eval_callback, reward_logger],
             log_interval=10,
             progress_bar=True
         )
         
         # Save final model
-        model.save("sac_mpc_final")
+        model.save("sac_mpc_rl_"+ str(total_timesteps)+"_final")
         print("\n✓ Training completed successfully")
         print(f"✓ Final model saved to sac_mpc_final.zip")
         
@@ -240,33 +244,36 @@ def train_sac(
 
 def train_ppo(
     total_timesteps: int = 100000,
-    learning_rate: float = 3e-4,
+    learning_rate: float = 1e-4,
     n_steps: int = 2048,
-    batch_size: int = 64,
-    save_freq: int = 2000,
-    eval_freq: int = 2000
+    batch_size: int = 256,
+    save_freq: int = 5000,
+    eval_freq: int = 5000 
 ):
-    """Train PPO agent (alternative to SAC)"""
     print("="*60)
     print("MPC + Residual RL Training with PPO")
     print("="*60)
-    
+
+    # Match SAC's env config
     env = CarlaMPCEnv(
         host='localhost',
         port=2000,
-        towns=['Town01', 'Town02', 'Town03', 'Town04'],
-        episodes_per_town=3,
-        max_steps=1000
+        towns=['Town01'],
+        episodes_per_town=99999999,
+        target_speed=15,
+        max_steps=1500
     )
-    
+
+    # Match SAC's eval env config
     eval_env = Monitor(CarlaMPCEnv(
         host='localhost',
         port=2000,
         towns=['Town01'],
-        episodes_per_town=1,
-        max_steps=1000
+        episodes_per_town=9999999,
+        target_speed=15,
+        max_steps=1500 
     ))
-    
+
     model = PPO(
         'MlpPolicy',
         env,
@@ -274,26 +281,31 @@ def train_ppo(
         n_steps=n_steps,
         batch_size=batch_size,
         verbose=1,
-        tensorboard_log="./ppo_mpc_tensorboard/"
+        tensorboard_log="./ppo_mpc_overatke_tensorboard/",
+        policy_kwargs=dict(
+            net_arch=[256, 256],                          # added
+            optimizer_kwargs=dict(eps=1e-5),              # added
+        ),
+        device = "cpu",
     )
-    
+
     checkpoint_callback = CheckpointCallback(
         save_freq=save_freq,
-        save_path='./ppo_mpc_checkpoints/',
-        name_prefix='ppo_mpc_model'
+        save_path='./ppo_mpc_overatke_'+ str(total_timesteps)+'_checkpoints/',
+        name_prefix='ppo_mpc_overatke_'+ str(total_timesteps)+'_model'
     )
-    
+
     eval_callback = EvalCallback(
         eval_env,
-        best_model_save_path='./ppo_mpc_best/',
-        log_path='./ppo_mpc_eval/',
+        best_model_save_path='./ppo_mpc_overatke_best/',
+        log_path='./ppo_mpc_overatke_eval/',
         eval_freq=eval_freq,
         deterministic=True,
         render=False
     )
-    
+
     reward_logger = RewardLoggerCallback()
-    
+
     try:
         print(f"\nStarting training for {total_timesteps} timesteps...")
         model.learn(
@@ -302,19 +314,266 @@ def train_ppo(
             log_interval=10,
             progress_bar=True
         )
-        
-        model.save("ppo_mpc_final")
+
+        model.save("ppo_mpc_overatke_"+ str(total_timesteps)+"_final")
         print("\n✓ Training completed successfully")
-        
+
     except KeyboardInterrupt:
         print("\n⚠ Training interrupted by user")
         model.save("ppo_mpc_interrupted")
-    
+
     finally:
         env.close()
         eval_env.close()
 
-def evaluate_model(model_path: str, num_episodes: int = 10):
+
+def evaluate_multi_seed(model_path: str, num_episodes: int = 100):
+    SEEDS = [2547, 5555, 2910]
+    
+    seed_results = []
+    for seed in SEEDS:
+        print(f"\n{'#'*80}")
+        print(f"# SEED {seed}")
+        print(f"{'#'*80}")
+        result = evaluate_model(model_path, num_episodes=num_episodes, seed=seed)
+        seed_results.append(result)  # store the FULL result, not just summary
+    
+    # ── Helpers ─────────────────────────────────────────────────────────────
+    print(f"\n{'='*80}")
+    print(f"MULTI-SEED AGGREGATE REPORT  ({len(SEEDS)} seeds: {SEEDS})")
+    print(f"Model : {model_path}")
+    print(f"{'='*80}")
+
+    def report(label, values, fmt=".2f", suffix="", unit=""):
+        mean = np.mean(values)
+        std  = np.std(values)
+        per_seed = "  |  ".join(
+            [f"s{s}: {v:{fmt}}{suffix}" for s, v in zip(SEEDS, values)]
+        )
+        print(f"  {label:<32}: {mean:{fmt}}{suffix} ± {std:{fmt}}{suffix}{unit}")
+        print(f"    └─ {per_seed}")
+
+    def pool_metric(fn):
+        """Apply fn to each seed's all_metrics list and return list of 3 values."""
+        return [fn(r['metrics']) for r in seed_results]
+
+    def pool_score(fn):
+        return [fn(r['scores']) for r in seed_results]
+
+    # ── SECTION 1: CARLA Standard Metrics ───────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  CARLA STANDARD METRICS")
+    print(f"{'─'*80}")
+
+    report("Driving Score (DS)",
+           pool_metric(lambda ms: np.mean([m.driving_score for m in ms])),
+           fmt=".2f", unit="  (0-100)")
+
+    report("Route Completion",
+           pool_metric(lambda ms: np.mean([m.route_completion * 100 for m in ms])),
+           fmt=".1f", suffix="%")
+
+    report("Success Rate",
+           [r['summary']['success_rate'] * 100 for r in seed_results],
+           fmt=".1f", suffix="%")
+
+    report("Collision Rate",
+           [r['summary']['collision_rate'] * 100 for r in seed_results],
+           fmt=".1f", suffix="%")
+
+    infraction_vals = []
+    for r in seed_results:
+        vals = [m.infractions_per_km for m in r['metrics'] if m.infractions_per_km < float('inf')]
+        infraction_vals.append(np.mean(vals) if vals else 0.0)
+    report("Infractions / km", infraction_vals, fmt=".2f")
+
+    # Infraction breakdown totals per seed
+    print(f"\n  Infraction Breakdown (mean totals per seed):")
+    for label, attr in [
+        ("Collisions (layout)",      "collisions_layout"),
+        ("Collisions (vehicles)",    "collisions_vehicles"),
+        ("Collisions (pedestrians)", "collisions_pedestrians"),
+        ("Off-road",                 "off_road_infractions"),
+        ("Route timeouts",           "route_timeouts"),
+    ]:
+        report(label,
+               pool_metric(lambda ms, a=attr: sum(getattr(m, a) for m in ms)),
+               fmt=".1f")
+
+    # ── SECTION 2: Custom Racing Scores ─────────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  CUSTOM RACING SCORES  (out of 1000)")
+    print(f"{'─'*80}")
+
+    report("Overall Score",
+           pool_score(lambda ss: np.mean([s['total'] for s in ss])),
+           fmt=".1f")
+
+    report("  Median Score",
+           pool_score(lambda ss: np.median([s['total'] for s in ss])),
+           fmt=".1f")
+
+    report("  Best Score",
+           pool_score(lambda ss: np.max([s['total'] for s in ss])),
+           fmt=".1f")
+
+    report("  Worst Score",
+           pool_score(lambda ss: np.min([s['total'] for s in ss])),
+           fmt=".1f")
+
+    print(f"\n  Score Breakdown by Category:")
+    for category, max_pts in [
+        ("completion",  250),
+        ("speed",       200),
+        ("safety",      200),
+        ("smoothness",  150),
+        ("precision",   150),
+        ("efficiency",   50),
+    ]:
+        vals = pool_score(lambda ss, c=category: np.mean([s[c] for s in ss]))
+        mean_v = np.mean(vals)
+        std_v  = np.std(vals)
+        pct    = 100 * mean_v / max_pts
+        per_seed = "  |  ".join(
+            [f"s{s}: {v:.1f}" for s, v in zip(SEEDS, vals)]
+        )
+        print(f"    {category.capitalize():<12}: {mean_v:5.1f}/{max_pts} pts "
+              f"({pct:5.1f}%)  ±{std_v:.1f}")
+        print(f"      └─ {per_seed}")
+
+    # Grade distribution across all seeds pooled
+    print(f"\n  Grade Distribution (pooled across all seeds):")
+    from collections import Counter
+    all_grades = [s['grade'] for r in seed_results for s in r['scores']]
+    grade_counts = Counter(all_grades)
+    total_eps = num_episodes * len(SEEDS)
+    for grade in ['S', 'A+', 'A', 'B+', 'B', 'C+', 'C', 'D', 'F']:
+        count = grade_counts.get(grade, 0)
+        if count > 0:
+            bar = '█' * count
+            print(f"    {grade:3s} : {count:3d}/{total_eps}  ({100*count/total_eps:4.1f}%)  {bar}")
+
+    # ── SECTION 3: Completion & Lap Time ────────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  COMPLETION & LAP TIME")
+    print(f"{'─'*80}")
+
+    report("Avg Path Completion",
+           pool_metric(lambda ms: np.mean([m.path_completion * 100 for m in ms])),
+           fmt=".1f", suffix="%")
+
+    # Lap time — successful episodes only
+    succ_times_per_seed = [
+        [m.lap_time for m in r['metrics'] if m.success] for r in seed_results
+    ]
+    has_success = any(len(t) > 0 for t in succ_times_per_seed)
+
+    if has_success:
+        report("Lap Time Mean (success)",
+               [np.mean(t) if t else float('nan') for t in succ_times_per_seed],
+               fmt=".2f", suffix="s")
+        report("Lap Time Fastest",
+               [np.min(t) if t else float('nan') for t in succ_times_per_seed],
+               fmt=".2f", suffix="s")
+        report("Lap Time Slowest",
+               [np.max(t) if t else float('nan') for t in succ_times_per_seed],
+               fmt=".2f", suffix="s")
+        report("Lap Time Std",
+               [np.std(t) if len(t) > 1 else 0.0 for t in succ_times_per_seed],
+               fmt=".2f", suffix="s")
+    else:
+        # Fall back to all episodes
+        report("Lap Time Mean (all eps, no successes)",
+               pool_metric(lambda ms: np.mean([m.lap_time for m in ms])),
+               fmt=".2f", suffix="s")
+
+    # ── SECTION 4: Speed ────────────────────────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  SPEED  (target: 8.33 m/s)")
+    print(f"{'─'*80}")
+
+    report("Avg Speed",
+           pool_metric(lambda ms: np.mean([m.avg_speed for m in ms])),
+           fmt=".2f", suffix=" m/s")
+
+    report("Speed Consistency (std)",
+           pool_metric(lambda ms: np.mean([m.speed_consistency for m in ms])),
+           fmt=".2f", suffix=" m/s")
+
+    report("Time at Target Speed",
+           pool_metric(lambda ms: np.mean([m.time_at_target_speed for m in ms]) * 100),
+           fmt=".1f", suffix="%")
+
+    # ── SECTION 5: Path Following ────────────────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  PATH FOLLOWING  (lane limit: 3.5m)")
+    print(f"{'─'*80}")
+
+    report("Avg Lateral Error",
+           pool_metric(lambda ms: np.mean([m.avg_lateral_error for m in ms])),
+           fmt=".3f", suffix="m")
+
+    report("Max Lateral Error (mean)",
+           pool_metric(lambda ms: np.mean([m.max_lateral_error for m in ms])),
+           fmt=".3f", suffix="m")
+
+    report("Lateral Consistency (std)",
+           pool_metric(lambda ms: np.mean([m.lateral_consistency for m in ms])),
+           fmt=".3f", suffix="m")
+
+    # ── SECTION 6: Safety ───────────────────────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  SAFETY")
+    print(f"{'─'*80}")
+
+    report("Close Calls (avg/episode)",
+           pool_metric(lambda ms: np.mean([m.close_calls for m in ms])),
+           fmt=".1f")
+
+    report("Lane Violations (avg/episode)",
+           pool_metric(lambda ms: np.mean([m.lane_violations for m in ms])),
+           fmt=".1f")
+
+    report("Time in Danger (avg)",
+           pool_metric(lambda ms: np.mean([m.time_in_danger for m in ms])),
+           fmt=".2f", suffix="s")
+
+    # ── SECTION 7: Control Smoothness ───────────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  CONTROL SMOOTHNESS")
+    print(f"{'─'*80}")
+
+    report("Avg Throttle Change",
+           pool_metric(lambda ms: np.mean([m.avg_throttle_change for m in ms])),
+           fmt=".4f")
+
+    report("Avg Steering Change",
+           pool_metric(lambda ms: np.mean([m.avg_steering_change for m in ms])),
+           fmt=".4f")
+
+    # ── SECTION 8: Efficiency ───────────────────────────────────────────────
+    print(f"\n{'─'*80}")
+    print(f"  EFFICIENCY")
+    print(f"{'─'*80}")
+
+    report("Progress / Step",
+           pool_metric(lambda ms: np.mean([m.progress_per_step for m in ms])),
+           fmt=".3f", suffix=" m/step")
+
+    fuel_vals = []
+    for r in seed_results:
+        vals = [m.fuel_efficiency for m in r['metrics'] if m.fuel_efficiency > 0]
+        fuel_vals.append(np.mean(vals) if vals else 0.0)
+    report("Fuel Efficiency", fuel_vals, fmt=".2f", suffix=" m/throttle")
+
+    # ── Footer ──────────────────────────────────────────────────────────────
+    print(f"\n{'='*80}")
+    print(f"  Total episodes evaluated : {total_eps}  ({num_episodes} × {len(SEEDS)} seeds)")
+    print(f"{'='*80}\n")
+
+    return seed_results
+
+def evaluate_model(model_path: str, num_episodes: int = 100, seed: int = 2547):
     """
     Evaluate a trained model
     
@@ -327,16 +586,28 @@ def evaluate_model(model_path: str, num_episodes: int = 10):
     print(f"{'='*80}\n")
     
     # Load model
-    model = SAC.load(model_path)
+    # mpc_times_ms = []
+    # ppo_times_ms = []
+    model = None
+    if model_path is not None:
+        if 'ppo' in model_path.lower():
+            model = PPO.load(model_path)
+        else:
+            model = SAC.load(model_path)
+        print(f"Evaluating RL model: {model_path}")
+    else:
+        print("No model provided — evaluating MPC only")
+
     
     # Create environment
     env = CarlaMPCEnv(
         host='localhost',
         port=2000,
-        towns=['Town01', 'Town02', 'Town03'],
+        towns=['Town02'],
         episodes_per_town=9999999,
-        max_steps=1000,
-        render_mode='human'
+        max_steps=1500,
+        render_mode='human',
+        seed=seed
     )
     
     score_calc = RacingScoreCalculator()
@@ -354,10 +625,19 @@ def evaluate_model(model_path: str, num_episodes: int = 10):
         done = False
         episode_reward = 0
         episode_length = 0
-        
+        if ep == 0:  # record first episode only
+            env.start_recording(episode_num=ep, )
+
         while not done:
+            env.render(camera_mode='top_down')
             # Get action
-            action, _states = model.predict(obs, deterministic=True)
+            if model is not None:
+                # _t_ppo_start = time.perf_counter()
+                action, _states = model.predict(obs, deterministic=True)
+                # _t_ppo_end = time.perf_counter()
+                # ppo_times_ms.append((_t_ppo_end - _t_ppo_start) * 1000)
+            else:
+                action = np.array([0.0, 0.0])  # Zero residual = pure MPC
             
             # Step
             obs, reward, done, truncated, info = env.step(action)
@@ -365,18 +645,28 @@ def evaluate_model(model_path: str, num_episodes: int = 10):
             episode_length += 1
             
             # Track metrics
+            idx = np.argmin(np.abs(env._road_width_s - env.current_s))
             env_state = {
                 'speed': env.current_speed,
                 'd': env.current_d,
                 's': env.current_s,
                 'throttle': env.current_throttle,
                 'steering': env.current_steering,
-                'obstacles': env.selected_obstacles
+                'obstacles': env.selected_obstacles,
+                'n_min': -env._road_widths[idx, 0],
+                'n_max': env._road_widths[idx, 1],
             }
             tracker.update(env_state)
+
+            # Collect MPC timing from env
+            # if hasattr(env, '_last_mpc_time_ms'):
+            #     mpc_times_ms.append(env._last_mpc_time_ms)
             
             # Render
             env.render(mode='human', camera_mode='follow')
+        if ep == 0:
+            env.save_recording(label='hybrid', output_dir='./recordings')
+            return
         
         # Finalize metrics
         metrics = tracker.finalize(env.path_length, info['done_reason'])
@@ -384,6 +674,31 @@ def evaluate_model(model_path: str, num_episodes: int = 10):
         
         all_scores.append(scores)
         all_metrics.append(metrics)
+
+        # print(f"\n{'='*60}")
+        # print(f"COMPUTATIONAL TIMING REPORT")
+        # print(f"{'='*60}")
+
+        # if mpc_times_ms:
+        #     mpc_mean = np.mean(mpc_times_ms)
+        #     mpc_std  = np.std(mpc_times_ms)
+        #     print(f"  MPCC solve time:     {mpc_mean:.2f} ± {mpc_std:.2f} ms")
+
+        # if ppo_times_ms:
+        #     ppo_mean = np.mean(ppo_times_ms)
+        #     ppo_std  = np.std(ppo_times_ms)
+        #     print(f"  PPO inference time:  {ppo_mean:.3f} ± {ppo_std:.3f} ms")
+
+        # if mpc_times_ms:
+        #     total_mean = np.mean(mpc_times_ms) + (np.mean(ppo_times_ms) if ppo_times_ms else 0)
+        #     hz = 1000.0 / total_mean
+        #     print(f"  Total per timestep:  {total_mean:.2f} ms")
+        #     print(f"  Control frequency:   {hz:.1f} Hz")
+        #     print(f"  Required frequency:  {1/0.05:.1f} Hz (Δt = 0.05s)")
+        #     print(f"  Real-time capable:   {'✓ YES' if hz > 20 else '✗ NO'}")
+
+        # print(f"  Samples collected:   {len(mpc_times_ms)} timesteps")
+        # print(f"{'='*60}\n")
         
         # Print episode summary
         print(f"\n📊 Episode {ep+1} Results:")
@@ -615,7 +930,7 @@ def test_mpc_only(num_steps=1000, camera_mode='follow'):
             port=2000,
             towns=['Town01', 'Town02', 'Town03', 'Town04'],
             episodes_per_town=3,
-            max_steps=1000,
+            max_steps=1500,
             #render_mode='human'
         )
         
@@ -676,7 +991,7 @@ def test_mpc_only(num_steps=1000, camera_mode='follow'):
             
             print(f"{'='*60}")
             print("Respawning in 2 seconds...")
-            time.sleep(2)
+            # time.sleep(2)
         
     except KeyboardInterrupt:
         print("\n\n" + "="*60)
@@ -707,6 +1022,10 @@ if __name__ == "__main__":
                        help='Total training timesteps')
     parser.add_argument('--model', type=str, default=None,
                        help='Path to model for evaluation')
+    parser.add_argument('--seed',       type=int,  default=2547)
+    parser.add_argument('--episodes',   type=int,  default=100)
+    parser.add_argument('--multi_seed', action='store_true',
+                        help='Evaluate across 3 fixed seeds and aggregate')
     
     args = parser.parse_args()
     
@@ -720,9 +1039,9 @@ if __name__ == "__main__":
             train_ppo(total_timesteps=args.timesteps)
     
     elif args.mode == 'eval':
-        if args.model is None:
-            print("Error: --model required for evaluation")
+        if args.multi_seed:
+            evaluate_multi_seed(args.model, num_episodes=args.episodes)
         else:
-            evaluate_model(args.model)
+            evaluate_model(args.model, num_episodes=args.episodes, seed=args.seed)
     elif args.mode == 'test_mpc':
         test_mpc_only(num_steps=10000)

@@ -44,10 +44,12 @@ class PathPlanner:
         # Check for adjacent lanes
         left_lane = waypoint.get_left_lane()
         if left_lane and left_lane.lane_type == carla.LaneType.Driving:
-            left_width += left_lane.lane_width / 2.0
+            left_width += left_lane.lane_width
+        else:
+            left_width += 4
         
         right_lane = waypoint.get_right_lane()
         if right_lane and right_lane.lane_type == carla.LaneType.Driving:
-            right_width += right_lane.lane_width / 2.0
+            right_width += right_lane.lane_width
         
         return left_width, right_width

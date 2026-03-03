@@ -4,6 +4,7 @@ import sys
 import os
 import math
 from casadi import *
+import time
 sys.path.append('/home/ave/Desktop/carla_mpc_residual_learning/src/mpc_controller/src')
 
 # Import existing ACADOS setup
@@ -76,7 +77,8 @@ class MPCController:
         D: float = 0.0, 
         delta: float = 0.0,
         road_widths: Optional[np.ndarray] = None,
-        target_lane_d: Optional[float] = None
+        target_lane_d: Optional[float] = None,
+        road_width_s = None
     ) -> Tuple[float, float]:
         """
         Args:
@@ -114,7 +116,8 @@ class MPCController:
         self.acados_solver.set(0, "ubx", propagated_x_upper)
         
         # 3. Set initial state
-        self.acados_solver.set(0, "x", np.array([s, d, alpha, v, D, delta, s]))
+        # self.acados_solver.set(0, "x", np.array([s, d, alpha, v, D, delta, s]))
+        self.acados_solver.set(0, "x", propagated_x)
 
         # Set obstacle parameters for stage 0
         # self.acados_solver.set(0, "p", obstacles.flatten())
@@ -156,21 +159,16 @@ class MPCController:
             s_pred = s + self.target_speed * (self.Tf / self.N) * i
             
             # Get road bounds (use defaults if not provided)
-            if road_widths is not None and len(road_widths) > 0:
-                # Get road width at predicted s
-                idx = int(s_pred / 1.0)  # Assuming 1m spacing
-                idx = np.clip(idx, 0, len(road_widths) - 1)
-                n_left = road_widths[idx, 0]
-                n_right = -road_widths[idx, 1]
+            safety_margin = 1.2
+            if road_widths is not None and road_width_s is not None and len(road_widths) > 0:
+                idx = np.argmin(np.abs(road_width_s - s_pred))
+                n_min_adaptive = -road_widths[idx, 0] + safety_margin   # negative = world left
+                n_max_adaptive =  road_widths[idx, 1] - safety_margin   # positive = world right
             else:
-                # Default road bounds
-                n_left = 3.8
-                n_right = -0.5
+                n_min_adaptive = -5.25 + safety_margin  # fallback: full road left
+                n_max_adaptive =  1.75 - safety_margin  # fallback: ego lane right
             
             # Add safety margin
-            safety_margin = 0.2  # IMPROVED: Reduced from 0.4 for more flexibility
-            n_min_adaptive = n_right + safety_margin
-            n_max_adaptive = n_left - safety_margin
             
             # Clamp to reasonable values
             n_min_adaptive = max(n_min_adaptive, -10.0)
@@ -180,7 +178,7 @@ class MPCController:
             lh_constraints = np.array([
                 self.constraint.along_min,
                 self.constraint.alat_min,
-                n_min_adaptive - 0.1,
+                n_min_adaptive,
                 self.model.v_min,
                 self.model.throttle_min,
                 self.model.delta_min,
@@ -195,7 +193,7 @@ class MPCController:
             uh_constraints = np.array([
                 self.constraint.along_max,
                 self.constraint.alat_max,
-                n_max_adaptive + 0.1,
+                n_max_adaptive,
                 self.model.v_max,
                 self.model.throttle_max,
                 self.model.delta_max + 1e-3,
@@ -231,9 +229,8 @@ class MPCController:
         status = self.acados_solver.solve()
         
         if status != 0:
-            # print(f"⚠️  ACADOS solver failed with status {status}")
-            # if status == 4:
-            #     print("    QP solver failed - constraints may be infeasible")
+            # print(f"\n{'='*50}")
+            # print(f"⚠️ ACADOS failed status={status}")
             return self._fallback_controller(d, alpha, v)
         
         # 9. Extract control from solution
@@ -316,7 +313,7 @@ class MPCController:
         lf = 1.169
         lr = 1.801
         C1 = lr / (lr + lf)
-        C2 = 1 / (lr + lf) * 0.5
+        C2 = 1 / (lr + lf)
 
         Cm1 = 9.36424211e+03 
         Cm2 = 4.08690122e+01  

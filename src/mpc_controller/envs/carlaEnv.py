@@ -27,20 +27,22 @@ class CarlaMPCEnv(gym.Env):
         self,
         host: str = 'localhost',
         port: int = 2000,
-        timeout: float = 100.0,
+        timeout: float = 20.0,
         towns: List[str] = ['Town01', 'Town02', 'Town03', 'Town04'],
         episodes_per_town: int = 99999,
-        target_speed: float = 8.33,  # m/s
+        target_speed: float = 15,  # m/s
         max_steps: int = 1000,
         lookahead_distance: float = 100.0,
         num_obstacles: int = 6,
         state_dim: int = 116,
         mpc_horizon: int = 30,
         mpc_dt: float = 0.05,
+        seed: int = 2547,
         discrete_actions: bool = False,
         render_mode: Optional[str] = None,
     ):
         super().__init__()
+        random.seed(seed)
         
         # CARLA connection
         self.host = host
@@ -48,12 +50,12 @@ class CarlaMPCEnv(gym.Env):
         self.timeout = timeout
         self.client = carla.Client(host, port)
         self.client.set_timeout(timeout)
-        self.world = self.client.load_world('Town04')
+        self.world = self.client.load_world(towns[0])
         self.map = self.world.get_map()
         
         # Multi-town setup
         self.available_towns = towns
-        self.current_town = 'Town04'
+        self.current_town = towns[0]
         self.episodes_per_town = episodes_per_town
         self.episode_count = 0
         
@@ -77,8 +79,10 @@ class CarlaMPCEnv(gym.Env):
         self.current_throttle = 0.0
         self.current_brake = 0.0
         self.current_steering = 0.0
+        self.lateral_accel = 0.0
         
         self._road_widths = None
+        self._road_width_s = None
         
         # Frenet frame
         self.frenet_converter: Optional[FrenetConverter] = None
@@ -91,9 +95,11 @@ class CarlaMPCEnv(gym.Env):
         # MPC controller
         self.mpc_controller: Optional[MPCController] = None
         self.mpc_prediction = np.zeros((mpc_horizon, 2))
+        # self._last_mpc_time_ms = 0.0
         
         # Obstacles
         self.selected_obstacles = np.ones((num_obstacles, 2)) * -100
+        self.overtaken_npcs = set()
         
         # Episode state
         self.collision = False
@@ -115,6 +121,14 @@ class CarlaMPCEnv(gym.Env):
             shape=(state_dim,),
             dtype=np.float64
         )
+
+        # ── Recording ─────────────────────────────────────────
+        self.camera_sensor = None
+        self.video_frames = []
+        self.ego_trajectory = []   # (step, x, y, s, d)
+        self.npc_trajectory = []   # (step, x, y, s, d) per NPC
+        self.recording = False
+        self.record_episode = 0
         
         # Set up CARLA world
         self._setup_world()
@@ -131,7 +145,191 @@ class CarlaMPCEnv(gym.Env):
         # Enable traffic manager in sync mode
         traffic_manager = self.client.get_trafficmanager(8000)
         traffic_manager.set_synchronous_mode(True)
+
+    def _attach_camera(self):
+        """Attach top-down RGB camera for video recording"""
+        blueprint_library = self.world.get_blueprint_library()
+        camera_bp = blueprint_library.find('sensor.camera.rgb')
+        camera_bp.set_attribute('image_size_x', '1280')
+        camera_bp.set_attribute('image_size_y', '720')
+        camera_bp.set_attribute('fov', '90')
+
+        # Fixed offset above vehicle — top down
+        camera_transform = carla.Transform(
+            carla.Location(x=0, y=0, z=20),
+            carla.Rotation(pitch=-90, yaw=0, roll=0)
+        )
+
+        self.camera_sensor = self.world.spawn_actor(
+            camera_bp,
+            camera_transform,
+            attach_to=self.vehicle
+        )
+
+        weak_self = weakref.ref(self)
+        self.camera_sensor.listen(
+            lambda image: CarlaMPCEnv._on_camera_image(weak_self, image)
+        )
+        print("✓ Recording camera attached")
+
+    @staticmethod
+    def _on_camera_image(weak_self, image):
+        self = weak_self()
+        if self is not None and self.recording:
+            try:
+                import numpy as np
+                array = np.frombuffer(image.raw_data, dtype=np.uint8)
+                array = array.reshape((image.height, image.width, 4))
+                # BGRA → RGB
+                frame = array[:, :, :3][:, :, ::-1].copy()
+                self.video_frames.append(frame)
+            except Exception:
+                pass
+    
+    def start_recording(self, episode_num=0):
+        """Call this before running the episode you want to record"""
+        self.video_frames = []
+        self.ego_trajectory = []
+        self.npc_trajectory = []
+        self.recording = True
+        self.record_episode = episode_num
+        self._attach_camera()
+        print(f"🎥 Recording started for episode {episode_num}")
+
+    def save_recording(self, label='hybrid', output_dir='./recordings'):
+        """Call this after episode ends to save video + trajectory"""
+        import os
+        import cv2
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+
+        self.recording = False
+        os.makedirs(output_dir, exist_ok=True)
+        tag = f"ep{self.record_episode}_{label}"
+
+        # ── Save Video ────────────────────────────────────
+        if self.video_frames:
+            video_path = os.path.join(output_dir, f"{tag}.mp4")
+            h, w = self.video_frames[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(video_path, fourcc, 20.0, (w, h))
+            for frame in self.video_frames:
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            writer.release()
+            print(f"✓ Video saved: {video_path}  ({len(self.video_frames)} frames)")
+        else:
+            print("⚠ No video frames captured")
+
+        # ── Save Trajectory Plot ──────────────────────────
+        if not self.ego_trajectory:
+            print("⚠ No trajectory data")
+            return
+
+        ego = np.array(self.ego_trajectory)    # (N, 5): step,x,y,s,d
         
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle(f'Trajectory Analysis — {label}  (Episode {self.record_episode})',
+                    fontsize=13, fontweight='bold')
+
+        # ── LEFT: World XY plot ───────────────────────────
+        ax = axes[0]
+
+        # Road boundaries
+        if self._road_widths is not None and self.frenet_converter is not None:
+            s_pts = np.linspace(0, self.path_length, 200)
+            left_x, left_y, right_x, right_y, center_x, center_y = [], [], [], [], [], []
+            for s in s_pts:
+                idx = np.argmin(np.abs(self._road_width_s - s))
+                lw = self._road_widths[idx, 0]
+                rw = self._road_widths[idx, 1]
+                xl, yl, _ = self.frenet_converter.frenet_to_world(s, -lw, 0)
+                xr, yr, _ = self.frenet_converter.frenet_to_world(s,  rw, 0)
+                xc, yc, _ = self.frenet_converter.frenet_to_world(s, 0.0, 0)
+                left_x.append(xl);  left_y.append(yl)
+                right_x.append(xr); right_y.append(yr)
+                center_x.append(xc); center_y.append(yc)
+
+            ax.fill_betweenx(left_y,  left_x,  right_x,
+                            alpha=0.08, color='gray', label='Road')
+            ax.plot(left_x,   left_y,   'b-', linewidth=1.0, alpha=0.5)
+            ax.plot(right_x,  right_y,  'b-', linewidth=1.0, alpha=0.5)
+            ax.plot(center_x, center_y, 'g--', linewidth=0.8,
+                    alpha=0.6, label='Centerline')
+
+        # Ego trajectory
+        ax.plot(ego[:, 1], ego[:, 2], 'b-', linewidth=2, label='Ego (MPCC+CBF+PPO)')
+        ax.plot(ego[0, 1],  ego[0, 2],  'go', markersize=8, label='Start')
+        ax.plot(ego[-1, 1], ego[-1, 2], 'rs', markersize=8, label='End')
+
+        # NPC trajectories
+        colors = ['orange', 'red', 'purple', 'brown']
+        if self.npc_trajectory:
+            npc_data = np.array(self.npc_trajectory)
+            npc_ids = np.unique(npc_data[:, 0]).astype(int)
+            for i, nid in enumerate(npc_ids):
+                mask = npc_data[:, 0] == nid
+                nd = npc_data[mask]
+                c = colors[i % len(colors)]
+                ax.plot(nd[:, 2], nd[:, 3], '-', color=c,
+                        linewidth=1.5, alpha=0.8, label=f'NPC {i+1}')
+                ax.plot(nd[0, 2], nd[0, 3], 'o', color=c, markersize=6)
+
+        ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)')
+        ax.set_title('World Coordinates')
+        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+
+        # ── RIGHT: Frenet d vs s plot ─────────────────────
+        ax2 = axes[1]
+
+        # Road boundaries in Frenet
+        if self._road_widths is not None:
+            s_pts = np.linspace(0, self.path_length, 200)
+            n_left_arr  = [-self._road_widths[np.argmin(np.abs(self._road_width_s - s)), 0]
+                        for s in s_pts]
+            n_right_arr = [ self._road_widths[np.argmin(np.abs(self._road_width_s - s)), 1]
+                            for s in s_pts]
+            ax2.fill_between(s_pts, n_left_arr, n_right_arr,
+                            alpha=0.08, color='gray')
+            ax2.plot(s_pts, n_left_arr,  'b-', linewidth=1.0, alpha=0.5)
+            ax2.plot(s_pts, n_right_arr, 'b-', linewidth=1.0, alpha=0.5)
+            ax2.axhline(y=0, color='g', linestyle='--',
+                        linewidth=0.8, alpha=0.6, label='Centerline')
+
+        # Ego Frenet trajectory
+        ax2.plot(ego[:, 3], ego[:, 4], 'b-', linewidth=2,
+                label='Ego (MPCC+CBF+PPO)')
+
+        # NPC Frenet trajectories
+        if self.npc_trajectory:
+            npc_data = np.array(self.npc_trajectory)
+            npc_ids = np.unique(npc_data[:, 0]).astype(int)
+            for i, nid in enumerate(npc_ids):
+                mask = npc_data[:, 0] == nid
+                nd = npc_data[mask]
+                c = colors[i % len(colors)]
+                ax2.plot(nd[:, 1], nd[:, 4], '-', color=c,
+                        linewidth=1.5, alpha=0.8, label=f'NPC {i+1}')
+
+        ax2.set_xlabel('Arc Length s (m)')
+        ax2.set_ylabel('Lateral Deviation d (m)')
+        ax2.set_title('Frenet Frame')
+        ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        traj_path = os.path.join(output_dir, f"{tag}_trajectory.pdf")
+        plt.savefig(traj_path, dpi=150, bbox_inches='tight')
+        plt.savefig(traj_path.replace('.pdf', '.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"✓ Trajectory saved: {traj_path}")
+
+        # ── Save raw numpy data too ───────────────────────
+        np.save(os.path.join(output_dir, f"{tag}_ego.npy"), ego)
+        if self.npc_trajectory:
+            np.save(os.path.join(output_dir, f"{tag}_npc.npy"),
+                    np.array(self.npc_trajectory))
+        print(f"✓ Raw data saved to {output_dir}/")
+
     def _spawn_ego_vehicle(self, spawn_point: carla.Transform) -> bool:
         """Spawn ego vehicle at given spawn point"""
         try:
@@ -281,21 +479,100 @@ class CarlaMPCEnv(gym.Env):
         self.frenet_converter = FrenetConverter(waypoint_coords)
         self.path_length = self.frenet_converter.get_path_length()
         self._road_widths = np.array(road_widths)
+
+        road_width_s_list = []
+        for x, y in waypoint_coords:
+            s, _, _ = self.frenet_converter.world_to_frenet(x, y, 0)
+            road_width_s_list.append(s)
+        
+        self._road_width_s = np.array(road_width_s_list)
         
         return True
     
-    def _spawn_frenet_racers(self, num_cars=5, min_gap=12.0, ego_buffer=15.0):
+    # def _spawn_frenet_racers(self, num_cars=5, min_gap=12.0, ego_buffer=20.0):
+    #     vehicles = []
+    #     blueprints = self.world.get_blueprint_library().filter('vehicle.bmw.*')
+
+    #     used_s = []
+    #     for _ in range(num_cars):
+    #         spawned = False
+    #         for _try in range(50):  # More attempts
+    #             s = random.uniform(2.0, self.path_length - 5.0)
+
+    #             ds = s - self.current_s
+
+    #             # Only spawn AHEAD of ego, not behind
+    #             if ds < ego_buffer:  # Must be at least ego_buffer ahead
+    #                 continue
+                
+    #             # Keep distance from other NPCs
+    #             if any(abs(s - s_used) < min_gap for s_used in used_s):
+    #                 continue
+
+    #             x, y, yaw = self.frenet_converter.frenet_to_world(s, 0.0, 0.0)
+    #             transform = carla.Transform(
+    #                 carla.Location(x=x, y=y, z=0.5),
+    #                 carla.Rotation(yaw=np.rad2deg(yaw))
+    #             )
+
+    #             bp = random.choice(blueprints)
+    #             try:
+    #                 npc = self.world.try_spawn_actor(bp, transform)
+    #                 if npc is not None:
+    #                     used_s.append(s)
+    #                     vehicles.append({
+    #                         "actor": npc,
+    #                         "s": s,
+    #                         "target_speed": random.uniform(4.0, 6.0)
+    #                     })
+    #                     spawned = True
+    #                     break
+    #             except Exception as e:
+    #                 continue
+
+    #         if not spawned:
+    #             print(f"Warning: Could not spawn NPC after 50 attempts, skipping.")
+
+    #     if vehicles:
+    #         self.world.tick()
+    #     return vehicles
+
+    def _spawn_frenet_racers(self, num_cars=5, min_gap=12.0, ego_buffer=20.0):
         vehicles = []
         blueprints = self.world.get_blueprint_library().filter('vehicle.bmw.*')
-
         used_s = []
+
+        # ── FIXED NPC at s = 15 ───────────────────────────────
+        fixed_s = self.current_s + 15.0  # 15m ahead of ego
+        x, y, yaw = self.frenet_converter.frenet_to_world(fixed_s, 0.0, 0.0)
+        transform = carla.Transform(
+            carla.Location(x=x, y=y, z=0.5),
+            carla.Rotation(yaw=np.rad2deg(yaw))
+        )
+        bp = random.choice(blueprints)
+        try:
+            npc = self.world.try_spawn_actor(bp, transform)
+            if npc is not None:
+                used_s.append(fixed_s)
+                vehicles.append({
+                    "actor": npc,
+                    "s": fixed_s,
+                    "target_speed": 3.0  # slow so ego catches up quickly
+                })
+                print(f"✓ Fixed NPC spawned at s={fixed_s:.1f}")
+            else:
+                print(f"⚠ Fixed NPC failed to spawn at s={fixed_s:.1f}")
+        except Exception as e:
+            print(f"⚠ Fixed NPC spawn error: {e}")
+        # ─────────────────────────────────────────────────────
+
+        # Random NPCs as before
         for _ in range(num_cars):
             spawned = False
-            for _try in range(20):
+            for _try in range(50):
                 s = random.uniform(2.0, self.path_length - 5.0)
-
-                # Keep distance from ego
-                if abs(s - self.current_s) < ego_buffer:
+                ds = s - self.current_s
+                if ds < ego_buffer:
                     continue
                 if any(abs(s - s_used) < min_gap for s_used in used_s):
                     continue
@@ -305,25 +582,23 @@ class CarlaMPCEnv(gym.Env):
                     carla.Location(x=x, y=y, z=0.5),
                     carla.Rotation(yaw=np.rad2deg(yaw))
                 )
-
                 bp = random.choice(blueprints)
                 try:
-                    npc = self.world.try_spawn_actor(bp, transform)  # Returns None instead of raising
+                    npc = self.world.try_spawn_actor(bp, transform)
                     if npc is not None:
                         used_s.append(s)
                         vehicles.append({
                             "actor": npc,
                             "s": s,
-                            "target_speed": 8.0 + random.uniform(-1.5, 1.5)
+                            "target_speed": random.uniform(4.0, 6.0)
                         })
                         spawned = True
                         break
                 except Exception as e:
-                    print(f"NPC spawn attempt failed: {e}")
                     continue
 
             if not spawned:
-                print(f"Warning: Could not spawn NPC after 20 attempts, skipping.")
+                print(f"Warning: Could not spawn NPC after 50 attempts, skipping.")
 
         if vehicles:
             self.world.tick()
@@ -362,14 +637,17 @@ class CarlaMPCEnv(gym.Env):
         speed = np.linalg.norm([v.x, v.y])
         target_speed = npc_data["target_speed"]
 
-        throttle = 0.5 + 0.5 * (target_speed - speed)
-        throttle = np.clip(throttle, 0.0, 0.75)
-
+        speed_error = target_speed - speed
         control = carla.VehicleControl()
-        control.throttle = throttle
-        control.steer = steer
-        control.brake = 0.0
 
+        if speed_error > 0:
+            control.throttle = np.clip(0.5 * speed_error, 0.0, 0.75)
+            control.brake = 0.0
+        else:
+            control.throttle = 0.0
+            control.brake = np.clip(-0.5 * speed_error, 0.0, 0.5)
+
+        control.steer = steer
         npc.apply_control(control)
 
         # Update s (for looping)
@@ -451,140 +729,40 @@ class CarlaMPCEnv(gym.Env):
             self.current_throttle = control.throttle
         self.current_brake = control.brake
         self.current_steering = control.steer * (45 * np.pi / 180) # Change to radians
-    
+
+        angular_velocity = self.vehicle.get_angular_velocity()
+        yaw_rate = np.deg2rad(angular_velocity.z)
+        self.lateral_accel = self.current_speed * yaw_rate
+
     def _detect_obstacles(self):
-        """Detect and select closest obstacles in Frenet frame"""
         self.selected_obstacles = np.ones((self.num_obstacles, 2)) * -100
-        
-        ego_location = self.vehicle.get_location()
         obstacles = []
         
-        # Clean up old sensor detections (older than 0.5 seconds)
-        current_time = time.time()
-        self.sensor_detected_obstacles = [
-            obs for obs in self.sensor_detected_obstacles 
-            if current_time - obs.get('timestamp', 0) < 0.5
-        ]
+        MAX_OBS_LOOKAHEAD = 30.0  # Only care about obstacles within 30m
         
-        # 1. Process obstacles from the sensor
-        for obs_data in self.sensor_detected_obstacles:
+        for npc_data in self.racing_npcs:
+            npc = npc_data.get("actor")
+            if npc is None or not npc.is_alive:
+                continue
             try:
-                actor = obs_data['actor']
-                
-                # Check if actor is still alive
-                if not actor.is_alive:
-                    continue
-                
-                loc = actor.get_location()
-                distance = np.sqrt(
-                    (ego_location.x - loc.x)**2 + 
-                    (ego_location.y - loc.y)**2
+                loc = npc.get_location()
+                s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
+                    loc.x, loc.y, 0
                 )
-                
-                if distance < 50.0:
-                    s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
-                        loc.x, loc.y, 0
-                    )
-                    
-                    if s_obs > self.current_s - 5.0 and abs(d_obs) < 8.0:
-                        obstacles.append({
-                            's': s_obs, 
-                            'd': d_obs, 
-                            'distance': s_obs - self.current_s,
-                            'type': 'sensor_detected',
-                            'actor_id': actor.id
-                        })
+                ds = s_obs - self.current_s
+                if ds > -5.0 and ds < MAX_OBS_LOOKAHEAD:
+                    obstacles.append({
+                        's': s_obs,
+                        'd': d_obs,
+                        'distance': ds,
+                        'type': 'npc'
+                    })
             except:
                 pass
         
-        # 2. Add vehicles (manual detection as backup)
-        vehicles = self.world.get_actors().filter('vehicle.*')
-        for vehicle in vehicles:
-            if vehicle.id == self.vehicle.id:
-                continue
-            
-            # Skip if already detected by sensor
-            if any(obs.get('actor_id') == vehicle.id for obs in obstacles):
-                continue
-            
-            loc = vehicle.get_location()
-            distance = np.sqrt(
-                (ego_location.x - loc.x)**2 + 
-                (ego_location.y - loc.y)**2
-            )
-            
-            if distance < 50.0:
-                try:
-                    s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
-                        loc.x, loc.y, 0
-                    )
-                    
-                    if s_obs > self.current_s - 5.0 and abs(d_obs) < 8.0:
-                        obstacles.append({
-                            's': s_obs, 
-                            'd': d_obs, 
-                            'distance': s_obs - self.current_s,
-                            'type': 'vehicle',
-                            'actor_id': vehicle.id
-                        })
-                except:
-                    pass
-        
-        # 3. Add static objects (manual detection for those not caught by sensor)
-        all_actors = self.world.get_actors()
-        print("="*50)
-        print(f"Total actors: {len(all_actors)}")
-        print("="*50)
-
-        # Group by type prefix
-        from collections import Counter
-        type_counts = Counter()
-        for actor in all_actors:
-            # Get the category prefix (e.g. 'vehicle', 'sensor', 'static', 'prop')
-            prefix = actor.type_id.split('.')[0]
-            type_counts[prefix] += 1
-
-        print("\nActor counts by category:")
-        for category, count in sorted(type_counts.items()):
-            print(f"  {category}: {count}")
-
-        print("\nAll unique type_ids:")
-        unique_types = sorted(set(actor.type_id for actor in all_actors))
-        for t in unique_types:
-            print(f"  {t}")
-        print("="*50)
-        static_objects = self.world.get_actors().filter('static.*')
-        for prop in static_objects:
-            loc = prop.get_location()
-            distance = np.sqrt(
-                (ego_location.x - loc.x)**2 + 
-                (ego_location.y - loc.y)**2
-            )
-            
-            if distance < 50.0:
-                try:
-                    s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
-                        loc.x, loc.y, 0
-                    )
-                    
-                    if s_obs > self.current_s - 5.0 and abs(d_obs) < 8.0:
-                        obstacles.append({
-                            's': s_obs, 
-                            'd': d_obs, 
-                            'distance': s_obs - self.current_s,
-                            'type': 'static'
-                        })
-                except:
-                    pass
-
-        # Sort by distance and select closest N
         obstacles.sort(key=lambda x: x['distance'])
-        
         for i, obs in enumerate(obstacles[:self.num_obstacles]):
             self.selected_obstacles[i] = [obs['s'], obs['d']]
-
-        if len(self.sensor_detected_obstacles) > 200:
-            self.sensor_detected_obstacles = self.sensor_detected_obstacles[-100:]
     
     def _get_observation(self) -> np.ndarray:
         """
@@ -622,7 +800,7 @@ class CarlaMPCEnv(gym.Env):
             mpc_control,  # MPC throttle, steering
             mpc_prev,  # Previous MPC control
             self.selected_obstacles.flatten(),  # Obstacles
-            [self.current_speed, 0.0, self.current_throttle, 
+            [self.current_speed, self.lateral_accel, self.current_throttle, 
              self.current_brake, self.current_steering],  # Vehicle state
             kappa_samples,  # Curvature
             [self.current_step],  # Step count
@@ -638,47 +816,90 @@ class CarlaMPCEnv(gym.Env):
         return np.clip(obs, -1e6, 1e6)
     
     def _calculate_reward(self, action: np.ndarray) -> float:
-        reward = 0.0
-        
-        # Collision penalty
+    
         if self.collision:
-            return -100.0
+            return -200.0
         
         # Progress reward
         progress = self.current_s - self.prev_s
-        reward += progress * 10.0
+        reward = progress / (self.target_speed * self.mpc_dt)
         
-        # Lane keeping
-        if not (self.current_d < 3.5 and self.current_d > -0.5):
+        # Lane boundary
+        idx = np.argmin(np.abs(self._road_width_s - self.current_s))
+        n_min = -self._road_widths[idx, 0]
+        n_max =  self._road_widths[idx, 1]
+        road_width = n_max - n_min
+        d_normalized = (self.current_d - n_min) / road_width
+        edge_penalty = -2.0 * (2 * d_normalized - 1) ** 4
+        reward += edge_penalty
+        
+        if not (n_min < self.current_d < n_max):
+            reward -= 5.0
+        
+        # Lateral acceleration penalty
+        reward -= 0.1 * abs(self.lateral_accel)
+        
+        # Heading penalty
+        reward -= abs(self.current_alpha) * 2.0
+        
+        # Speed tracking
+        speed_error = abs(self.current_speed - self.target_speed)
+        reward -= 0.05 * speed_error
+        if self.current_speed > self.target_speed * 1.3:
+            reward -= 1.0
+        
+        # Stall penalty
+        if self.current_speed < 1.0:
             reward -= 5.0
         
         # Obstacle avoidance
         for obs in self.selected_obstacles:
-            if obs[0] > -50:  # Valid obstacle
+            if obs[0] > -50:
                 dist = np.sqrt(
                     (self.current_s - obs[0])**2 + 
                     ((self.current_d - obs[1]) * 2)**2
                 )
                 if dist < 6.0:
-                    reward -= 5.0
+                    reward -= 3.0
         
-        # Heading alignment penalty
-        reward -= abs(self.current_alpha) * 5.0
+        # --- OVERTAKING REWARD ---
+        for npc_data in self.racing_npcs:
+            npc = npc_data.get("actor")
+            if npc is None or not npc.is_alive:
+                continue
+            npc_id = npc.id
+            npc_s = npc_data.get("s", -999)
+            
+            # Ignore NPCs that have respawned behind us
+            if npc_s < self.current_s - 50.0:  # way behind = just respawned
+                continue
+            
+            # NPC must have been meaningfully ahead at some point
+            # Only count overtake if NPC is within a reasonable window behind us
+            ds = self.current_s - npc_s
+            if 5.0 < ds < 40.0 and npc_id not in self.overtaken_npcs:
+                self.overtaken_npcs.add(npc_id)
+                reward += 50.0
+                print(f"🏎️  Overtook NPC {npc_id}! Total overtakes: {len(self.overtaken_npcs)}")
         
-        # Speed penalty (stalling)
-        if self.current_speed < 1.0:
-            reward -= 10.0
-        
-        # Speed bonus
-        if self.current_speed > 5.0:
-            reward += 0.001 * self.current_speed**2
-        
-        # Goal reached bonus
+        # --- GOAL REACHED ---
         if self.current_s >= self.path_length - 10:
-            reward += 1000.0
-        
-        # Time penalty
-        reward -= self.current_step * 0.005
+            # Base completion bonus
+            reward += 200.0
+            
+            # Time bonus — faster finish = more reward
+            # At target speed, expected time = path_length / target_speed
+            expected_time = self.path_length / self.target_speed
+            actual_time = time.time() - self.start_time
+            time_ratio = expected_time / max(actual_time, 1.0)  # >1 means faster than expected
+            time_bonus = 100.0 * time_ratio  # scales with how fast you finished
+            reward += time_bonus
+            
+            # Overtaking bonus at finish — reward total cars beaten
+            overtake_finish_bonus = len(self.overtaken_npcs) * 25.0
+            reward += overtake_finish_bonus
+            
+            print(f"🏁 Finished! Time bonus: {time_bonus:.1f}, Overtakes: {len(self.overtaken_npcs)} (+{overtake_finish_bonus:.1f})")
         
         return reward
     
@@ -718,6 +939,7 @@ class CarlaMPCEnv(gym.Env):
         # Town rotation
         try:
             self.episode_count += 1
+            self.overtaken_npcs = set()
             # if self.episode_count % self.episodes_per_town == 0 and self.episode_count > 0:
             #     self._load_random_town()
             # Disable because of resource
@@ -732,15 +954,16 @@ class CarlaMPCEnv(gym.Env):
                 spawn_point = random.choice(spawn_points)
                 spawn_point.location.z += 1.0 #avoid collision
                 goal_point = random.choice(spawn_points)
-                # spawn_point = carla.Transform(
-                #     carla.Location(x=-45.235935, y=-36.500095, z=0.600000),
-                #     carla.Rotation(pitch=0.000000, yaw=-89.567680, roll=0.000000)
-                # )
+                
+                spawn_point = carla.Transform(
+                    carla.Location(x=63.340027, y=191.769989, z=1.500000),
+                    carla.Rotation(pitch=0.000000, yaw=-0.000183, roll=0.000000)
+                )
 
-                # goal_point = carla.Transform(
-                #     carla.Location(x=-114.432091, y=56.850296, z=0.600000),
-                #     carla.Rotation(pitch=0.000000, yaw=90.642235, roll=0.000000)
-                # )
+                goal_point = carla.Transform(
+                    carla.Location(x=-7.530000, y=270.729980, z=0.500000),
+                    carla.Rotation(pitch=0.000000, yaw=89.999954, roll=0.000000)
+                )
                 
                 # Ensure minimum distance
                 dist = np.sqrt(
@@ -748,9 +971,9 @@ class CarlaMPCEnv(gym.Env):
                     (spawn_point.location.y - goal_point.location.y)**2
                 )
                 
-                if dist > 100.0:
-                    # print(f"spawn: {spawn_point}")
-                    # print(f"goal: {goal_point}")
+                if dist > 50.0:
+                    print(f"spawn: {spawn_point}")
+                    print(f"goal: {goal_point}")
                     # Spawn vehicle
                     if not self._spawn_ego_vehicle(spawn_point):
                         continue
@@ -768,7 +991,7 @@ class CarlaMPCEnv(gym.Env):
                     self._initialize_mpc()
                     # self._visualize_path_and_goal(goal_point)
 
-                    self.racing_npcs = self._spawn_frenet_racers(num_cars=5)
+                    self.racing_npcs = self._spawn_frenet_racers(num_cars = random.randint(0, 7))
 
                     break
             else:
@@ -814,7 +1037,9 @@ class CarlaMPCEnv(gym.Env):
             # Run MPC to get base control
             self._update_vehicle_state()
             self._detect_obstacles()
+            # self._debug_road_boundaries(every_n_steps=50)
 
+            # _t_mpc_start = time.perf_counter()
             mpc_throttle, mpc_steering = self.mpc_controller.solve(
                 s=self.current_s,
                 d=self.current_d,
@@ -823,8 +1048,11 @@ class CarlaMPCEnv(gym.Env):
                 obstacles=self.selected_obstacles,
                 D=self.current_throttle,
                 delta=self.current_steering,
-                road_widths=self._road_widths  # None is okay, MPC will use defaults
+                road_widths=self._road_widths,  # None is okay, MPC will use defaults
+                road_width_s=self._road_width_s,
             )
+            # _t_mpc_end = time.perf_counter()
+            # self._last_mpc_time_ms = (_t_mpc_end - _t_mpc_start) * 1000
 
             # print("="*20)
             # print(f"MPC Throttle: {mpc_throttle}\nMPC Steering: {mpc_steering}")
@@ -840,6 +1068,8 @@ class CarlaMPCEnv(gym.Env):
             if final_throttle < 0 and self.current_speed < 0.3:
                 final_throttle = 1.0  # Prevent Stalling
             
+            # print(f"Throttle: {final_throttle} \n Steering: {final_steering}")
+            
             # Apply control to vehicle
             control = carla.VehicleControl()
             if final_throttle >= 0:
@@ -854,6 +1084,33 @@ class CarlaMPCEnv(gym.Env):
             
             # Tick world
             self.world.tick()
+            # ── Trajectory logging ────────────────────────────
+            if self.recording:
+                # Ego
+                t = self.vehicle.get_transform()
+                self.ego_trajectory.append([
+                    self.current_step,
+                    t.location.x, t.location.y,
+                    self.current_s, self.current_d
+                ])
+                # NPCs
+                for npc_data in self.racing_npcs:
+                    npc = npc_data.get("actor")
+                    if npc is None or not npc.is_alive:
+                        continue
+                    try:
+                        loc = npc.get_location()
+                        s_n, d_n, _ = self.frenet_converter.world_to_frenet(
+                            loc.x, loc.y, 0)
+                        self.npc_trajectory.append([
+                            npc.id,
+                            self.current_step,
+                            loc.x, loc.y,
+                            s_n, d_n
+                        ])
+                    except:
+                        pass
+            # ─────────────────────────────────────────────────
             
             # Get new observation
             obs = self._get_observation()
@@ -863,11 +1120,13 @@ class CarlaMPCEnv(gym.Env):
             if hasattr(self, 'render_mode') and self.render_mode == 'human':
                 self._draw_vehicle_info()
             
-            # self._draw_road_boundaries_ahead()
-            self._visualize_detected_obstacles()
+            self._draw_road_boundaries_ahead()
+            # self._visualize_detected_obstacles()
+            # self._visualize_lidar_obstacles()
+            self._visualize_cbf_ellipses()
                 
-            # if self.current_step % 5 == 0:
-            #     self._visualize_mpc_prediction()
+            if self.current_step % 5 == 0:
+                self._visualize_mpc_prediction()
 
             
             return obs, reward, done, False, info
@@ -890,6 +1149,12 @@ class CarlaMPCEnv(gym.Env):
     
     def _destroy_actors(self):
         """Safely destroy all actors"""
+        if hasattr(self, 'camera_sensor') and self.camera_sensor is not None:
+            try:
+                self.camera_sensor.stop()
+                self.camera_sensor.destroy()
+            except: pass
+            self.camera_sensor = None
         if hasattr(self, 'obstacle_sensor') and self.obstacle_sensor is not None:
             try:
                 self.obstacle_sensor.stop()
@@ -1047,7 +1312,7 @@ class CarlaMPCEnv(gym.Env):
         if camera_mode == 'top_down':
             # Bird's eye view
             spectator_transform = carla.Transform(
-                vehicle_transform.location + carla.Location(z=50),
+                vehicle_transform.location + carla.Location(z=20),
                 carla.Rotation(pitch=-90)
             )
         
@@ -1125,74 +1390,88 @@ class CarlaMPCEnv(gym.Env):
         debug = self.world.debug
         traj = self.mpc_controller.get_predicted_trajectory()
 
-        # Draw current car position in frenet coordination
-        loc = self.vehicle.get_transform().location
-        debug.draw_point(
-            loc,
-            size=0.15,
-            color=carla.Color(255, 0, 255), # pink
-            life_time=15.0
-        )
+        # # Draw current car position in frenet coordination
+        # loc = self.vehicle.get_transform().location
+        # debug.draw_point(
+        #     loc,
+        #     size=0.15,
+        #     color=carla.Color(255, 0, 255), # pink
+        #     life_time=15.0
+        # )
 
-        # Draw current car position in world coordination
-        s0, d0, a0 = self.current_s, self.current_d, self.current_alpha
-        x0, y0, _ = self.frenet_converter.frenet_to_world(s0, d0, a0)
-        debug.draw_point(
-            carla.Location(x=x0, y=y0, z=0.8),
-            size=0.12,
-            color=carla.Color(0, 255, 255),  # cyan
-            life_time=15.0
-        )
+        # # Draw current car position in world coordination
+        # s0, d0, a0 = self.current_s, self.current_d, self.current_alpha
+        # x0, y0, _ = self.frenet_converter.frenet_to_world(s0, d0, a0)
+        # debug.draw_point(
+        #     carla.Location(x=x0, y=y0, z=0.8),
+        #     size=0.12,
+        #     color=carla.Color(0, 255, 255),  # cyan
+        #     life_time=15.0
+        # )
 
         # Draw MPC predicted trajectory (small yellow dots)
         for s, d in traj:
             x, y, _ = self.frenet_converter.frenet_to_world(s, d, 0.0)
             debug.draw_point(
                 carla.Location(x=x, y=y, z=0.7),
-                size=0.08,
-                color=carla.Color(255, 255, 0),  # yellow
+                size=0.10,
+                color=carla.Color(255, 0, 255),
                 life_time=0.2
             )
 
     def _draw_road_boundaries_ahead(self, lookahead_distance=30.0):
-        """Draw road boundaries ahead of the vehicle"""
-        if self._road_widths is None or self.frenet_converter is None:
+        if self._road_widths is None or self._road_width_s is None or self.frenet_converter is None:
             return
         
         debug = self.world.debug
         
-        # Sample points ahead
-        num_points = 30
         s_samples = np.linspace(
             self.current_s,
             min(self.current_s + lookahead_distance, self.path_length),
-            num_points
+            30
         )
         
         for s in s_samples:
-            # Get road width at this s
-            idx = int(s / 1.0)
-            idx = np.clip(idx, 0, len(self._road_widths) - 1)
-            n_left = self._road_widths[idx, 0]
-            n_right = -self._road_widths[idx, 1]
+            idx = np.argmin(np.abs(self._road_width_s - s))
+            n_left  =  - self._road_widths[idx, 0]  # positive d = left (includes overtaking lane)
+            n_right =  self._road_widths[idx, 1]  # negative d = right (ego lane edge only)
             
-            # Left boundary
+            # Left boundary (red) - should be ~5.25m out (full overtaking lane)
             x_left, y_left, _ = self.frenet_converter.frenet_to_world(s, n_left, 0)
             debug.draw_point(
                 carla.Location(x=x_left, y=y_left, z=0.3),
-                size=0.08,
-                color=carla.Color(255, 100, 100),
-                life_time=15.0
+                size=0.15,
+                color=carla.Color(0, 0, 255),
+                life_time=0.15
             )
             
-            # Right boundary
+            # Right boundary (blue) - should be ~1.75m out
             x_right, y_right, _ = self.frenet_converter.frenet_to_world(s, n_right, 0)
             debug.draw_point(
                 carla.Location(x=x_right, y=y_right, z=0.3),
-                size=0.08,
-                color=carla.Color(100, 100, 255),
-                life_time=15.0
+                size=0.15,
+                color=carla.Color(0, 0, 255),
+                life_time=0.15
             )
+            
+            # Centerline (green) - should be exactly on path
+            x_c, y_c, _ = self.frenet_converter.frenet_to_world(s, 0.0, 0)
+            debug.draw_point(
+                carla.Location(x=x_c, y=y_c, z=0.3),
+                size=0.10,
+                color=carla.Color(0, 255, 0),
+                life_time=0.15
+            )
+            
+            # Lane divider (yellow) - left edge of ego lane
+            # lane_divider_d = - self._road_widths[idx, 1]  # right_width = lane_width/2
+            # x_div, y_div, _ = self.frenet_converter.frenet_to_world(s, lane_divider_d, 0)
+            # debug.draw_point(
+            #     carla.Location(x=x_div, y=y_div, z=0.3),
+            #     size=0.06,
+            #     color=carla.Color(255, 255, 0),
+            #     life_time=0.15
+            # )
 
     def _visualize_detected_obstacles(self):
         """Visualize obstacles with different colors based on detection method"""
@@ -1250,6 +1529,124 @@ class CarlaMPCEnv(gym.Env):
                     color=carla.Color(255, 255, 0),  # Yellow
                     life_time=0.1
                 )
+
+    def _debug_road_boundaries(self, every_n_steps=50):
+        """Compare road widths used in MPC constraints vs draw visualization"""
+        if self.current_step % every_n_steps != 0:
+            return
+        if self._road_widths is None or self._road_width_s is None:
+            return
+
+        print(f"\n{'='*60}")
+        print(f"[STEP {self.current_step}] ROAD BOUNDARY DEBUG @ s={self.current_s:.2f}")
+        print(f"{'='*60}")
+
+        # ---- GLOBAL PATH STATS (one-time overview) ----
+        lw_all = self._road_widths[:, 0]  # left widths
+        rw_all = self._road_widths[:, 1]  # right widths
+        print(f"[GLOBAL] Left  width: min={lw_all.min():.2f}, max={lw_all.max():.2f}, mean={lw_all.mean():.2f}")
+        print(f"[GLOBAL] Right width: min={rw_all.min():.2f}, max={rw_all.max():.2f}, mean={rw_all.mean():.2f}")
+
+        # ---- CURRENT POSITION LOOKUP ----
+        idx = np.argmin(np.abs(self._road_width_s - self.current_s))
+        lw = self._road_widths[idx, 0]
+        rw = self._road_widths[idx, 1]
+
+        safety_margin = 1.0
+
+        # What MPC constraint uses (from solve() loop):
+        mpc_n_min = -lw + safety_margin   # negative = left boundary
+        mpc_n_max =  rw - safety_margin   # positive = right boundary
+        mpc_n_min_clamped = max(mpc_n_min, -10.0)
+        mpc_n_max_clamped = min(mpc_n_max,  10.0)
+
+        # What draw uses (from _draw_road_boundaries_ahead):
+        draw_n_left  = -lw + safety_margin   # left boundary dot
+        draw_n_right =  rw - safety_margin   # right boundary dot
+
+        print(f"\n[CURRENT s={self.current_s:.2f}, idx={idx}]")
+        print(f"  Raw road widths:  left={lw:.3f}m, right={rw:.3f}m")
+        print(f"  MPC n_min (left boundary) : {mpc_n_min:.3f} → clamped: {mpc_n_min_clamped:.3f}")
+        print(f"  MPC n_max (right boundary): {mpc_n_max:.3f} → clamped: {mpc_n_max_clamped:.3f}")
+        print(f"  Draw n_left  (red dot d)  : {draw_n_left:.3f}")
+        print(f"  Draw n_right (blue dot d) : {draw_n_right:.3f}")
+        print(f"  MATCH: {np.isclose(mpc_n_min, draw_n_left) and np.isclose(mpc_n_max, draw_n_right)}")
+
+        # ---- CURRENT EGO POSITION ----
+        print(f"\n[EGO] current_d={self.current_d:.3f}")
+        print(f"  Inside MPC bounds? {mpc_n_min_clamped < self.current_d < mpc_n_max_clamped}")
+        print(f"  Distance to left wall : {self.current_d - mpc_n_min_clamped:.3f}m")
+        print(f"  Distance to right wall: {mpc_n_max_clamped - self.current_d:.3f}m")
+
+        # ---- LOOKAHEAD: what MPC will use for future steps ----
+        print(f"\n[MPC HORIZON PREVIEW] (next {self.mpc_horizon} steps)")
+        print(f"  {'i':>3}  {'s_pred':>8}  {'n_min':>8}  {'n_max':>8}  {'width':>8}")
+        for i in range(1, self.mpc_horizon, 5):  # every 5 steps
+            s_pred = self.current_s + self.target_speed * (self.mpc_dt * self.mpc_horizon / self.mpc_horizon) * i
+            idx_pred = np.argmin(np.abs(self._road_width_s - s_pred))
+            lw_pred = self._road_widths[idx_pred, 0]
+            rw_pred = self._road_widths[idx_pred, 1]
+            n_min_p = max(-lw_pred + safety_margin, -10.0)
+            n_max_p = min( rw_pred - safety_margin,  10.0)
+            print(f"  {i:>3}  {s_pred:>8.2f}  {n_min_p:>8.3f}  {n_max_p:>8.3f}  {n_min_p+n_max_p:>8.3f}")
+
+        print(f"{'='*60}\n")
+
+    def _visualize_cbf_ellipses(self):
+        """Draw CBF ellipses around each obstacle in CARLA world"""
+        if self.frenet_converter is None:
+            return
+        
+        debug = self.world.debug
+        
+        a_long = 4  # Must match bicycle_model_mpcc_cbf.py
+        b_lat = 2   # Must match bicycle_model_mpcc_cbf.py
+        
+        for obs in self.selected_obstacles:
+            if obs[0] < -50:  # Invalid obstacle
+                continue
+            
+            s_obs, n_obs = obs[0], obs[1]
+            
+            # Draw ellipse by sampling points around it
+            num_points = 36
+            for i in range(num_points):
+                angle = 2 * np.pi * i / num_points
+                
+                s_ellipse = s_obs + a_long * np.cos(angle)
+                n_ellipse = n_obs + b_lat * np.sin(angle)
+                
+                x1, y1, _ = self.frenet_converter.frenet_to_world(
+                    s_ellipse, n_ellipse, 0.0)
+                
+                debug.draw_point(
+                    carla.Location(x=x1, y=y1, z=0.5),
+                    size=0.05,                    # adjust size as needed
+                    color=carla.Color(255, 0, 0), # solid red
+                    life_time=0.15
+                )
+            
+            # # Also draw 2x safety distance (where repulsive cost kicks in)
+            # for i in range(num_points):
+            #     angle = 2 * np.pi * i / num_points
+            #     angle_next = 2 * np.pi * (i + 1) / num_points
+                
+            #     s_outer = s_obs + (a_long * 2) * np.cos(angle)
+            #     n_outer = n_obs + (b_lat * 2) * np.sin(angle)
+                
+            #     s_outer_next = s_obs + (a_long * 2) * np.cos(angle_next)
+            #     n_outer_next = n_obs + (b_lat * 2) * np.sin(angle_next)
+                
+            #     x1, y1, _ = self.frenet_converter.frenet_to_world(s_outer, n_outer, 0.0)
+            #     x2, y2, _ = self.frenet_converter.frenet_to_world(s_outer_next, n_outer_next, 0.0)
+                
+            #     debug.draw_line(
+            #         carla.Location(x=x1, y=y1, z=0.5),
+            #         carla.Location(x=x2, y=y2, z=0.5),
+            #         thickness=0.03,
+            #         color=carla.Color(255, 255, 0),  # Yellow = repulsive cost zone
+            #         life_time=0.1
+            #     )
 
     def close(self):
         try:

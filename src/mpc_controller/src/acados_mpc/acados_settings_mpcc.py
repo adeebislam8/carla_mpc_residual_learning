@@ -19,9 +19,7 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3):
     ocp = AcadosOcp()
     dt = Tf/N
     # export model
-    print("before model")
-    model, constraint = bicycle_model(dt, coeffs, knots, path_msg, degree)
-    print("after model")
+    model, constraint = bicycle_model(dt, coeffs, knots, path_msg, degree, use_cbf=True)
     # define acados ODE
     model_ac = AcadosModel()
     model_ac.f_impl_expr = model.f_impl_expr
@@ -173,14 +171,14 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3):
     slack_L2_cost = np.array([
         1e-3,
         1e-3,
-        5e2, ##
+        5e5, ##
         5e-1,
         1e1,
         1e1,
-        1e1,
-        1e1,
-        1e1,
-        1e1,
+        1e-1,
+        1e-1,
+        1e-1,
+        1e-1,
                 ])
 
     ocp.cost.zl = slack_L1_cost
@@ -216,9 +214,9 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3):
     ocp.solver_options.qp_solver_cond_N = 5      # Condensing horizon   
     # ocp.solver_options.tol = 1e-3
     # ocp.solver_options.nlp_solver_tol_comp = 1e-1
-    ocp.solver_options.nlp_solver_tol_stat = 1e-4
+    ocp.solver_options.nlp_solver_tol_stat = 1e-2
     ocp.solver_options.nlp_solver_tol_eq = 1e-4
-    ocp.solver_options.nlp_solver_tol_ineq = 1e-4
+    ocp.solver_options.nlp_solver_tol_ineq = 1e-2
     ocp.solver_options.nlp_solver_tol_comp = 1e-4
 
     # create solver

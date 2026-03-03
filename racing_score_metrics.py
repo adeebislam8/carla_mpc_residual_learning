@@ -267,7 +267,10 @@ class RacingMetricsTracker:
                     self.danger_time += 0.05  # dt
         
         # Lane violations
-        if abs(env_state['d']) > 3.5 or env_state['d'] < -0.5:
+        n_min = env_state.get('n_min', -5.25)  # fallback to Town01 default
+        n_max = env_state.get('n_max', 1.75)
+
+        if env_state['d'] < n_min or env_state['d'] > n_max:
             self.lane_violations += 1
     
     def finalize(self, path_length: float, done_reason: str) -> RacingMetrics:
