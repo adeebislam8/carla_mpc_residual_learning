@@ -1,7 +1,12 @@
 import os
 import sys
 
-sys.path.append('/home/ave/Desktop/carla_mpc_residual_learning/carla/PythonAPI/carla')
+# CARLA's PythonAPI ships the `agents` package alongside the `carla` module.
+# Prefer whatever is already on PYTHONPATH; fall back to the in-repo checkout.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_CARLA_API = os.path.join(_REPO_ROOT, 'carla', 'PythonAPI', 'carla')
+if os.path.isdir(_CARLA_API) and _CARLA_API not in sys.path:
+    sys.path.append(_CARLA_API)
 
 import carla
 from agents.navigation.global_route_planner import GlobalRoutePlanner

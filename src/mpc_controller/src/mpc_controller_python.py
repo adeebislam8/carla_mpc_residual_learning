@@ -5,7 +5,7 @@ import os
 import math
 from casadi import *
 import time
-sys.path.append('/home/ave/Desktop/carla_mpc_residual_learning/src/mpc_controller/src')
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import existing ACADOS setup
 from acados_mpc.acados_settings_mpcc import acados_settings

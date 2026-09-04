@@ -6,12 +6,14 @@ import time
 from gymnasium import spaces
 from typing import Dict, Tuple, Optional, List
 from scipy.interpolate import make_interp_spline
+import os
 import sys
 import weakref
 import traceback
 import gc
 
-sys.path.append('/home/ave/Desktop/carla_mpc_residual_learning/src')
+# <repo>/src -- so the global_planner / mpc_controller packages resolve
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from global_planner.src.frenet_world_converter_python import FrenetConverter
 from global_planner.src.global_path_publisher_python import PathPlanner
