@@ -1756,6 +1756,14 @@ class CarlaMPCEnv(gym.Env):
 
     def close(self):
         try:
+            # Flush the in-progress episode's diagnostics.  reset() only saves
+            # the *previous* episode, so without this the run you were watching
+            # when you hit Ctrl+C -- usually the interesting one -- is lost.
+            if self.mpc_controller is not None:
+                diag = getattr(self.mpc_controller, 'diagnostics', None)
+                if diag is not None:
+                    diag.save(tag=f"ep{self.episode_count:04d}_final")
+
             self._destroy_actors()
 
             # Extra safety: remove any leftover vehicles
