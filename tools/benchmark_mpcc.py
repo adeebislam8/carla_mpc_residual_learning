@@ -44,7 +44,7 @@ def run(args):
     env = CarlaMPCEnv(
         host=args.host,
         port=args.port,
-        towns=args.towns,
+        towns=[args.town],
         episodes_per_town=10 ** 9,
         target_speed=args.target_speed,
         max_steps=args.max_steps,
@@ -102,7 +102,7 @@ def run(args):
         'episodes_completed': len(episodes),
         'seed': args.seed,
         'target_speed': args.target_speed,
-        'towns': args.towns,
+        'town': args.town,
         'max_steps': args.max_steps,
         'wall_time_s': time.time() - t_start,
         'per_episode': episodes,
@@ -150,7 +150,7 @@ def write_report(res, path):
     L.append(f"  episodes      : {res['episodes_completed']}/{res['episodes_requested']}")
     L.append(f"  seed          : {res['seed']}   (same seed => same spawn sequence)")
     L.append(f"  target_speed  : {res['target_speed']} m/s")
-    L.append(f"  towns         : {', '.join(res['towns'])}")
+    L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  wall time     : {res['wall_time_s']/60:.1f} min")
     L.append(f"  driven with action = [0, 0]  -> pure MPCC, no RL residual")
     L.append("")
@@ -244,9 +244,15 @@ def main():
     ap.add_argument('--label', default='run', help='name for this configuration')
     ap.add_argument('--episodes', type=int, default=20)
     ap.add_argument('--seed', type=int, default=2547)
-    ap.add_argument('--target-speed', type=float, default=15.0)
+    ap.add_argument('--target-speed', type=float, default=15.0,
+                    help='drop this for the non-racing reframe (see WORKLOG.md)')
     ap.add_argument('--max-steps', type=int, default=1500)
-    ap.add_argument('--towns', nargs='+', default=['Town03'])
+    # Only towns[0] reaches load_world(), and the town-rotation block in reset()
+    # is commented out, so exactly one map is ever used.  Town01 is what every
+    # previous run and every saved diagnostics/*.npz used -- keep it unless you
+    # deliberately want a different map, or comparisons break.
+    ap.add_argument('--town', default='Town01',
+                    help='map to benchmark on (default Town01, matching prior runs)')
     ap.add_argument('--host', default='localhost')
     ap.add_argument('--port', type=int, default=2000)
     ap.add_argument('--out-dir', default='results')
