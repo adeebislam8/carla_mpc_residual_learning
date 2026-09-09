@@ -953,20 +953,32 @@ class CarlaMPCEnv(gym.Env):
             max_attempts = 500
             spawn_points = self.map.get_spawn_points()
             for attempt in range(max_attempts):
-                spawn_point = random.choice(spawn_points)
-                spawn_point.location.z += 1.0 #avoid collision
-                goal_point = random.choice(spawn_points)
-                
+                # Build a fresh Transform: get_spawn_points() is cached above, so
+                # mutating the chosen one would drift its z on every re-pick.
+                base_point = random.choice(spawn_points)
                 spawn_point = carla.Transform(
-                    carla.Location(x=63.340027, y=191.769989, z=1.500000),
-                    carla.Rotation(pitch=0.000000, yaw=-0.000183, roll=0.000000)
+                    carla.Location(
+                        x=base_point.location.x,
+                        y=base_point.location.y,
+                        z=base_point.location.z + 1.0,  # avoid collision
+                    ),
+                    base_point.rotation,
                 )
+                goal_point = random.choice(spawn_points)
 
-                goal_point = carla.Transform(
-                    carla.Location(x=-7.530000, y=270.729980, z=0.500000),
-                    carla.Rotation(pitch=0.000000, yaw=89.999954, roll=0.000000)
-                )
-                
+                # Fixed spawn/goal for parameter exploration -- re-enable to pin
+                # the episode to one route. Leave commented for normal runs, or
+                # the retry loop below can only ever try this single point.
+                # spawn_point = carla.Transform(
+                #     carla.Location(x=63.340027, y=191.769989, z=1.500000),
+                #     carla.Rotation(pitch=0.000000, yaw=-0.000183, roll=0.000000)
+                # )
+
+                # goal_point = carla.Transform(
+                #     carla.Location(x=-7.530000, y=270.729980, z=0.500000),
+                #     carla.Rotation(pitch=0.000000, yaw=89.999954, roll=0.000000)
+                # )
+
                 # Ensure minimum distance
                 dist = np.sqrt(
                     (spawn_point.location.x - goal_point.location.x)**2 +
