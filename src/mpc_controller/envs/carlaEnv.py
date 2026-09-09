@@ -1004,6 +1004,13 @@ class CarlaMPCEnv(gym.Env):
             #     self._load_random_town()
             # Disable because of resource
             
+            # Flush the previous episode's solver diagnostics before the
+            # controller is rebuilt below.
+            if self.mpc_controller is not None:
+                diag = getattr(self.mpc_controller, 'diagnostics', None)
+                if diag is not None:
+                    diag.save(tag=f"ep{self.episode_count:04d}")
+
             # Destroy old vehicle and sensors
             self._destroy_actors()
             

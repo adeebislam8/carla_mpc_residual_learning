@@ -9,6 +9,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import existing ACADOS setup
 from acados_mpc.acados_settings_mpcc import acados_settings
+from solver_diagnostics import SolverDiagnostics
 from scipy.integrate import solve_ivp
 
 
@@ -59,7 +60,11 @@ class MPCController:
         self.fallback_blend_steps = max(1, int(round(1.0 / dt)))  # ~1 s
         self.solve_failures = 0
         self.solve_calls = 0
-    
+
+        # Records solver inputs so failures can be attributed instead of
+        # guessed at.  Off unless CARLA_MPC_DIAG=1.
+        self.diagnostics = SolverDiagnostics()
+
     def initialize_acados(self, path_curvature_spline, path_msg=None):
         """
         Initialize ACADOS solver with path information
@@ -223,10 +228,14 @@ class MPCController:
             # Set constraints for this timestep
             self.acados_solver.constraints_set(i, "lh", lh_constraints)
             self.acados_solver.constraints_set(i, "uh", uh_constraints)
-            
+
             # Set obstacle parameters for this timestep
             self.acados_solver.set(i, "p", obstacles.flatten())
-        
+
+            if i == 1:  # keep one representative stage for the diagnostics
+                diag_lh, diag_uh = lh_constraints, uh_constraints
+                diag_n_min, diag_n_max = n_min_adaptive, n_max_adaptive
+
         distance2stop = 0.5 * v
         s_target = s + self.target_speed * self.Tf
         
@@ -237,6 +246,23 @@ class MPCController:
         # 8. Solve ACADOS OCP
         self.solve_calls += 1
         status = self.acados_solver.solve()
+
+        # Record what the solver was fed, whether or not it succeeded -- the
+        # failures only mean something next to the successes.
+        if self.diagnostics is not None and self.diagnostics.enabled:
+            path_len = getattr(self, '_global_path_length', None) or 0.0
+            self.diagnostics.record(
+                status=status, s=s, n=d, alpha=alpha, v=v, D=D, delta=delta,
+                propagated_x=propagated_x, obstacles=obstacles,
+                kappa_fn=self.model.kapparef_s, path_length=path_len,
+                n_min=locals().get('diag_n_min', np.nan),
+                n_max=locals().get('diag_n_max', np.nan),
+                lh=locals().get('diag_lh'), uh=locals().get('diag_uh'),
+                v_min=self.model.v_min, v_max=self.model.v_max,
+                horizon_s=[s + self.target_speed * self.dt * i
+                           for i in range(self.N + 1)],
+                solver=self.acados_solver,
+            )
 
         if status != 0:
             # print(f"\n{'='*50}")
