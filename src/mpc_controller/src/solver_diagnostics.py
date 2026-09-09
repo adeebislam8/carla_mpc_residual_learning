@@ -204,6 +204,14 @@ class SolverDiagnostics:
             return "NaN/Inf in the obstacle parameters"
         if rec["v_out_of_bounds"]:
             return f"v={rec['v']:.2f} outside the model's speed bounds"
+        # Every switch in the cost that depends on an obstacle is multiplied by
+        # n**2, so its Hessian cross terms scale with n and n**2.  Near the
+        # centreline the discontinuity is multiplied by almost nothing; out at
+        # n = -3 during a pass it is not.
+        if rec["n_active_obs"] > 0 and abs(rec["n"]) > 2.0:
+            return (f"mid-overtake: obstacle present and n={rec['n']:+.2f} -- "
+                    "the obstacle-gated n**2 term's switch dominates the Hessian "
+                    "at this lateral offset")
         return ("no input-side cause found -- points at cost/Hessian "
                 "conditioning rather than a bad input")
 

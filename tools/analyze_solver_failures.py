@@ -196,12 +196,22 @@ def main():
 
     print("\nVERDICT")
     print("-" * 72)
-    top = sorted(rows, reverse=True)
-    if top and top[0][1] > 0.2 and top[0][0] > 3:
-        print(f"  '{top[0][3]}' fires on {100*top[0][1]:.0f}% of failures "
-              f"({'inf' if np.isinf(top[0][0]) else f'{top[0][0]:.1f}x'} lift).")
-        print(f"  {CHECKS[top[0][3]][1]}")
-        print("  Fix that input before touching any cost weight.")
+    # Rank only rows that both cover most failures and are much rarer at
+    # successes.  Ranking by lift alone picks narrow high-lift rows and then
+    # trips the coverage test, which reads as "no cause found".
+    qualifying = [r for r in rows if r[1] > 0.5 and r[0] > 3]
+    if not qualifying:
+        qualifying = [r for r in rows if r[1] > 0.2 and r[0] > 3]
+
+    if qualifying:
+        for lift, p_fail, _p_ok, name in sorted(qualifying, key=lambda r: -r[1])[:3]:
+            lift_s = "inf" if np.isinf(lift) else f"{lift:.1f}x"
+            print(f"  '{name}' holds at {100*p_fail:.0f}% of failures ({lift_s} lift)")
+            print(f"      {CHECKS[name][1]}")
+        print()
+        print("  Conditions that co-occur at nearly every failure describe the")
+        print("  regime, not necessarily separate causes -- look for the single")
+        print("  term in the cost or constraints that needs ALL of them at once.")
     else:
         print("  No input-side cause separates failures from successes.")
         print("  That points at cost/Hessian conditioning, not a bad input:")

@@ -7,4 +7,17 @@ logs
 wandb
 src/mpc_controller/envs/wandb
 
+paper/
+WORKLOG.md
 
+# Solver diagnostics output (npz per episode, regenerated on every run)
+diagnostics/
+
+# Python bytecode. NOTE: ~15 .pyc files are already tracked from before this
+# rule; clear them with
+#   git rm -r --cached "**/__pycache__" && git commit -m "untrack bytecode"
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store

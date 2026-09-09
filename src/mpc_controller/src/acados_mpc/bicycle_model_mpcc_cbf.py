@@ -290,10 +290,29 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     ds1 = s_obs1 - s
     scale1 = if_else(ds1 > 1.0, 1.0, if_else(ds1 > -3.0, 0.2, 0.0))
 
+    # Smooth overtake gate.  Was:
+    #   if_else(ds1 > 0, if_else(ds1 < 15.0, 1.0, 0.0), 0.0)
+    #
+    # cost_type is EXTERNAL, so acados differentiates this expression exactly.
+    # The gate depends on s (through ds1) and multiplies n**2, which puts the
+    # switch into the Hessian cross terms:
+    #     d2/ds dn  ~  gate'(s) * n
+    #     d2/ds2    ~  gate''(s) * n**2
+    # With if_else those are discontinuous.  Near the centreline they are
+    # multiplied by almost nothing, but mid-overtake at n ~ -3 they are 3x and
+    # 9x larger -- which is exactly where the solver failed: diagnostics over
+    # 6378 solves put 100% of failures with an obstacle present and 81% at
+    # |n| > 2 m (28x lift), all HPIPM qp_stat 3 (NAN_SOL).
+    #
+    # tanh gives the same window, C-infinity, with a ~1 m transition at each
+    # edge.  Matches the original to 2.5e-3 more than 3 m from either edge.
+    k_gate = 1.0
+    overtake_gate = 0.5 * (tanh(k_gate * ds1) - tanh(k_gate * (ds1 - 15.0)))
+
     # closest_distance = fmin(dist_obs1, fmin(dist_obs2, fmin(dist_obs3, fmin(dist_obs4, fmin(dist_obs5, dist_obs6)))))
     model.cost_expr_ext_cost = (
-        (ql * (s - theta) ** 2) 
-        + qc * (1 - 0.8 * if_else(ds1 > 0, if_else(ds1 < 15.0, 1.0, 0.0), 0.0)) * n**2
+        (ql * (s - theta) ** 2)
+        + qc * (1 - 0.8 * overtake_gate) * n**2
         + qa * alpha**2
         - gamma * derTheta * fmax(0, sign(path_length - s - DIST2STOP))
         + r1 * derD**2 * fmax(0, sign(path_length - s - DIST2STOP))
