@@ -930,6 +930,56 @@ class CarlaMPCEnv(gym.Env):
         
         return reward
     
+    def _select_target_lane_d(self, gate_window: float = 20.0,
+                              safety_margin: float = 1.2) -> Optional[float]:
+        """
+        Lateral offset to warm-start the MPC toward, or None to hold the lane.
+
+        The MPCC cost is symmetric in n, so nothing in it prefers passing left
+        over right; the side is decided by whichever way the barrier gradient
+        happens to point, and SQP_RTI's single iteration then locks that choice
+        in.  When the lead vehicle sits slightly to our left, that sends the
+        solver into the ~0.5 m of room on the right and the overtake never
+        develops.
+
+        Picking the side here and handing it to MPCController.solve() as
+        target_lane_d seeds the horizon on the passing branch instead of asking
+        one linearisation to discover it.
+        """
+        if self._road_widths is None or self._road_width_s is None:
+            return None
+
+        # Nearest obstacle *ahead*.  selected_obstacles is sorted by signed ds
+        # and admits vehicles up to 5 m behind, so filter explicitly.
+        target = None
+        for s_obs, n_obs in self.selected_obstacles:
+            if s_obs <= -50.0:
+                continue
+            ds = s_obs - self.current_s
+            if 0.0 < ds < gate_window and (target is None or ds < target[0]):
+                target = (ds, n_obs)
+        if target is None:
+            return None
+
+        _, n_obs = target
+
+        idx = np.argmin(np.abs(self._road_width_s - self.current_s))
+        n_min = -self._road_widths[idx, 0] + safety_margin   # negative = left
+        n_max = self._road_widths[idx, 1] - safety_margin    # positive = right
+
+        # Clear the obstacle's elliptical zone laterally (b_lat = 2.0) with a
+        # little slack, on whichever side actually has the room.
+        clearance = 2.2
+        left_d = n_obs - clearance
+        right_d = n_obs + clearance
+
+        left_room = left_d - n_min      # >= 0 if the left target fits
+        right_room = n_max - right_d    # >= 0 if the right target fits
+
+        if left_room < 0.0 and right_room < 0.0:
+            return None                 # no room either side; let MPC slow down
+        return float(left_d if left_room >= right_room else right_d)
+
     def _authority_metrics(self) -> Dict:
         """
         Residual-authority metrics from Section 17.2 of the project spec:
@@ -1124,6 +1174,7 @@ class CarlaMPCEnv(gym.Env):
                 delta=self.current_steering,
                 road_widths=self._road_widths,  # None is okay, MPC will use defaults
                 road_width_s=self._road_width_s,
+                target_lane_d=self._select_target_lane_d(),
             )
             # _t_mpc_end = time.perf_counter()
             # self._last_mpc_time_ms = (_t_mpc_end - _t_mpc_start) * 1000

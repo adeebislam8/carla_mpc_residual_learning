@@ -290,19 +290,48 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     ds1 = s_obs1 - s
     scale1 = if_else(ds1 > 1.0, 1.0, if_else(ds1 > -3.0, 0.2, 0.0))
 
+    # --- smooth replacements for the switches in the cost -------------------
+    # With cost_type "EXTERNAL" acados differentiates this expression exactly.
+    # if_else / sign / fmax / fmin / fabs give a Hessian that jumps at the
+    # switch, and HPIPM answers the resulting indefinite QP with status 3
+    # (NAN_SOL).  The overtake gate was the worst case: crossing ds1 = 15 m
+    # stepped the n**2 coefficient by 5x at precisely the moment an overtake
+    # begins, which is where the solver was observed to break down.
+    #
+    # k_gate sets the transition width of the overtake window (~1 m), k_stop
+    # that of the end-of-path switch (~2 m).  Both are C-infinity, so the
+    # Hessian stays continuous.
+    k_gate = 1.0
+    k_stop = 1.0
+
+    # Smooth bump: ~1 inside (0, 15) m ahead, ~0 outside.  Replaces
+    # if_else(ds1 > 0, if_else(ds1 < 15.0, 1.0, 0.0), 0.0).
+    overtake_gate = 0.5 * (tanh(k_gate * ds1) - tanh(k_gate * (ds1 - 15.0)))
+
+    # Smooth step: ~1 while the goal is ahead, ~0 past it.  Replaces
+    # fmax(0, sign(path_length - s - DIST2STOP)).
+    s_to_go = path_length - s - DIST2STOP
+    before_goal = 0.5 * (1.0 + tanh(k_stop * s_to_go))
+
+    # fmin(0, sign(x)) is (step - 1); smooth it the same way.
+    past_goal = 0.5 * (tanh(k_stop * s_to_go) - 1.0)
+
+    # Smooth |x|; fabs is non-differentiable at the origin.
+    abs_s_to_go = sqrt(s_to_go**2 + 1e-4)
+
     # closest_distance = fmin(dist_obs1, fmin(dist_obs2, fmin(dist_obs3, fmin(dist_obs4, fmin(dist_obs5, dist_obs6)))))
     model.cost_expr_ext_cost = (
-        (ql * (s - theta) ** 2) 
-        + qc * (1 - 0.8 * if_else(ds1 > 0, if_else(ds1 < 15.0, 1.0, 0.0), 0.0)) * n**2
+        (ql * (s - theta) ** 2)
+        + qc * (1 - 0.8 * overtake_gate) * n**2
         + qa * alpha**2
-        - gamma * derTheta * fmax(0, sign(path_length - s - DIST2STOP))
-        + r1 * derD**2 * fmax(0, sign(path_length - s - DIST2STOP))
-        + r2 * derDelta**2 * fmax(0, sign(path_length - s - DIST2STOP))
-        + r3 * derTheta**2 * fmax(0, sign(path_length - s - DIST2STOP))
+        - gamma * derTheta * before_goal
+        + r1 * derD**2 * before_goal
+        + r2 * derDelta**2 * before_goal
+        + r3 * derTheta**2 * before_goal
         # + scale1 * k1 * (1/fmax(1,(dist_obs1 - 2*SAFETY_DISTANCE) + 1e-7))
         # + k1 * (1/fmax(1,(dist_obs2 - 2*SAFETY_DISTANCE) + 1e-7))
         # + k1 * (1/fmax(1,(dist_obs3 - 2*SAFETY_DISTANCE) + 1e-7))
-        - p1 * (fabs(path_length - s - DIST2STOP + 1e-7)) * fmin(0, sign(path_length - s - DIST2STOP))
+        - p1 * abs_s_to_go * past_goal
     )
     model.cost_expr_ext_cost_e =    (     0
 
