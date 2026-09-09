@@ -4,7 +4,6 @@
 
 from casadi import *
 # from tracks.readDataFcn import getTrack
-from utils.convert_traj_track import parseReference, parseGlobal
 import math
 
 DEG2RAD = math.pi/180.0

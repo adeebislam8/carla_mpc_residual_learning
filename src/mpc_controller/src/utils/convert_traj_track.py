@@ -6,9 +6,12 @@ import numpy as np
 import csv
 import scipy.interpolate as interp
 import math
-from nav_msgs.msg import Path
 
-def parseGlobal(msg: Path):
+# `msg` is any object exposing .poses[i].pose.position.{x,y,z}
+# (originally a nav_msgs/Path; the annotation is dropped so this module
+# imports without ROS).
+
+def parseGlobal(msg):
     ss = []
     ds = []
     vs = []
@@ -32,7 +35,7 @@ def parseGlobal(msg: Path):
 
     return dense_s, d_spline, v_spline, dd_ds, dv_ds
 
-def parseReference(msg: Path):
+def parseReference(msg):
 
     xs = []
     ys = []
