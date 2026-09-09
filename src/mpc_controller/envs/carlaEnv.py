@@ -18,6 +18,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from global_planner.src.frenet_world_converter_python import FrenetConverter
 from global_planner.src.global_path_publisher_python import PathPlanner
 from mpc_controller.src.mpc_controller_python import MPCController
+from mpc_controller.src.residual_authority import ResidualAuthority
 
 
 
@@ -42,7 +43,18 @@ class CarlaMPCEnv(gym.Env):
         seed: int = 2547,
         discrete_actions: bool = False,
         render_mode: Optional[str] = None,
+        residual_mode: str = 'adaptive',
+        residual_max: float = 0.1,
     ):
+        """
+        residual_mode: 'adaptive' derives the residual authority from the CBF
+            feasibility of the *final* action (project spec Section 6);
+            'fixed' reproduces the previous law u = u_nom + residual_max * pi(o)
+            and is kept so the B2 baseline stays runnable.
+        residual_max: residual magnitude that alpha = 1 corresponds to.  Left at
+            0.1 so 'adaptive' at full authority matches the old fixed law, which
+            makes the B2-vs-B5 comparison a clean single-variable change.
+        """
         super().__init__()
         random.seed(seed)
         
@@ -123,6 +135,13 @@ class CarlaMPCEnv(gym.Env):
             shape=(state_dim,),
             dtype=np.float64
         )
+
+        # ── Residual authority ────────────────────────────────
+        self.residual_mode = residual_mode
+        self.residual_max = residual_max
+        self.residual_authority = None   # built in _initialize_mpc()
+        self.last_authority_info = {}
+        self.authority_history = []      # per-step alpha, for Section 17 metrics
 
         # ── Recording ─────────────────────────────────────────
         self.camera_sensor = None
@@ -709,6 +728,12 @@ class CarlaMPCEnv(gym.Env):
         # Initialize ACADOS
         self.mpc_controller.initialize_acados(kappa_spline, path_msg=None)
         self.mpc_controller._global_path_length = self.path_length
+
+        # Residual authority re-verifies the CBF on the residual-modified
+        # action, so it must be built from the same model the OCP compiled.
+        self.residual_authority = ResidualAuthority.from_mpc_model(
+            self.mpc_controller.model, dt=self.mpc_dt
+        )
     
     def _update_vehicle_state(self):
         """Update vehicle state from CARLA"""
@@ -905,6 +930,39 @@ class CarlaMPCEnv(gym.Env):
         
         return reward
     
+    def _authority_metrics(self) -> Dict:
+        """
+        Residual-authority metrics from Section 17.2 of the project spec:
+        average safe authority, intervention count and strong-suppression
+        frequency.  Attached to every step's info so the evaluation scripts can
+        aggregate them per episode without extra plumbing.
+        """
+        metrics = {}
+
+        # Solver health.  A collision immediately after a run of fallback steps
+        # is a solver failure, not a control failure -- worth separating when
+        # reporting collision rates.
+        mpc = self.mpc_controller
+        if mpc is not None and getattr(mpc, 'solve_calls', 0) > 0:
+            metrics["solver_failures"] = int(mpc.solve_failures)
+            metrics["solver_failure_rate"] = float(
+                mpc.solve_failures / mpc.solve_calls)
+            metrics["in_fallback"] = bool(mpc.consecutive_failures > 0)
+
+        if not self.authority_history:
+            return metrics
+
+        alphas = np.asarray(self.authority_history, dtype=float)
+        metrics.update({
+            "alpha": float(alphas[-1]),
+            "alpha_mean": float(alphas.mean()),
+            "authority_interventions": int(np.sum(alphas < 1.0 - 1e-6)),
+            "strong_suppression_frac": float(np.mean(alphas < 0.2)),
+            "cbf_margin": float(self.last_authority_info.get("margin_at_alpha", np.inf)),
+            "nominal_infeasible": bool(self.last_authority_info.get("nominal_infeasible", False)),
+        })
+        return metrics
+
     def _check_done(self) -> Tuple[bool, Dict]:
         info = {}
         
@@ -1017,6 +1075,8 @@ class CarlaMPCEnv(gym.Env):
             self.lane_invasion = False
             self.start_time = time.time()
             self.prev_s = 0.0
+            self.authority_history = []
+            self.last_authority_info = {}
             
             # Initial tick
             self.world.tick()
@@ -1072,12 +1132,36 @@ class CarlaMPCEnv(gym.Env):
             # print(f"MPC Throttle: {mpc_throttle}\nMPC Steering: {mpc_steering}")
             # print("="*20)
 
-            # Apply residual from RL
-            residual_throttle = action[0] * 0.1
-            residual_steering = action[1] * 0.1
-            
-            final_throttle = np.clip(mpc_throttle + residual_throttle, -1.0, 1.0)
-            final_steering = np.clip(mpc_steering + residual_steering, -1.0, 1.0)
+            # Apply residual from RL under the adaptive authority.  The
+            # residual proposal is scaled by alpha = g_support * alpha_safe,
+            # where alpha_safe is the largest scale for which the *final*
+            # action still satisfies the modelled CBF and actuator constraints
+            # (project spec Sections 6-7).  'fixed' keeps the old law for B2.
+            du = np.array([action[0], action[1]], dtype=float) * self.residual_max
+
+            if self.residual_mode == 'adaptive':
+                alpha, self.last_authority_info = self.residual_authority.compute(
+                    s=self.current_s,
+                    n=self.current_d,
+                    heading=self.current_alpha,
+                    v=self.current_speed,
+                    u_nom=(mpc_throttle, mpc_steering),
+                    du=du,
+                    obstacles=self.selected_obstacles,
+                    support_gate=1.0,  # until the support monitor lands
+                )
+            else:
+                alpha = 1.0
+                self.last_authority_info = {
+                    'alpha_safe': 1.0, 'alpha': 1.0, 'nominal_infeasible': False,
+                    'saturated': True, 'margin_at_alpha': np.inf,
+                    'support_gate': 1.0,
+                }
+
+            self.authority_history.append(alpha)
+
+            final_throttle = np.clip(mpc_throttle + alpha * du[0], -1.0, 1.0)
+            final_steering = np.clip(mpc_steering + alpha * du[1], -1.0, 1.0)
 
             if final_throttle < 0 and self.current_speed < 0.3:
                 final_throttle = 1.0  # Prevent Stalling
@@ -1130,6 +1214,7 @@ class CarlaMPCEnv(gym.Env):
             obs = self._get_observation()
             reward = self._calculate_reward(action)
             done, info = self._check_done()
+            info.update(self._authority_metrics())
 
             if hasattr(self, 'render_mode') and self.render_mode == 'human':
                 self._draw_vehicle_info()
