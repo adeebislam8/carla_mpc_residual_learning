@@ -45,11 +45,20 @@ class MPCController:
         # Control history
         self.last_control = np.zeros(2)
         self.previous_control = np.zeros(2)
-        
+
         # Control derivatives (initialized to zero)
         self.derD = 0.0
         self.derDelta = 0.0
         self.derTheta = 0.0
+
+        # Solver-failure handling.  last_good_control is the most recent control
+        # from a successful solve; the fallback blends away from it over
+        # fallback_blend_steps rather than snapping to centreline tracking.
+        self.last_good_control = np.zeros(2)
+        self.consecutive_failures = 0
+        self.fallback_blend_steps = max(1, int(round(1.0 / dt)))  # ~1 s
+        self.solve_failures = 0
+        self.solve_calls = 0
     
     def initialize_acados(self, path_curvature_spline, path_msg=None):
         """
@@ -226,13 +235,22 @@ class MPCController:
                 s_target = self._global_path_length - distance2stop
 
         # 8. Solve ACADOS OCP
+        self.solve_calls += 1
         status = self.acados_solver.solve()
-        
+
         if status != 0:
             # print(f"\n{'='*50}")
             # print(f"⚠️ ACADOS failed status={status}")
+            self.solve_failures += 1
+            self.consecutive_failures += 1
+            # SQP_RTI warm-starts from the previous iterate, so a NaN solution
+            # (HPIPM status 3) would otherwise seed every subsequent solve and
+            # the controller never recovers within the episode.
+            self._reset_solver_iterate(s, d, alpha, v, D, delta)
             return self._fallback_controller(d, alpha, v)
-        
+
+        self.consecutive_failures = 0
+
         # 9. Extract control from solution
         x0 = self.acados_solver.get(1, "x")
         u0 = self.acados_solver.get(1, "u")
@@ -261,24 +279,79 @@ class MPCController:
         # Update control history
         self.previous_control = self.last_control.copy()
         self.last_control = np.array([throttle, steering])
-        
+        self.last_good_control = self.last_control.copy()
+
         return throttle, steering
-    
+
+    def _reset_solver_iterate(self, s, d, alpha, v, D, delta):
+        """
+        Clear a poisoned iterate after a failed solve.
+
+        Prefers the solver's own reset(); older acados_template builds do not
+        expose it, so fall back to overwriting every stage with a straight
+        constant-speed guess, which is enough to get the next RTI step off a
+        finite starting point.
+        """
+        try:
+            self.acados_solver.reset()
+        except (AttributeError, NotImplementedError):
+            pass
+
+        try:
+            for i in range(self.N + 1):
+                s_guess = s + self.target_speed * self.dt * i
+                self.acados_solver.set(
+                    i, "x",
+                    np.array([s_guess, d, alpha, v, D, delta, s_guess], dtype=float))
+                if i < self.N:
+                    self.acados_solver.set(i, "u", np.zeros(3))
+        except Exception as e:
+            print(f"⚠️  Could not reset ACADOS iterate: {e}")
+
+        # The stored derivatives came from the failed solve; they feed the next
+        # delay propagation, so drop them too.
+        self.derD = 0.0
+        self.derDelta = 0.0
+        self.derTheta = 0.0
+
     def _fallback_controller(self, d: float, alpha: float, v: float) -> Tuple[float, float]:
-        """Simple P controller as fallback"""
+        """
+        Control to apply when the OCP fails.
+
+        The previous version was a pure centreline-tracking P controller.  That
+        is actively dangerous during obstacle avoidance: it drives d -> 0, which
+        is where the obstacle being avoided usually is, so a solver hiccup
+        mid-overtake steered the vehicle back into the vehicle it was passing.
+
+        Instead, hold the last control from a successful solve and blend toward
+        the P controller over fallback_blend_steps.  A brief failure therefore
+        continues the committed manoeuvre, while a sustained one still converges
+        to something that tracks the path.
+        """
         # Lateral control
         # print("Use control fallback")
         steering = -0.3 * d - 0.5 * alpha
         steering = np.clip(steering, -1.0, 1.0)
         steering = - steering
-        
+
         # Longitudinal control
         speed_error = self.target_speed - v
         throttle = 0.3 * speed_error
         throttle = np.clip(throttle, -1.0, 1.0)
-        
+
+        # Blend from the last good control toward the P controller.  w = 0 on
+        # the first failed step, reaching 1 after fallback_blend_steps.
+        w = min(1.0, self.consecutive_failures / float(self.fallback_blend_steps))
+        throttle = (1.0 - w) * self.last_good_control[0] + w * throttle
+        steering = (1.0 - w) * self.last_good_control[1] + w * steering
+
+        throttle = float(np.clip(throttle, -1.0, 1.0))
+        steering = float(np.clip(steering, -1.0, 1.0))
+
+        self.previous_control = self.last_control.copy()
+        self.last_control = np.array([throttle, steering])
         return throttle, steering
-    
+
     def get_last_control(self) -> np.ndarray:
         """Get last control output"""
         return self.last_control
@@ -393,6 +466,10 @@ class MPCController:
         # Reset control history for new episode
         self.last_control = np.zeros(2)
         self.previous_control = np.zeros(2)
+        self.last_good_control = np.zeros(2)
+        self.consecutive_failures = 0
+        self.solve_failures = 0
+        self.solve_calls = 0
         self.derD = 0.0
         self.derDelta = 0.0
         self.derTheta = 0.0

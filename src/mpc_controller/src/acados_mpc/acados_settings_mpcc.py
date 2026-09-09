@@ -205,7 +205,17 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3):
     # ocp.solver_options.nlp_solver_type = "SQP"
     # ocp.solver_options.nlp_solver_max_iter = 5
     # ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
-    # ocp.solver_options.levenberg_marquardt = 1e-6
+
+    # With cost_type "EXTERNAL" acados uses the EXACT Hessian, and this cost is
+    # built from if_else / sign / fmax / fmin / fabs, so that Hessian is
+    # discontinuous and can be indefinite -- HPIPM answers an indefinite QP with
+    # status 3 (NAN_SOL).  The overtake gate on line ~296 of
+    # bicycle_model_mpcc_cbf.py is the worst offender: crossing ds1 = 15 m jumps
+    # the n**2 coefficient by 5x, which is exactly when the solver was observed
+    # to break down mid-overtake.  CONVEXIFY projects the Hessian back to
+    # positive definite; the Levenberg-Marquardt term damps what is left.
+    ocp.solver_options.regularize_method = "CONVEXIFY"
+    ocp.solver_options.levenberg_marquardt = 1e-4
     # ocp.solver_options.integrator_type = "ERK"
     # ocp.solver_options.sim_method_num_stages = 4
     # ocp.solver_options.sim_method_num_steps = 4
