@@ -41,6 +41,8 @@ import numpy as np
 class SolverDiagnostics:
     """Per-solve recorder. Cheap enough to leave on (pure numpy, no I/O)."""
 
+    _announced = False
+
     def __init__(self, enabled=None, out_dir="diagnostics"):
         if enabled is None:
             enabled = os.environ.get("CARLA_MPC_DIAG", "0") not in ("0", "", "false")
@@ -48,6 +50,17 @@ class SolverDiagnostics:
         self.out_dir = out_dir
         self.records = []
         self._warned = False
+
+        # Say so once per process.  Silently recording nothing because an env
+        # var was missing is the failure mode worth ruling out immediately.
+        if not SolverDiagnostics._announced:
+            SolverDiagnostics._announced = True
+            if self.enabled:
+                print(f"[diag] recording solver inputs -> "
+                      f"{os.path.abspath(self.out_dir)}/")
+            else:
+                print("[diag] disabled (set CARLA_MPC_DIAG=1 to record "
+                      "solver inputs)")
 
     # ------------------------------------------------------------------ record
 
