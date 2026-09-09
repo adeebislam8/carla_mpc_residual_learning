@@ -209,7 +209,7 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     model.n_max = 1.0
 
     model.v_min = 0  # width of the track [m]
-    model.v_max = path_length  # width of the track [m]
+    model.v_max = 20  # width of the track [m]
     # model.v_max = 120  # width of the track [m]
 
     model.throttle_min = -0.5
@@ -228,8 +228,8 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     model.dtheta_max = 200
 
     # nonlinear constraint
-    constraint.alat_min = -10  # minimum lateral force [m/s^2]
-    constraint.alat_max =  10 # maximum lateral force [m/s^1]
+    constraint.alat_min = -8  # minimum lateral force [m/s^2]
+    constraint.alat_max =  8 # maximum lateral force [m/s^1]
 
     constraint.along_min = -5  # minimum longitudinal force [m/s^2]
     constraint.along_max = 5 # maximum longitudinal force [m/s^2]

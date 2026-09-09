@@ -171,7 +171,7 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3):
     slack_L2_cost = np.array([
         1e-3,
         1e-3,
-        5e5, ##
+        1e3, ##
         5e-1,
         1e1,
         1e1,
