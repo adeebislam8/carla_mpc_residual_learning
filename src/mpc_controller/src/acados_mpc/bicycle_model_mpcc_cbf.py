@@ -309,10 +309,29 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     k_gate = 1.0
     overtake_gate = 0.5 * (tanh(k_gate * ds1) - tanh(k_gate * (ds1 - 15.0)))
 
+    # The gate only *permits* leaving the lane: it weakens the centreline pull
+    # from qc to 0.2*qc, but the attractor stays at n = 0.  With a 1.5 s horizon
+    # (N*dt = 30*0.05, ~15 m at 10 m/s) the MPC never sees the payoff of a pass
+    # that takes 4-6 s -- inside the horizon, moving out is pure cost and getting
+    # past is invisible.  So the optimum is to sit behind the lead car, which is
+    # exactly what the predicted trajectory showed.
+    #
+    # Move the attractor instead.  During the gate the target lateral offset
+    # shifts into the overtaking lane, so pulling out becomes cost-*reducing* and
+    # starts immediately, without needing a horizon long enough to see the
+    # overtake complete.  Outside the gate n_ref decays to 0 and normal lane
+    # keeping resumes.
+    #
+    # Diagnostics confirmed the gate itself fires correctly (slot 0 held a
+    # trailing obstacle 0.0% of the time; gate active 100% within its window),
+    # so the gate was never the problem -- its target was.
+    n_overtake = -3.5   # left lane centre; n_min is -4.8, so this fits with margin
+    n_ref = n_overtake * overtake_gate
+
     # closest_distance = fmin(dist_obs1, fmin(dist_obs2, fmin(dist_obs3, fmin(dist_obs4, fmin(dist_obs5, dist_obs6)))))
     model.cost_expr_ext_cost = (
         (ql * (s - theta) ** 2)
-        + qc * (1 - 0.8 * overtake_gate) * n**2
+        + qc * (1 - 0.8 * overtake_gate) * (n - n_ref)**2
         + qa * alpha**2
         - gamma * derTheta * fmax(0, sign(path_length - s - DIST2STOP))
         + r1 * derD**2 * fmax(0, sign(path_length - s - DIST2STOP))
