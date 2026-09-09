@@ -122,6 +122,59 @@ def load(paths):
     return merged
 
 
+def overtaking_report(d, gate_window=15.0, lookahead=30.0):
+    """
+    How often the overtake relaxation actually engages.
+
+    The cost gates off obstacle slot 0 only (ds1 = s_obs1 - s).  _detect_obstacles
+    admits obstacles from ds > -5 and sorts by *signed* ds, so a trailing vehicle
+    can occupy slot 0 and silently disable the relaxation -- the car then gets the
+    full qc*n**2 centreline pull and simply follows the car in front.
+    """
+    if "obstacles" not in d:
+        return
+    obs, s = d["obstacles"], d["s"]
+    ds = obs[:, :, 0] - s[:, None]              # (solves, 6)
+    active = obs[:, :, 0] > -50.0
+
+    ahead = active & (ds > 0) & (ds < lookahead)
+    has_ahead = ahead.any(axis=1)
+
+    slot0_active = active[:, 0]
+    slot0_behind = slot0_active & (ds[:, 0] <= 0)
+    ds1 = np.where(slot0_active, ds[:, 0], np.inf)
+    gate_on = (ds1 > 0) & (ds1 < gate_window)
+
+    n_ahead = int(has_ahead.sum())
+    print("\nOVERTAKING OPPORTUNITY")
+    print("-" * 72)
+    print(f"  solves with an obstacle ahead (0 < ds < {lookahead:.0f} m):"
+          f"  {n_ahead} ({100*n_ahead/len(s):.1f}% of all solves)")
+    if n_ahead == 0:
+        return
+
+    stolen = int((has_ahead & slot0_behind).sum())
+    gated = int((has_ahead & gate_on).sum())
+    print(f"    ...of those, slot 0 held a TRAILING obstacle:"
+          f"   {stolen} ({100*stolen/n_ahead:.1f}%)  <- relaxation disabled")
+    print(f"    ...of those, the overtake gate was active:"
+          f"   {gated} ({100*gated/n_ahead:.1f}%)")
+
+    # Within the window where relaxation is supposed to help
+    close = has_ahead & (np.where(ahead, ds, np.inf).min(axis=1) < gate_window)
+    n_close = int(close.sum())
+    if n_close:
+        gated_close = int((close & gate_on).sum())
+        print(f"  nearest obstacle within the {gate_window:.0f} m gate window:"
+              f"   {n_close}")
+        print(f"    ...gate actually active:"
+              f"   {gated_close} ({100*gated_close/n_close:.1f}%)")
+        missed = n_close - gated_close
+        if missed:
+            print(f"    ...MISSED (obstacle in range, gate off):"
+                  f"   {missed} ({100*missed/n_close:.1f}%)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="+", help="npz files or a directory")
@@ -143,6 +196,8 @@ def main():
             print(f"   qp_stat {int(code)} among failures: "
                   f"{int((d['qp_stat'][fail] == code).sum())}")
     print("=" * 72)
+
+    overtaking_report(d)
 
     if n_fail == 0:
         print("\nno failures recorded -- nothing to attribute")
