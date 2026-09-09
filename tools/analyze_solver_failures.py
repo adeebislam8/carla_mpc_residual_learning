@@ -65,10 +65,33 @@ CHECKS = {
     "v out of bounds": (
         lambda d: d["v_out_of_bounds"] > 0,
         "speed outside the model's own limits"),
+    # The lateral bound carries Zl[2] = 5e5 against cost terms of order 1, so a
+    # metre of slack puts ~1e5 into the QP Hessian.  Saturating or exceeding it
+    # is the condition to watch, not the barrier.
+    "n outside [n_min,n_max]": (
+        lambda d: (d["n"] < d["n_min"]) | (d["n"] > d["n_max"]),
+        "lateral bound violated -- its 5e5 slack weight dominates the QP"),
+    "n within 0.5m of bound": (
+        lambda d: (d["n"] < d["n_min"] + 0.5) | (d["n"] > d["n_max"] - 0.5),
+        "lateral bound nearly active"),
+    "|n| > 2 m": (
+        lambda d: np.abs(d["n"]) > 2.0,
+        "large lateral excursion"),
+    "obstacle present": (
+        lambda d: d["n_active_obs"] > 0,
+        "at least one obstacle in the parameter vector"),
+    "obstacle + near bound": (
+        lambda d: (d["n_active_obs"] > 0)
+        & ((d["n"] < d["n_min"] + 0.5) | (d["n"] > d["n_max"] - 0.5)),
+        "avoiding an obstacle while pressed against the road edge"),
+    "|kappa| > 0.05": (
+        lambda d: np.abs(d["kappa"]) > 0.05,
+        "high path curvature"),
 }
 
 STATE_KEYS = ["s", "n", "alpha", "v", "D", "delta", "kappa", "denom",
-              "denom_min_abs", "barrier_min", "prop_s_jump", "n_active_obs"]
+              "denom_min_abs", "barrier_min", "prop_s_jump", "n_active_obs",
+              "n_min", "n_max", "n_slack"]
 
 
 def load(paths):
@@ -87,6 +110,14 @@ def load(paths):
             for k in z.files:
                 cols.setdefault(k, []).append(z[k])
     merged = {k: np.concatenate(v, axis=0) for k, v in cols.items()}
+
+    # How far n is outside its bounds (0 when inside).  This is the quantity the
+    # 5e5 slack weight multiplies, so it is worth seeing directly.
+    if {"n", "n_min", "n_max"} <= merged.keys():
+        merged["n_slack"] = np.maximum(
+            0.0, np.maximum(merged["n_min"] - merged["n"],
+                            merged["n"] - merged["n_max"]))
+
     print(f"loaded {len(files)} file(s), {len(merged['status'])} solves\n")
     return merged
 
