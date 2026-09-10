@@ -315,7 +315,17 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     # A car is ~4.5 m long and the CBF itself only releases at ds1 < -5 (see
     # distance2obs_casadi_elliptical), so the lateral target must persist to
     # about -8 for the pass to complete before the car comes back.
-    overtake_gate = 0.5 * (tanh(k_gate * (ds1 + 8.0)) - tanh(k_gate * (ds1 - 15.0)))
+    # Front edge at 25 m, not 15 m.  The horizon is only N*dt*v ~ 15-18 m, so a
+    # gate opening at 15 m gave n_ref its full value no earlier than the horizon
+    # reached the obstacle.  At the distances where the pass is actually decided
+    # (12-16 m) n_ref was only -0.4 to -1.75, too weak to beat the CBF gradient,
+    # which pushes straight away from the obstacle centre -- so a few cm of
+    # lateral offset chose the side, and the car committed right into the 0.8 m
+    # of room instead of left into 4.8 m.  carlaEnv detects obstacles out to
+    # MAX_OBS_LOOKAHEAD = 30 m; the gate should not ignore half of that.
+    GATE_BACK, GATE_FRONT = -8.0, 25.0
+    overtake_gate = 0.5 * (tanh(k_gate * (ds1 - GATE_BACK))
+                           - tanh(k_gate * (ds1 - GATE_FRONT)))
 
     # The gate only *permits* leaving the lane: it weakens the centreline pull
     # from qc to 0.2*qc, but the attractor stays at n = 0.  With a 1.5 s horizon
@@ -374,5 +384,20 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     model.name = model_name
     model.params = params
     model.kapparef_s = kapparef_s
-    
+
+    # Config banner.  Printed on every solver build so the console log records
+    # which tuning actually ran -- otherwise "which build produced this result"
+    # is unanswerable after the fact, and comparing runs becomes guesswork.
+    print("-" * 62)
+    print("MPCC CONFIG")
+    print(f"  speed      v_max={model.v_max}  alat=+-{constraint.alat_max}"
+          f"  along=+-{constraint.along_max}")
+    print(f"  lateral    n=[{model.n_min}, {model.n_max}]"
+          f"  delta_max={model.delta_max:.3f} rad")
+    print(f"  weights    ql={ql} qc={qc} qa={qa} gamma={gamma}")
+    print(f"  cbf        ellipse a={a_long} b={b_lat}"
+          f"  d_safe={SAFETY_DISTANCE} gamma={obs_gamma}")
+    print(f"  overtake   gate=({GATE_BACK}, {GATE_FRONT}) m  n_overtake={n_overtake}")
+    print("-" * 62)
+
     return model, constraint
