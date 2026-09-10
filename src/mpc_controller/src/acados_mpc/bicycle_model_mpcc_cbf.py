@@ -27,17 +27,31 @@ def distance2obs_casadi_elliptical(s, n, s_obs, n_obs, a=3.5, b=1.4):
         - distance > 1.0 means safe
         - distance < 1.0 means violation
     """
-    # Ignore obstacles that are far behind (same as before)
-    condition = s > (s_obs + 5)
-    
+    # Release obstacles once they are behind us -- smoothly, and by a BOUNDED
+    # amount.
+    #
+    # This was `if_else(s > s_obs + 5, 999999, ellipse)`.  The CBF built on top
+    # divides (b_next - b) by dt = 0.05, so the one step where the ego finally
+    # cleared the overtaken car turned a jump of ~1e6 in b into ~2e7 in the
+    # constraint -- against an upper bound of 1e6, i.e. a violation of ~1.9e7.
+    # With the obstacle slacks at Zl ~ 1e1 that is ~1e15 of QP cost arriving in a
+    # single step, at exactly the moment of passing.  It fired on every overtake
+    # and is the reason passes ended in erratic steering, leaving the road, or
+    # hitting the car just overtaken.
+    #
+    # RELEASE (5.0) only has to lift the barrier clear of d_safe = 1.0, not to
+    # infinity: an obstacle 5 m behind already scores ellipse >= 1.25 on its own.
+    # The tanh transition spreads the change over ~2 m instead of one timestep.
+    RELEASE, RELEASE_AT, RELEASE_WIDTH = 5.0, 5.0, 1.0
+    behind = 0.5 * (1.0 + tanh(RELEASE_WIDTH * (s - s_obs - RELEASE_AT)))
+
     # Elliptical distance formula:
     # sqrt((Δs/a)² + (Δn/b)²)
-    distance = if_else(
-        condition, 
-        999999,  # Ignore obstacles behind
-        sqrt(((s - s_obs)/a)**2 + ((n - n_obs)/b)**2)  # ELLIPTICAL
-    )
-    return distance
+    # The epsilon keeps the gradient finite; d/dx sqrt(x) is unbounded at 0,
+    # which is approached whenever the ego is on top of an obstacle.
+    ellipse = sqrt(((s - s_obs)/a)**2 + ((n - n_obs)/b)**2 + 1e-6)
+
+    return ellipse + behind * RELEASE
 
 
 def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
