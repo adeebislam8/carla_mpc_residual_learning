@@ -307,7 +307,15 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     # tanh gives the same window, C-infinity, with a ~1 m transition at each
     # edge.  Matches the original to 2.5e-3 more than 3 m from either edge.
     k_gate = 1.0
-    overtake_gate = 0.5 * (tanh(k_gate * ds1) - tanh(k_gate * (ds1 - 15.0)))
+    # Window is (-8, +15) m, not (0, +15).  The trailing edge matters: with the
+    # window opening at ds1 = 0 the gate collapsed the instant our s passed the
+    # obstacle's s (0.119 at ds1 = -1, 0.018 at -2), so n_ref snapped back to 0
+    # and the car cut toward the lane centre while still alongside the vehicle it
+    # was passing -- observed as veering into the side of the overtaken car.
+    # A car is ~4.5 m long and the CBF itself only releases at ds1 < -5 (see
+    # distance2obs_casadi_elliptical), so the lateral target must persist to
+    # about -8 for the pass to complete before the car comes back.
+    overtake_gate = 0.5 * (tanh(k_gate * (ds1 + 8.0)) - tanh(k_gate * (ds1 - 15.0)))
 
     # The gate only *permits* leaving the lane: it weakens the centreline pull
     # from qc to 0.2*qc, but the attractor stays at n = 0.  With a 1.5 s horizon

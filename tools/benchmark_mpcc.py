@@ -85,6 +85,11 @@ def run(args):
                 'frac_n_gt2': float(np.mean(np.abs(n_hist) > 2.0)) if n_hist else 0.0,
                 'solver_failure_rate': float(info.get('solver_failure_rate', 0.0)),
                 'solver_failures': int(info.get('solver_failures', 0)),
+                'collision_kind': info.get('collision_kind'),
+                'collision_other': info.get('collision_other'),
+                'collision_speed': info.get('collision_speed'),
+                'collision_off_corridor': info.get('collision_off_corridor'),
+                'collision_in_fallback': info.get('collision_in_fallback'),
             }
             episodes.append(rec)
             print(f"  ep {ep:3d}  {rec['outcome']:<9} "
@@ -180,6 +185,30 @@ def write_report(res, path):
         L.append("-" * 72)
         L.append(f"  mean failure rate        {100*s['mean_solver_failure_rate']:8.2f}%")
         L.append("")
+        colls = [e for e in res['per_episode'] if e['outcome'] == 'collision'
+                 and e.get('collision_kind')]
+        if colls:
+            L.append("COLLISION BREAKDOWN  (what is actually being hit)")
+            L.append("-" * 72)
+            from collections import Counter
+            for label, key in (("impact side", 'collision_kind'),
+                               ("other actor", 'collision_other')):
+                cnt = Counter(str(e[key]) for e in colls)
+                L.append(f"  by {label}:")
+                for k, v in cnt.most_common():
+                    L.append(f"      {k:<34}{v:4d}  ({100*v/len(colls):5.1f}%)")
+            off = sum(1 for e in colls if e.get('collision_off_corridor'))
+            fb = sum(1 for e in colls if e.get('collision_in_fallback'))
+            spd = [e['collision_speed'] for e in colls
+                   if e.get('collision_speed') is not None]
+            L.append(f"  outside the lateral corridor:   {off:4d}"
+                     f"  ({100*off/len(colls):5.1f}%)  <- tracking failure")
+            L.append(f"  MPC had fallen back to fallback:{fb:4d}"
+                     f"  ({100*fb/len(colls):5.1f}%)  <- solver failure, not control")
+            if spd:
+                L.append(f"  mean speed at impact:           {statistics.mean(spd):6.2f} m/s")
+            L.append("")
+
         L.append("PER EPISODE")
         L.append("-" * 72)
         L.append(f"  {'ep':>3} {'outcome':<10}{'steps':>7}{'ovt':>5}"

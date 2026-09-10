@@ -88,6 +88,7 @@ class CarlaMPCEnv(gym.Env):
         # Vehicle state
         self.vehicle = None
         self.collision_sensor = None
+        self.collision_info = {}
         self.lane_invasion_sensor = None
         self.current_speed = 0.0
         self.current_throttle = 0.0
@@ -428,8 +429,68 @@ class CarlaMPCEnv(gym.Env):
         self.world.tick()
     
     def _on_collision(self, event):
-        """Collision callback"""
+        """
+        Collision callback.
+
+        Records what was hit and the state at impact, not just a boolean.  A 70%
+        collision rate with no attribution is the same position the solver was in
+        before diagnostics: the fix is unknowable without knowing whether the car
+        is rear-ending the lead vehicle (failing to slow), sideswiping during a
+        pass (the overtake manoeuvre), or leaving the road (tracking failure).
+        Each implies a different fix.
+
+        Runs on CARLA's sensor thread, so everything is wrapped -- a throw here
+        would be swallowed silently and lose the episode.
+        """
         self.collision = True
+        if self.collision_info:
+            return  # keep the first impact only
+
+        info = {'other': 'unknown', 'kind': 'unknown'}
+        try:
+            other = getattr(event, 'other_actor', None)
+            info['other'] = getattr(other, 'type_id', 'unknown') or 'unknown'
+            info['other_is_vehicle'] = info['other'].startswith('vehicle.')
+
+            # Impulse in world frame -> ego frame, to tell front/rear/side apart.
+            imp = event.normal_impulse
+            yaw = np.deg2rad(self.vehicle.get_transform().rotation.yaw)
+            c, sn = np.cos(yaw), np.sin(yaw)
+            fwd = imp.x * c + imp.y * sn
+            lat = -imp.x * sn + imp.y * c
+            info['impulse'] = float(np.sqrt(imp.x**2 + imp.y**2 + imp.z**2))
+            info['impulse_fwd'] = float(fwd)
+            info['impulse_lat'] = float(lat)
+
+            # NOTE: sign convention is unverified -- check one real collision
+            # against the video before trusting front/rear, and flip if needed.
+            if abs(fwd) >= abs(lat):
+                info['kind'] = 'front' if fwd < 0 else 'rear'
+            else:
+                info['kind'] = 'left' if lat > 0 else 'right'
+
+            info['speed'] = float(self.current_speed)
+            info['n'] = float(self.current_d)
+            info['alpha'] = float(self.current_alpha)
+            info['progress_frac'] = float(
+                self.current_s / max(self.path_length, 1e-6))
+            info['overtakes_so_far'] = len(self.overtaken_npcs)
+
+            # Off-road: outside the lateral corridor when it hit.
+            if self._road_widths is not None and self._road_width_s is not None:
+                idx = np.argmin(np.abs(self._road_width_s - self.current_s))
+                info['off_corridor'] = bool(
+                    self.current_d < -self._road_widths[idx, 0]
+                    or self.current_d > self._road_widths[idx, 1])
+
+            # Was the MPC solving, or had the fallback taken over?
+            mpc = self.mpc_controller
+            info['in_fallback'] = bool(
+                mpc is not None and getattr(mpc, 'consecutive_failures', 0) > 0)
+        except Exception as e:
+            info['error'] = repr(e)
+
+        self.collision_info = info
     
     def _on_lane_invasion(self, event):
         """Lane invasion callback - only trigger for solid markings"""
@@ -969,7 +1030,9 @@ class CarlaMPCEnv(gym.Env):
         # Collision
         if self.collision:
             elapsed = time.time() - self.start_time
-            return True, {"done_reason": "collision", "lap_time": elapsed}
+            out = {"done_reason": "collision", "lap_time": elapsed}
+            out.update({f"collision_{k}": v for k, v in self.collision_info.items()})
+            return True, out
         
         # Goal reached
         if self.current_s >= self.path_length - 10:
@@ -1079,6 +1142,7 @@ class CarlaMPCEnv(gym.Env):
             # Reset state
             self.current_step = 0
             self.collision = False
+            self.collision_info = {}
             self.lane_invasion = False
             self.start_time = time.time()
             self.prev_s = 0.0
