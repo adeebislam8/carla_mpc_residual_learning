@@ -39,79 +39,97 @@ sys.path.insert(0, os.path.join(
 
 
 def run(args):
+    """Drive `episodes` episodes for each seed and collect per-episode records."""
     from mpc_controller.envs.carlaEnv import CarlaMPCEnv
 
-    env = CarlaMPCEnv(
-        host=args.host,
-        port=args.port,
-        towns=[args.town],
-        episodes_per_town=10 ** 9,
-        target_speed=args.target_speed,
-        max_steps=args.max_steps,
-        seed=args.seed,
-        residual_mode='fixed',      # alpha == 1, but action is 0 -> pure MPCC
-    )
-
     episodes = []
-    zero = np.zeros(2, dtype=float)
     t_start = time.time()
 
-    try:
-        for ep in range(args.episodes):
-            obs, _ = env.reset()
-
-            n_hist, v_hist = [], []
-            steps = 0
-            done = False
-            info = {}
-
-            while not done and steps < args.max_steps:
-                obs, reward, done, truncated, info = env.step(zero)
-                n_hist.append(float(env.current_d))
-                v_hist.append(float(env.current_speed))
-                steps += 1
-
-            rec = {
-                'episode': ep,
-                'outcome': info.get('done_reason', 'timeout'),
-                'steps': steps,
-                'overtakes': len(env.overtaken_npcs),
-                'progress_m': float(env.current_s),
-                'path_length_m': float(env.path_length),
-                'progress_frac': float(env.current_s / max(env.path_length, 1e-6)),
-                'lap_time_s': float(info.get('lap_time', float('nan'))),
-                'mean_speed': float(np.mean(v_hist)) if v_hist else 0.0,
-                'max_abs_n': float(np.max(np.abs(n_hist))) if n_hist else 0.0,
-                'frac_n_gt2': float(np.mean(np.abs(n_hist) > 2.0)) if n_hist else 0.0,
-                'solver_failure_rate': float(info.get('solver_failure_rate', 0.0)),
-                'solver_failures': int(info.get('solver_failures', 0)),
-                'collision_kind': info.get('collision_kind'),
-                'collision_other': info.get('collision_other'),
-                'collision_speed': info.get('collision_speed'),
-                'collision_off_corridor': info.get('collision_off_corridor'),
-                'collision_in_fallback': info.get('collision_in_fallback'),
-            }
-            episodes.append(rec)
-            print(f"  ep {ep:3d}  {rec['outcome']:<9} "
-                  f"overtakes={rec['overtakes']:2d}  "
-                  f"progress={100*rec['progress_frac']:5.1f}%  "
-                  f"solver_fail={100*rec['solver_failure_rate']:.2f}%")
-    except KeyboardInterrupt:
-        print("\ninterrupted -- reporting on the episodes completed so far")
-    finally:
-        env.close()
+    # One env per seed.  The seed reaches random.seed() inside CarlaMPCEnv's
+    # constructor and drives spawn/goal selection, so it cannot be changed on a
+    # live env.  Averaging across seeds is what makes a number reportable: a
+    # single seed measures one route sequence, not the controller.
+    for seed in args.seeds:
+        print(f"\n=== seed {seed} ===")
+        env = CarlaMPCEnv(
+            host=args.host,
+            port=args.port,
+            towns=[args.town],
+            episodes_per_town=10 ** 9,
+            target_speed=args.target_speed,
+            max_steps=args.max_steps,
+            seed=seed,
+            residual_mode='fixed',   # alpha == 1, but action is 0 -> pure MPCC
+        )
+        interrupted = False
+        try:
+            _run_seed(env, args, seed, episodes)
+        except KeyboardInterrupt:
+            print("\ninterrupted -- reporting on the episodes completed so far")
+            interrupted = True
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+        if interrupted:
+            break
 
     return {
         'label': args.label,
-        'episodes_requested': args.episodes,
+        'episodes_per_seed': args.episodes,
+        'seeds': list(args.seeds),
         'episodes_completed': len(episodes),
-        'seed': args.seed,
         'target_speed': args.target_speed,
         'town': args.town,
         'max_steps': args.max_steps,
         'wall_time_s': time.time() - t_start,
         'per_episode': episodes,
     }
+
+
+def _run_seed(env, args, seed, episodes):
+    zero = np.zeros(2, dtype=float)
+    for ep in range(args.episodes):
+        obs, _ = env.reset()
+
+        n_hist, v_hist = [], []
+        steps = 0
+        done = False
+        info = {}
+
+        while not done and steps < args.max_steps:
+            obs, reward, done, truncated, info = env.step(zero)
+            n_hist.append(float(env.current_d))
+            v_hist.append(float(env.current_speed))
+            steps += 1
+
+        rec = {
+            'seed': seed,
+            'episode': ep,
+            'outcome': info.get('done_reason', 'timeout'),
+            'steps': steps,
+            'overtakes': len(env.overtaken_npcs),
+            'progress_m': float(env.current_s),
+            'path_length_m': float(env.path_length),
+            'progress_frac': float(env.current_s / max(env.path_length, 1e-6)),
+            'lap_time_s': float(info.get('lap_time', float('nan'))),
+            'mean_speed': float(np.mean(v_hist)) if v_hist else 0.0,
+            'max_abs_n': float(np.max(np.abs(n_hist))) if n_hist else 0.0,
+            'frac_n_gt2': float(np.mean(np.abs(n_hist) > 2.0)) if n_hist else 0.0,
+            'solver_failure_rate': float(info.get('solver_failure_rate', 0.0)),
+            'solver_failures': int(info.get('solver_failures', 0)),
+            'collision_kind': info.get('collision_kind'),
+            'collision_other': info.get('collision_other'),
+            'collision_speed': info.get('collision_speed'),
+            'collision_off_corridor': info.get('collision_off_corridor'),
+            'collision_in_fallback': info.get('collision_in_fallback'),
+        }
+        episodes.append(rec)
+        print(f"  s{seed} ep {ep:3d}  {rec['outcome']:<9} "
+              f"overtakes={rec['overtakes']:2d}  "
+              f"progress={100*rec['progress_frac']:5.1f}%  "
+              f"solver_fail={100*rec['solver_failure_rate']:.2f}%")
 
 
 def summarize(res):
@@ -146,14 +164,52 @@ def summarize(res):
     }
 
 
+PAPER_METRICS = [
+    ('Success rate (%)',        'success_rate',             100.0),
+    ('Collision rate (%)',      'collision_rate',           100.0),
+    ('Timeout rate (%)',        'timeout_rate',             100.0),
+    ('Route completion (%)',    'mean_progress_frac',       100.0),
+    ('Overtakes / episode',     'overtakes_per_episode',      1.0),
+    ('Mean speed (m/s)',        'mean_speed',                 1.0),
+    ('Lap time, success (s)',   'mean_lap_time_success',      1.0),
+    ('Solver failure (%)',      'mean_solver_failure_rate', 100.0),
+]
+
+
+def summarize_per_seed(res):
+    """summarize() applied to each seed separately."""
+    out = {}
+    for seed in res.get('seeds', [res.get('seed')]):
+        eps = [e for e in res['per_episode'] if e.get('seed') == seed]
+        if eps:
+            out[seed] = summarize({'per_episode': eps})
+    return out
+
+
+def across_seeds(per_seed):
+    """mean and sample std of each metric across seeds -- what goes in the paper."""
+    stats = {}
+    for _, key, _ in PAPER_METRICS:
+        vals = [s[key] for s in per_seed.values()
+                if key in s and not (isinstance(s[key], float) and np.isnan(s[key]))]
+        if not vals:
+            continue
+        stats[key] = (statistics.mean(vals),
+                      statistics.stdev(vals) if len(vals) > 1 else 0.0,
+                      len(vals))
+    return stats
+
+
 def write_report(res, path):
     s = summarize(res)
     L = []
     L.append("=" * 72)
     L.append(f"NOMINAL MPCC BENCHMARK  --  {res['label']}")
     L.append("=" * 72)
-    L.append(f"  episodes      : {res['episodes_completed']}/{res['episodes_requested']}")
-    L.append(f"  seed          : {res['seed']}   (same seed => same spawn sequence)")
+    L.append(f"  episodes      : {res['episodes_completed']} total")
+    seeds = res.get('seeds', [res.get('seed')])
+    L.append(f"  seeds         : {', '.join(str(x) for x in seeds)}"
+             f"   ({res.get('episodes_per_seed', '?')} episodes each)")
     L.append(f"  target_speed  : {res['target_speed']} m/s")
     L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  wall time     : {res['wall_time_s']/60:.1f} min")
@@ -185,6 +241,33 @@ def write_report(res, path):
         L.append("-" * 72)
         L.append(f"  mean failure rate        {100*s['mean_solver_failure_rate']:8.2f}%")
         L.append("")
+        per_seed = summarize_per_seed(res)
+        if len(per_seed) > 1:
+            L.append("PER SEED")
+            L.append("-" * 72)
+            L.append(f"  {'seed':>8}{'eps':>6}{'succ%':>8}{'coll%':>8}"
+                     f"{'ovt/ep':>9}{'route%':>9}{'fail%':>8}")
+            for seed, st in sorted(per_seed.items()):
+                L.append(f"  {seed:>8}{st['n_episodes']:>6}"
+                         f"{100*st['success_rate']:>8.1f}{100*st['collision_rate']:>8.1f}"
+                         f"{st['overtakes_per_episode']:>9.2f}"
+                         f"{100*st['mean_progress_frac']:>9.1f}"
+                         f"{100*st['mean_solver_failure_rate']:>8.2f}")
+            L.append("")
+            L.append("PAPER TABLE  (mean +- std across seeds)")
+            L.append("-" * 72)
+            st = across_seeds(per_seed)
+            for name, key, scale in PAPER_METRICS:
+                if key not in st:
+                    continue
+                m, sd, k = st[key]
+                L.append(f"  {name:<26}{scale*m:8.2f}  +-{scale*sd:7.2f}   (n={k} seeds)")
+            L.append("")
+            L.append("  Report these as mean +- std over seeds, with the episode")
+            L.append("  count per seed stated.  std over 3 seeds is a weak estimate --")
+            L.append("  quote it, do not run significance tests on it.")
+            L.append("")
+
         colls = [e for e in res['per_episode'] if e['outcome'] == 'collision'
                  and e.get('collision_kind')]
         if colls:
@@ -272,7 +355,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--label', default='run', help='name for this configuration')
     ap.add_argument('--episodes', type=int, default=20)
-    ap.add_argument('--seed', type=int, default=2547)
+    ap.add_argument('--seeds', type=int, nargs='+', default=[2547],
+                    help='one run per seed; metrics are averaged across them')
     ap.add_argument('--target-speed', type=float, default=15.0,
                     help='drop this for the non-racing reframe (see WORKLOG.md)')
     ap.add_argument('--max-steps', type=int, default=1500)
