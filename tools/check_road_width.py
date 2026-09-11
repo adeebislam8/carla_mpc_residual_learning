@@ -50,6 +50,10 @@ def main():
     real = 0
     left_kinds = Counter()
     widths = []
+    phantom_junction = 0
+    phantom_open = 0
+    real_junction = 0
+    phantom_samples = []
 
     for w in driving:
         lw = w.lane_width
@@ -57,10 +61,19 @@ def main():
         if left is not None and left.lane_type == carla.LaneType.Driving:
             left_width = lw / 2.0 + left.lane_width
             real += 1
+            real_junction += bool(w.is_junction)
             left_kinds['Driving (real lane)'] += 1
         else:
             left_width = lw / 2.0 + 4.0
             phantom += 1
+            if w.is_junction:
+                phantom_junction += 1
+            else:
+                phantom_open += 1
+                if len(phantom_samples) < 8:
+                    loc = w.transform.location
+                    phantom_samples.append(
+                        (w.road_id, w.lane_id, round(loc.x, 1), round(loc.y, 1)))
             left_kinds[str(left.lane_type) if left is not None else 'None'] += 1
         widths.append((lw, left_width, -left_width + args.margin))
 
@@ -68,6 +81,16 @@ def main():
     print("LEFT SIDE")
     print(f"  real adjacent driving lane : {real:6d}  ({100*real/n:5.1f}%)")
     print(f"  PHANTOM +4 m applied       : {phantom:6d}  ({100*phantom/n:5.1f}%)  <-- invented road")
+    print(f"\n  WHERE the phantom fires:")
+    print(f"      at junctions        : {phantom_junction:6d}"
+          f"  ({100*phantom_junction/max(phantom,1):5.1f}% of phantom cases)")
+    print(f"      on open road        : {phantom_open:6d}"
+          f"  ({100*phantom_open/max(phantom,1):5.1f}% of phantom cases)")
+    print(f"  (for reference, {real_junction} of the {real} real-lane waypoints are junctions)")
+    if phantom_samples:
+        print("\n  open-road phantom samples (road_id, lane_id, x, y):")
+        for smp in phantom_samples:
+            print(f"      {smp}")
     print("\n  what get_left_lane() actually returned where the phantom fired:")
     for k, v in left_kinds.most_common():
         print(f"      {k:<28}{v:6d}")
