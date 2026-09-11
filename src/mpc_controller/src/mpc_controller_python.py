@@ -78,6 +78,24 @@ class MPCController:
         #   40 deg -> 1.750x   35 deg -> 2.000x  (untested)
         self.steer_norm_deg = 45.0
 
+        # Situational speed limits, applied as per-stage bounds on v (the speed
+        # bound is already set per stage, so this needs no model change).
+        #
+        # 1. CURVATURE.  v^2*|kappa| <= alat_max is the lateral acceleration the
+        #    PATH demands, independent of the commanded steering.  The model's own
+        #    a_lat = C2*v^2*delta is computed from delta in a slip-free kinematic
+        #    bicycle, so it under-estimates what a real tyre must supply and never
+        #    forces a slow-down before a corner.  This does.
+        # 2. OFF-PATH RECOVERY.  The cost is qc*n^2 + qa*alpha^2 with no
+        #    saturation, so once the car is well off the path those terms demand a
+        #    correction the tyres cannot deliver at speed -- n and alpha grow, the
+        #    command grows, and it diverges instead of recovering.  Capping speed
+        #    while off-path makes the correction executable.
+        # Set either to None to disable.
+        self.curvature_speed_limit = True
+        self.recover_n_threshold = 2.5    # m off-path before the cap applies
+        self.recover_speed_cap = 6.0      # m/s while recovering
+
         # Tracking diagnostics: does the PLAN leave the corridor, or does the car
         # fail to follow a plan that stayed inside it?  Four corridor changes have
         # now failed to move "outside the corridor" off 64-69%, and raising Zl[2]
@@ -255,6 +273,24 @@ class MPCController:
                 n_min_adaptive, n_max_adaptive = mid - 0.05, mid + 0.05
             
             # Build constraint arrays
+            # Per-stage speed ceiling (see __init__).
+            v_stage_max = self.model.v_max
+            if self.curvature_speed_limit:
+                try:
+                    s_q = min(max(s_pred, 0.0),
+                              getattr(self, '_global_path_length', s_pred) or s_pred)
+                    k_pred = abs(float(self.model.kapparef_s(s_q)))
+                    if np.isfinite(k_pred) and k_pred > 1e-4:
+                        v_stage_max = min(
+                            v_stage_max,
+                            float(np.sqrt(self.constraint.alat_max / k_pred)))
+                except Exception:
+                    pass
+            if (self.recover_speed_cap is not None
+                    and abs(d) > self.recover_n_threshold):
+                v_stage_max = min(v_stage_max, self.recover_speed_cap)
+            v_stage_max = max(v_stage_max, 1.0)   # never demand a full stop
+
             lh_constraints = np.array([
                 self.constraint.along_min,
                 self.constraint.alat_min,
@@ -274,7 +310,7 @@ class MPCController:
                 self.constraint.along_max,
                 self.constraint.alat_max,
                 n_max_adaptive,
-                self.model.v_max,
+                v_stage_max,
                 self.model.throttle_max,
                 self.model.delta_max + 1e-3,
                 self.constraint.dist_obs1_max,

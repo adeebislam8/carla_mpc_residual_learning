@@ -483,6 +483,17 @@ class CarlaMPCEnv(gym.Env):
                 self.current_s / max(self.path_length, 1e-6))
             info['overtakes_so_far'] = len(self.overtaken_npcs)
 
+            # Path curvature at the impact point.  The corridor is ~6x wider to
+            # the left than the right, and tracking error pushes a car to the
+            # OUTSIDE of a curve, so one turn direction has far less budget than
+            # the other.  Recording kappa lets that be measured instead of
+            # derived from sign conventions.
+            try:
+                info['kappa'] = float(
+                    self.frenet_converter.get_curvature(self.current_s))
+            except Exception:
+                info['kappa'] = float('nan')
+
             # Off-road: outside the lateral corridor when it hit.
             if self._road_widths is not None and self._road_width_s is not None:
                 idx = np.argmin(np.abs(self._road_width_s - self.current_s))

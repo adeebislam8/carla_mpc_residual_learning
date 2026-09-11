@@ -300,6 +300,24 @@ def write_report(res, path):
                 L.append(f"  by {label}:")
                 for k, v in cnt.most_common():
                     L.append(f"      {k:<34}{v:4d}  ({100*v/len(colls):5.1f}%)")
+            ks = [e['collision_kappa'] for e in colls
+                  if e.get('collision_kappa') is not None
+                  and e['collision_kappa'] == e['collision_kappa']]
+            if ks:
+                STRAIGHT = 0.02
+                pos = sum(1 for k in ks if k > STRAIGHT)
+                neg = sum(1 for k in ks if k < -STRAIGHT)
+                flat = len(ks) - pos - neg
+                L.append("  by path curvature at impact:")
+                L.append(f"      kappa > +{STRAIGHT}  (one turn dir) {pos:4d}"
+                         f"  ({100*pos/len(ks):5.1f}%)")
+                L.append(f"      kappa < -{STRAIGHT}  (other dir)    {neg:4d}"
+                         f"  ({100*neg/len(ks):5.1f}%)")
+                L.append(f"      |kappa| <= {STRAIGHT} (straight)     {flat:4d}"
+                         f"  ({100*flat/len(ks):5.1f}%)")
+                L.append("      a large imbalance = one turn direction is much")
+                L.append("      harder; the corridor is ~6x wider left than right")
+
             off = sum(1 for e in colls if e.get('collision_off_corridor'))
             fb = sum(1 for e in colls if e.get('collision_in_fallback'))
             spd = [e['collision_speed'] for e in colls
