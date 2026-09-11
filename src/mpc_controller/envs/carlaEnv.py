@@ -786,6 +786,16 @@ class CarlaMPCEnv(gym.Env):
         kappa_samples = [self.frenet_converter.get_curvature(s) for s in s_samples]
         kappa_spline = make_interp_spline(s_samples, kappa_samples, k=3)
         
+        # Give the controller the ego's real footprint so the corridor margin
+        # matches the car actually being driven, not a hardcoded Model 3.
+        try:
+            ext = self.vehicle.bounding_box.extent
+            self.mpc_controller.veh_length = float(2.0 * ext.x)
+            self.mpc_controller.veh_width = float(2.0 * ext.y)
+            print(f"  ego footprint: {2*ext.x:.2f} x {2*ext.y:.2f} m")
+        except Exception as e:
+            print(f"  could not read ego bounding box ({e}); using defaults")
+
         # Initialize ACADOS
         self.mpc_controller.initialize_acados(kappa_spline, path_msg=None)
         self.mpc_controller._global_path_length = self.path_length

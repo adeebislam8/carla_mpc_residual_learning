@@ -64,7 +64,10 @@ class PathPlanner:
         # so the allowance must not go to zero -- but it should not reach the corner
         # either.  JUNCTION_MARGIN is the knob: raise it if turns become infeasible,
         # lower it if the car still clips corners.
-        JUNCTION_MARGIN = 1.5
+        JUNCTION_MARGIN = 4.0   # reverted: 1.5 made things worse (65% -> 75% collisions,
+                                #  overtakes 0.93 -> 0.63) while outside-corridor stayed
+                                #  at ~69%, i.e. narrowing the corridor never addressed
+                                #  why the car leaves it
         SHOULDER = 0.3          # genuinely no lane: road edge, keep tight
 
         left_lane = waypoint.get_left_lane()

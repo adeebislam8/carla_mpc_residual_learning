@@ -52,6 +52,13 @@ class MPCController:
         self.derDelta = 0.0
         self.derTheta = 0.0
 
+        # Vehicle footprint, for the lateral corridor margin.  Defaults are a
+        # Tesla Model 3; CarlaMPCEnv overwrites them from the spawned actor's
+        # bounding box in _initialize_mpc().
+        self.veh_length = 4.69
+        self.veh_width = 1.85
+        self.lateral_clearance = 0.30
+
         # Solver-failure handling.  last_good_control is the most recent control
         # from a successful solve; the fallback blends away from it over
         # fallback_blend_steps rather than snapping to centreline tracking.
@@ -172,8 +179,33 @@ class MPCController:
             # Predict arc length at timestep i
             s_pred = s + self.target_speed * (self.Tf / self.N) * i
             
-            # Get road bounds (use defaults if not provided)
-            safety_margin = 1.2
+            # Lateral margin from the vehicle's actual footprint, not a constant.
+            #
+            # The corridor constrains the vehicle CENTRE, so a fixed 1.2 m margin
+            # is only correct when the car is aligned with the path.  The lateral
+            # extent of a rotated rectangle is
+            #     (L/2)|sin a| + (W/2)|cos a|
+            # which is 0.93 m at a = 0 but 1.94 m at a = 0.5 rad and 2.44 m at
+            # 0.94 rad -- and 0.94 rad was the peak heading error at collisions.
+            # The corners were swinging outside a corridor the solver believed it
+            # was respecting, worst while turning through junctions, which is
+            # where ~90% of collisions land.
+            #
+            # The heading error is taken per stage from the previous solution, so
+            # the margin widens over exactly the part of the horizon that is
+            # turning instead of inflating the whole corridor.  At a = 0 this
+            # gives 0.93 + 0.30 = 1.23 m, i.e. unchanged on straights.
+            try:
+                alpha_pred = float(self.acados_solver.get(i, "x")[2])
+                if not np.isfinite(alpha_pred):
+                    alpha_pred = alpha
+            except Exception:
+                alpha_pred = alpha
+
+            half_extent = (0.5 * self.veh_length * abs(np.sin(alpha_pred))
+                           + 0.5 * self.veh_width * abs(np.cos(alpha_pred)))
+            safety_margin = half_extent + self.lateral_clearance
+
             if road_widths is not None and road_width_s is not None and len(road_widths) > 0:
                 idx = np.argmin(np.abs(road_width_s - s_pred))
                 n_min_adaptive = -road_widths[idx, 0] + safety_margin   # negative = world left
@@ -187,6 +219,16 @@ class MPCController:
             # Clamp to reasonable values
             n_min_adaptive = max(n_min_adaptive, -10.0)
             n_max_adaptive = min(n_max_adaptive, 10.0)
+
+            # A heading-dependent margin can exceed the corridor width on a
+            # narrow road (e.g. left_width 2.30 m against a 2.65 m worst-case
+            # margin at a = pi/2), which would invert the bounds and hand the QP
+            # an empty constraint set.  Keep a small feasible band centred on the
+            # corridor instead -- being slightly outside is recoverable, an
+            # infeasible stage is not.
+            if n_min_adaptive > n_max_adaptive:
+                mid = 0.5 * (n_min_adaptive + n_max_adaptive)
+                n_min_adaptive, n_max_adaptive = mid - 0.05, mid + 0.05
             
             # Build constraint arrays
             lh_constraints = np.array([
