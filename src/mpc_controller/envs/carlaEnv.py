@@ -107,6 +107,7 @@ class CarlaMPCEnv(gym.Env):
         self.frenet_converter: Optional[FrenetConverter] = None
         self.path_planner: Optional[PathPlanner] = None
         self.current_s = 0.0
+        self._ego_s_hint = None   # branch-continuity hint, per episode
         self.current_d = 0.0
         self.current_alpha = 0.0
         self.path_length = 0.0
@@ -845,7 +846,15 @@ class CarlaMPCEnv(gym.Env):
         y = transform.location.y
         yaw = np.deg2rad(transform.rotation.yaw)
         
-        self.current_s, self.current_d, self.current_alpha = self.frenet_converter.world_to_frenet(x, y, yaw)
+        # Hint with the ego's previous s so the closest-point search stays on the
+        # same branch.  Without it a route that doubles back can flip branches --
+        # measured 1 m of drift moving s by ~100 m and inverting d's sign, which
+        # corrupts progress, curvature, the corridor and the overtake direction
+        # in one step.
+        self.current_s, self.current_d, self.current_alpha = \
+            self.frenet_converter.world_to_frenet(
+                x, y, yaw, s_hint=self._ego_s_hint)
+        self._ego_s_hint = self.current_s
         
         # Vehicle dynamics
         self.current_speed = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
@@ -878,8 +887,7 @@ class CarlaMPCEnv(gym.Env):
             try:
                 loc = npc.get_location()
                 s_obs, d_obs, _ = self.frenet_converter.world_to_frenet(
-                    loc.x, loc.y, 0
-                )
+                    loc.x, loc.y, 0, s_hint=npc_data.get("s"))
                 ds = s_obs - self.current_s
                 if ds > -5.0 and ds < MAX_OBS_LOOKAHEAD:
                     obstacles.append({
@@ -1191,6 +1199,7 @@ class CarlaMPCEnv(gym.Env):
             self.prev_s = 0.0
             self.authority_history = []
             self.last_authority_info = {}
+            self._ego_s_hint = None
             
             # Initial tick
             self.world.tick()

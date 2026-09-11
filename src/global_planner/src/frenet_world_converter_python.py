@@ -64,7 +64,8 @@ class FrenetCartesianConverter:
         
         return np.array(filtered_x), np.array(filtered_y)
     
-    def get_frenet(self, cartesian_state: List[float]) -> Tuple[float, float, float]:
+    def get_frenet(self, cartesian_state: List[float],
+                   s_hint=None) -> Tuple[float, float, float]:
         """
         Convert Cartesian (x, y, yaw) to Frenet (s, d, alpha)
         
@@ -80,7 +81,7 @@ class FrenetCartesianConverter:
         x, y, yaw = cartesian_state
         
         # Find closest point on path
-        s_guess = self._find_closest_s(x, y)
+        s_guess = self._find_closest_s(x, y, s_hint=s_hint)
         
         # Refine with Newton's method
         s = self._refine_s(x, y, s_guess)
@@ -170,8 +171,30 @@ class FrenetCartesianConverter:
         """Get total path length"""
         return self.s_max
     
-    def _find_closest_s(self, x: float, y: float) -> float:
-        """Find initial guess for closest s using coarse search"""
+    def _find_closest_s(self, x: float, y: float, s_hint=None,
+                        window: float = 20.0) -> float:
+        """
+        Initial guess for the closest s.
+
+        With s_hint, search only [s_hint-window, s_hint+window] at ~0.25 m
+        spacing.  Without it, fall back to a coarse global search.
+
+        The global search has no memory, so on any route that doubles back the
+        closest point can flip branches: measured on a Town01-like block route,
+        1 m of lateral drift moved s from 40.0 to 138.8 m and inverted the sign
+        of d.  Everything downstream -- progress, curvature, the corridor, the
+        CBF, and the sign of the overtake target -- becomes wrong in the same
+        step.  Restricting the search to a window around the previous s enforces
+        branch continuity, which is what makes the frame usable off-road.
+        """
+        if s_hint is not None and np.isfinite(s_hint):
+            lo = max(0.0, float(s_hint) - window)
+            hi = min(self.s_max, float(s_hint) + window)
+            n = max(16, int((hi - lo) / 0.25))
+            s_samples = np.linspace(lo, hi, n)
+            x_s, y_s = self.x_spline(s_samples), self.y_spline(s_samples)
+            return float(s_samples[np.argmin((x_s - x) ** 2 + (y_s - y) ** 2)])
+
         s_samples = np.linspace(0, self.s_max, 100)
         x_samples = self.x_spline(s_samples)
         y_samples = self.y_spline(s_samples)
@@ -236,7 +259,8 @@ class FrenetConverter:
         """
         self.converter = FrenetCartesianConverter(waypoints)
     
-    def world_to_frenet(self, x: float, y: float, yaw: float) -> Tuple[float, float, float]:
+    def world_to_frenet(self, x: float, y: float, yaw: float,
+                        s_hint=None) -> Tuple[float, float, float]:
         """
         Convert world coordinates to Frenet
         
@@ -249,7 +273,7 @@ class FrenetConverter:
         Returns:
             (s, d, alpha): Frenet coordinates
         """
-        return self.converter.get_frenet([x, y, yaw])
+        return self.converter.get_frenet([x, y, yaw], s_hint=s_hint)
     
     def frenet_to_world(self, s: float, d: float, alpha: float) -> Tuple[float, float, float]:
         """
