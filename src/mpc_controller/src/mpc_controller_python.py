@@ -57,6 +57,17 @@ class MPCController:
         # bounding box in _initialize_mpc().
         self.veh_length = 4.69
         self.veh_width = 1.85
+
+        # CARLA's control.steer is normalised [-1, 1] over the vehicle's REAL
+        # max_steer_angle, which is 70 deg for vehicle.tesla.model3 -- not the
+        # 45 deg model.delta_max used to model the planned steering.  Dividing by
+        # delta_max made the car steer 70/45 = 1.556x more than commanded, and
+        # carlaEnv read the angle back with the same wrong constant, so the MPC's
+        # own delta state was wrong by that factor and it never compensated.
+        # Over-steering past the tyres' peak slip angle produces UNDERSTEER, which
+        # is why the prediction turned while the car went straight.
+        # CarlaMPCEnv overwrites this from the spawned actor's physics control.
+        self.carla_max_steer = np.deg2rad(70.0)
         self.lateral_clearance = 0.30
 
         # Solver-failure handling.  last_good_control is the most recent control
@@ -333,7 +344,9 @@ class MPCController:
         else:
             throttle = target_D  # Negative for braking
         
-        steering = target_delta / self.model.delta_max  # Normalize by max angle
+        # Normalise by the ACTUATOR range, not the model's own limit, so that a
+        # planned delta produces that same delta on the vehicle.
+        steering = target_delta / self.carla_max_steer
         
         # Clip to valid range
         throttle = np.clip(throttle, -1.0, 1.0)

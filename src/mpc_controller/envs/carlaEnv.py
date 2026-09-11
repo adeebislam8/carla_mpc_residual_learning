@@ -94,6 +94,9 @@ class CarlaMPCEnv(gym.Env):
         self.current_throttle = 0.0
         self.current_brake = 0.0
         self.current_steering = 0.0
+        # Real actuator range, read from the spawned vehicle in _initialize_mpc().
+        # 70 deg is the Model 3 value; overwritten once the actor exists.
+        self._carla_max_steer = np.deg2rad(70.0)
         self.lateral_accel = 0.0
         
         self._road_widths = None
@@ -789,6 +792,15 @@ class CarlaMPCEnv(gym.Env):
         # Give the controller the ego's real footprint so the corridor margin
         # matches the car actually being driven, not a hardcoded Model 3.
         try:
+            wheels = self.vehicle.get_physics_control().wheels
+            real = max(w.max_steer_angle for w in wheels)
+            self._carla_max_steer = float(np.deg2rad(real))
+            self.mpc_controller.carla_max_steer = self._carla_max_steer
+            print(f"  steering: CARLA max_steer_angle = {real:.1f} deg")
+        except Exception as e:
+            print(f"  could not read steering limit ({e}); using 70 deg")
+
+        try:
             ext = self.vehicle.bounding_box.extent
             self.mpc_controller.veh_length = float(2.0 * ext.x)
             self.mpc_controller.veh_width = float(2.0 * ext.y)
@@ -826,7 +838,10 @@ class CarlaMPCEnv(gym.Env):
         else:
             self.current_throttle = control.throttle
         self.current_brake = control.brake
-        self.current_steering = control.steer * (45 * np.pi / 180) # Change to radians
+        # Read the angle back with the SAME constant CARLA uses to apply it.
+        # This was hardcoded to 45 deg while the Model 3's real max_steer_angle
+        # is 70 deg, so the MPC's delta state was wrong by 1.556x.
+        self.current_steering = control.steer * self._carla_max_steer
 
         angular_velocity = self.vehicle.get_angular_velocity()
         yaw_rate = np.deg2rad(angular_velocity.z)
@@ -1655,7 +1670,7 @@ class CarlaMPCEnv(gym.Env):
             #     life_time=0.15
             # )
 
-    def _visualize_vehicle_footprint(self, life_time=0.15):
+    def _visualize_vehicle_footprint(self, life_time=0.06):
         """
         Draw the ego's real bounding box AND the lateral extent the corridor
         constraint actually reasons about, so "the box must not exceed the lane"
@@ -1686,11 +1701,14 @@ class CarlaMPCEnv(gym.Env):
 
             # 1. the actual CARLA bounding box, for reference
             bb = self.vehicle.bounding_box
+            # life_time just over one step (dt = 0.05) so successive frames do
+            # not stack -- overlapping debug draws add up and look like a glow.
+            # A dimmer white for the same reason; 255 saturates.
             debug.draw_box(
                 carla.BoundingBox(tf.transform(bb.location), bb.extent),
                 tf.rotation,
-                thickness=0.04,
-                color=carla.Color(255, 255, 255),
+                thickness=0.03,
+                color=carla.Color(160, 160, 160),
                 life_time=life_time,
             )
 
@@ -1717,7 +1735,7 @@ class CarlaMPCEnv(gym.Env):
                     self.current_s, n_edge, 0.0)
                 debug.draw_point(
                     carla.Location(x=x, y=y, z=1.2),
-                    size=0.12, color=colour, life_time=life_time)
+                    size=0.08, color=colour, life_time=life_time)
         except Exception:
             pass
 
