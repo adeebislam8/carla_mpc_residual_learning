@@ -54,7 +54,9 @@ def distance2obs_casadi_elliptical(s, n, s_obs, n_obs, a=3.5, b=1.4):
     return ellipse + behind * RELEASE
 
 
-def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None):
+def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
+                  a_long_obs=None, b_lat_obs=None, apex_gain=None,
+                  gate_depth=None, lookahead=None, r3_cap=None):
     # define structs
     constraint = types.SimpleNamespace()
     model = types.SimpleNamespace()
@@ -175,8 +177,14 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None):
     a_lat = C2 * v * v * delta + a_long * sin(C1 * delta)
 
     obs_gamma = 1.0
-    a_long = 4  # Longitudinal semi-axis (meters)
-    b_lat = 2   # Lateral semi-axis (meters)
+    # Ellipse semi-axes.  Lowering a_long makes b larger for a given gap, so the
+    # CBF is satisfied more easily and there is LESS pressure to escape laterally
+    # -- with the n_ref attractor in place that reads as less aggressive
+    # overtaking.  Before the attractor existed the barrier gradient was the only
+    # thing choosing a side, and lowering a_long increased overtaking; the sign
+    # of the effect changed when n_ref took over.
+    a_long = 3 if a_long_obs is None else float(a_long_obs)
+    b_lat = 2 if b_lat_obs is None else float(b_lat_obs)
 
 
     """ wrong """
@@ -288,7 +296,13 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None):
     # kappa_val = kapparef_s(s)
     # r3 = 1e-2 + 5e-1 * kappa_val**2  # fast straight, slows at corners
     # Lookahead distance in meters — how far ahead to check
-    lookahead = 5.0  # tune this: larger = brakes earlier
+    # How far ahead curvature is sampled to slow the virtual reference.
+    #
+    # NOTE the comments below claim 5/10/15 m, but the samples are taken at
+    # lookahead*0.33/0.66/1.0 -- so at the default 5.0 they are 1.65/3.3/5.0 m,
+    # i.e. half a second of preview at 10 m/s.  The reference is slowed as the
+    # corner is entered rather than before it.
+    lookahead = 5.0 if lookahead is None else float(lookahead)
 
     # Sample curvature ahead
     kappa_now     = kapparef_s(s)
@@ -301,7 +315,12 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None):
                     fmax(fabs(kappa_ahead1),
                     fmax(fabs(kappa_ahead2), fabs(kappa_ahead3))))
 
-    r3 = fmin(1.5e-2 + 5.5e-1 * kappa_max_ahead**2, 3e-2)
+    # r3 penalises derTheta^2, so the virtual reference settles at
+    #     derTheta* = gamma / (2*r3)
+    # The cap saturates at kappa = 0.165 (R = 6 m), so a 4.3 m junction turn is
+    # slowed no more than a 6 m one, and the whole range is only 2x.
+    R3_CAP = 3e-2 if r3_cap is None else float(r3_cap)
+    r3 = fmin(1.5e-2 + 5.5e-1 * kappa_max_ahead**2, R3_CAP)
     k1 = 5e-1
     p1 = 1e-1
     ds1 = s_obs1 - s
@@ -365,7 +384,23 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None):
     # edge.  -2.5 keeps 0.5 m over the barrier floor and 2.3 m to the edge.
     # This is the value the 65% baseline was measured with.
     n_overtake = -2.5
-    n_ref = n_overtake * overtake_gate
+    # Apex offset: bias the car toward the INSIDE of an upcoming bend.
+    #
+    # Tracking error pushes a car to the OUTSIDE of a curve, and the corridor is
+    # ~6x wider to the left (oncoming lane) than to the right (kerb).  So running
+    # wide costs 4.8 m of budget one way and 0.8 m the other -- which is why one
+    # turn direction is much less forgiving.  Sitting slightly inside before the
+    # bend spends margin where there is plenty and saves it where there is none.
+    #
+    # apex_gain is SIGNED and in metres per unit curvature: kappa's sign
+    # convention here is not independently verified, so if the car leans the
+    # wrong way, negate it.  0 disables (baseline).
+    APEX_GAIN = 0.0 if apex_gain is None else float(apex_gain)
+    APEX_MAX = 1.2          # never ask for more than this many metres
+    kappa_here = kapparef_s(s)
+    apex_offset = APEX_MAX * tanh(APEX_GAIN * kappa_here / max(APEX_MAX, 1e-6))
+
+    n_ref = n_overtake * overtake_gate + apex_offset
 
     # Saturating lateral cost (pseudo-Huber) instead of a raw square.
     #
@@ -379,6 +414,16 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None):
     # is identical to e^2 for |e| << D and becomes linear beyond, so the gradient
     # saturates at 2*D.  Normal lane keeping and overtaking (|e| <= 2.5 m) are
     # unchanged; only far-off-path recovery is bounded.  D is the knee.
+    # How much the lateral penalty is relaxed when an obstacle is in the gate.
+    #   coefficient = qc            with no obstacle   (hold the lane)
+    #               = qc*(1-depth)  while overtaking   (permit the pass)
+    # qc alone scales BOTH regimes, so raising it to hold the lane harder also
+    # makes overtaking proportionally more expensive -- which is why overtakes
+    # fell at qc=0.5.  depth decouples them: qc=0.5 with depth=0.98 holds the
+    # lane 10x harder than the 5e-2 baseline while leaving the overtaking
+    # coefficient exactly where it was (0.01).
+    GATE_DEPTH = 0.8 if gate_depth is None else float(gate_depth)
+
     HUBER_D = 3.0
     e_lat = n - n_ref
     lat_cost = 2.0 * HUBER_D**2 * (sqrt(1.0 + (e_lat / HUBER_D)**2) - 1.0)
@@ -386,7 +431,7 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None):
     # closest_distance = fmin(dist_obs1, fmin(dist_obs2, fmin(dist_obs3, fmin(dist_obs4, fmin(dist_obs5, dist_obs6)))))
     model.cost_expr_ext_cost = (
         (ql * (s - theta) ** 2)
-        + qc * (1 - 0.8 * overtake_gate) * lat_cost
+        + qc * (1 - GATE_DEPTH * overtake_gate) * lat_cost
         + qa * alpha**2
         - gamma * derTheta * fmax(0, sign(path_length - s - DIST2STOP))
         + r1 * derD**2 * fmax(0, sign(path_length - s - DIST2STOP))

@@ -21,11 +21,26 @@ cd "$(dirname "$0")/.."
 # Keep a no-flag baseline first so every sweep has its own reference point
 # measured in the same session, rather than compared against an older run.
 CONFIGS=(
-  "qc_005|"
-  "qc_010|--qc 0.10"
-  "qc_020|--qc 0.20"
-  "qc_050|--qc 0.50"
+  "base|"
+  "hold|--qc 0.5 --gate-depth 0.98"
+  "slow|--lookahead 20 --r3-cap 0.06"
+  "both|--qc 0.5 --gate-depth 0.98 --lookahead 20 --r3-cap 0.06"
 )
+
+# What these test, and why they are separable:
+#
+#   hold  Hold the lane hard, but keep overtaking exactly as cheap as baseline.
+#         qc alone scales BOTH regimes (which is why overtakes fell at qc=0.5);
+#         pairing it with gate-depth 0.98 lifts only the no-obstacle term:
+#         lane-hold 0.05 -> 0.50 while the overtaking coefficient stays 0.010.
+#
+#   slow  Slow the virtual reference BEFORE a corner rather than in it.  The
+#         default lookahead of 5 m samples curvature at 1.65/3.3/5.0 m, about
+#         half a second at 10 m/s; r3 also saturates at R = 6 m so a 4.3 m
+#         junction turn is slowed no harder than a 6 m one.
+#
+#   both  They address different halves of the same failure: deviation is cheap
+#         AND the car arrives too fast to hold the line.
 
 # Applied to every config.  Same seeds and town for all of them, or the
 # comparison is meaningless.

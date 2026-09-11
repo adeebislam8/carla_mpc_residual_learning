@@ -69,6 +69,12 @@ def run(args):
             seed=seed,
             steer_norm_deg=args.steer_norm_deg,
             qc=args.qc,
+            a_long_obs=args.a_long,
+            b_lat_obs=args.b_lat,
+            apex_gain=args.apex_gain,
+            gate_depth=args.gate_depth,
+            lookahead=args.lookahead,
+            r3_cap=args.r3_cap,
             residual_mode='fixed',   # alpha == 1, but action is 0 -> pure MPCC
         )
         interrupted = False
@@ -93,6 +99,12 @@ def run(args):
         'target_speed': args.target_speed,
         'steer_norm_deg': args.steer_norm_deg,
         'qc': args.qc,
+        'a_long': args.a_long,
+        'b_lat': args.b_lat,
+        'apex_gain': args.apex_gain,
+        'gate_depth': args.gate_depth,
+        'lookahead': args.lookahead,
+        'r3_cap': args.r3_cap,
         'town': args.town,
         'max_steps': args.max_steps,
         'rendered': bool(args.render),
@@ -239,6 +251,15 @@ def write_report(res, path):
         g = 70.0 / res['steer_norm_deg']
         L.append(f"  steer norm    : {res['steer_norm_deg']} deg  -> {g:.3f}x feedforward")
     L.append(f"  qc (lateral)  : {res.get('qc') or 0.05}")
+    L.append(f"  ellipse       : a={res.get('a_long') or 4}  b={res.get('b_lat') or 2}"
+             f"   apex_gain={res.get('apex_gain') or 0}")
+    _qc = res.get('qc') or 0.05
+    _gd = res.get('gate_depth') if res.get('gate_depth') is not None else 0.8
+    L.append(f"  lane-hold qc  : {_qc:.3f} normally / {_qc*(1-_gd):.3f} while overtaking")
+    _la = res.get('lookahead') or 5.0
+    _r3 = res.get('r3_cap') or 3e-2
+    L.append(f"  corner slowdown: lookahead {_la} m, r3_cap {_r3}"
+             f"  -> derTheta {0.4/(2*0.015):.1f} straight / {0.4/(2*_r3):.1f} in a bend")
     L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  wall time     : {res['wall_time_s']/60:.1f} min")
     L.append(f"  driven with action = [0, 0]  -> pure MPCC, no RL residual")
@@ -424,6 +445,25 @@ def main():
     ap.add_argument('--qc', type=float, default=None,
                     help='lateral tracking weight (default 5e-2 from the model). '
                          'Higher = holds the path harder.')
+    ap.add_argument('--a-long', type=float, default=None,
+                    help='CBF ellipse longitudinal semi-axis (model default 4). '
+                         'LOWER = barrier easier to satisfy = less overtaking.')
+    ap.add_argument('--b-lat', type=float, default=None,
+                    help='CBF ellipse lateral semi-axis (model default 2). '
+                         'Sets the minimum lateral clearance when passing.')
+    ap.add_argument('--apex-gain', type=float, default=None,
+                    help='signed metres per unit curvature; leans the car toward '
+                         'the inside of a bend. 0 = off. Negate if it leans wrong.')
+    ap.add_argument('--gate-depth', type=float, default=None,
+                    help='lateral relaxation while overtaking (model default 0.8). '
+                         'Pair a HIGH qc with a HIGH depth to hold the lane hard '
+                         'without making passes expensive.')
+    ap.add_argument('--lookahead', type=float, default=None,
+                    help='m of curvature preview for the corner slowdown '
+                         '(model default 5.0 = ~0.5 s at 10 m/s).')
+    ap.add_argument('--r3-cap', type=float, default=None,
+                    help='cap on the curvature slowdown (model default 3e-2, '
+                         'saturates at R=6 m). Higher = slower in tight turns.')
     ap.add_argument('--no-diag', action='store_true',
                     help='disable solver diagnostics (on by default; writes '
                          'diagnostics/*.npz for analyze_solver_failures.py)')

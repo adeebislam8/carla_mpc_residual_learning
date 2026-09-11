@@ -45,6 +45,12 @@ class CarlaMPCEnv(gym.Env):
         render_mode: Optional[str] = None,
         steer_norm_deg: float = 45.0,
         qc: float = None,
+        a_long_obs: float = None,
+        b_lat_obs: float = None,
+        apex_gain: float = None,
+        gate_depth: float = None,
+        lookahead: float = None,
+        r3_cap: float = None,
         residual_mode: str = 'adaptive',
         residual_max: float = 0.1,
     ):
@@ -59,6 +65,16 @@ class CarlaMPCEnv(gym.Env):
         """
         super().__init__()
         random.seed(seed)
+        self.seed = seed
+        # Per-episode RNG, rebuilt in reset() from (seed, episode_count).
+        # The global `random` stream is shared between scenario setup and retry
+        # loops whose LENGTH depends on controller behaviour, so two configs
+        # diverge as soon as one needs a different number of spawn attempts --
+        # and every later episode then has a different route and traffic.  A
+        # dedicated stream, drawn a fixed number of times, makes the scenario
+        # sequence identical across configs, which is what the whole
+        # same-seed comparison relies on.
+        self._ep_rng = random.Random(seed)
         
         # CARLA connection
         self.host = host
@@ -148,6 +164,12 @@ class CarlaMPCEnv(gym.Env):
         # normalising by 45 gives 1.556x.  Smaller => more gain.
         self.steer_norm_deg = steer_norm_deg
         self.qc = qc          # lateral tracking weight; None = model default (5e-2)
+        self.a_long_obs = a_long_obs
+        self.b_lat_obs = b_lat_obs
+        self.apex_gain = apex_gain
+        self.gate_depth = gate_depth
+        self.lookahead = lookahead
+        self.r3_cap = r3_cap
         self.residual_mode = residual_mode
         self.residual_max = residual_max
         self.residual_authority = None   # built in _initialize_mpc()
@@ -641,6 +663,9 @@ class CarlaMPCEnv(gym.Env):
     #     return vehicles
 
     def _spawn_frenet_racers(self, num_cars=5, min_gap=12.0, ego_buffer=20.0):
+        # Draw from the per-episode stream, not the global one, so NPC placement
+        # is reproducible across configurations too.
+        rng = getattr(self, '_ep_rng', random)
         vehicles = []
         blueprints = self.world.get_blueprint_library().filter('vehicle.bmw.*')
         used_s = []
@@ -652,7 +677,7 @@ class CarlaMPCEnv(gym.Env):
             carla.Location(x=x, y=y, z=0.5),
             carla.Rotation(yaw=np.rad2deg(yaw))
         )
-        bp = random.choice(blueprints)
+        bp = rng.choice(blueprints)
         try:
             npc = self.world.try_spawn_actor(bp, transform)
             if npc is not None:
@@ -673,7 +698,7 @@ class CarlaMPCEnv(gym.Env):
         for _ in range(num_cars):
             spawned = False
             for _try in range(50):
-                s = random.uniform(2.0, self.path_length - 5.0)
+                s = rng.uniform(2.0, self.path_length - 5.0)
                 ds = s - self.current_s
                 if ds < ego_buffer:
                     continue
@@ -685,7 +710,7 @@ class CarlaMPCEnv(gym.Env):
                     carla.Location(x=x, y=y, z=0.5),
                     carla.Rotation(yaw=np.rad2deg(yaw))
                 )
-                bp = random.choice(blueprints)
+                bp = rng.choice(blueprints)
                 try:
                     npc = self.world.try_spawn_actor(bp, transform)
                     if npc is not None:
@@ -693,7 +718,7 @@ class CarlaMPCEnv(gym.Env):
                         vehicles.append({
                             "actor": npc,
                             "s": s,
-                            "target_speed": random.uniform(4.0, 6.0)
+                            "target_speed": rng.uniform(4.0, 6.0)
                         })
                         spawned = True
                         break
@@ -811,6 +836,12 @@ class CarlaMPCEnv(gym.Env):
         # matches the car actually being driven, not a hardcoded Model 3.
         self.mpc_controller.steer_norm_deg = self.steer_norm_deg
         self.mpc_controller.qc = self.qc
+        self.mpc_controller.a_long_obs = self.a_long_obs
+        self.mpc_controller.b_lat_obs = self.b_lat_obs
+        self.mpc_controller.apex_gain = self.apex_gain
+        self.mpc_controller.gate_depth = self.gate_depth
+        self.mpc_controller.lookahead = self.lookahead
+        self.mpc_controller.r3_cap = self.r3_cap
         try:
             wheels = self.vehicle.get_physics_control().wheels
             real = max(w.max_steer_angle for w in wheels)
@@ -1131,13 +1162,25 @@ class CarlaMPCEnv(gym.Env):
             # Destroy old vehicle and sensors
             self._destroy_actors()
             
-            # Find valid spawn and goal
+            # Find valid spawn and goal.
+            #
+            # All candidates are drawn UP FRONT from a per-episode stream, so the
+            # number of draws is fixed no matter how many attempts the controller
+            # needs.  Drawing inside the loop consumed a behaviour-dependent
+            # number of values from the shared `random` stream and desynchronised
+            # the scenario sequence between configurations.
             max_attempts = 500
             spawn_points = self.map.get_spawn_points()
+            self._ep_rng = random.Random(self.seed * 1000003 + self.episode_count)
+            _cand = [(self._ep_rng.randrange(len(spawn_points)),
+                      self._ep_rng.randrange(len(spawn_points)))
+                     for _ in range(max_attempts)]
+            _npc_count = self._ep_rng.randint(0, 7)
+
             for attempt in range(max_attempts):
                 # Build a fresh Transform: get_spawn_points() is cached above, so
                 # mutating the chosen one would drift its z on every re-pick.
-                base_point = random.choice(spawn_points)
+                base_point = spawn_points[_cand[attempt][0]]
                 spawn_point = carla.Transform(
                     carla.Location(
                         x=base_point.location.x,
@@ -1146,7 +1189,7 @@ class CarlaMPCEnv(gym.Env):
                     ),
                     base_point.rotation,
                 )
-                goal_point = random.choice(spawn_points)
+                goal_point = spawn_points[_cand[attempt][1]]
 
                 # Fixed spawn/goal for parameter exploration -- re-enable to pin
                 # the episode to one route. Leave commented for normal runs, or
@@ -1187,7 +1230,7 @@ class CarlaMPCEnv(gym.Env):
                     self._initialize_mpc()
                     # self._visualize_path_and_goal(goal_point)
 
-                    self.racing_npcs = self._spawn_frenet_racers(num_cars = random.randint(0, 7))
+                    self.racing_npcs = self._spawn_frenet_racers(num_cars=_npc_count)
 
                     break
             else:

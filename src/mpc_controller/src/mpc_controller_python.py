@@ -82,6 +82,12 @@ class MPCController:
         # Raise it to make the car hold the path harder; the overtake gate scales
         # it by 0.2 during a pass, so both regimes move together.
         self.qc = None
+        self.a_long_obs = None   # CBF ellipse longitudinal semi-axis (model: 4)
+        self.b_lat_obs = None    # CBF ellipse lateral semi-axis (model: 2)
+        self.apex_gain = None    # signed m per unit curvature; 0 = off
+        self.gate_depth = None   # lateral relaxation while overtaking (model: 0.8)
+        self.lookahead = None    # m of curvature preview (model: 5.0)
+        self.r3_cap = None       # cap on the curvature slowdown (model: 3e-2)
 
         # Situational speed limits, applied as per-stage bounds on v (the speed
         # bound is already set per stage, so this needs no model change).
@@ -145,6 +151,12 @@ class MPCController:
             path_msg=path_msg,
             degree=3,
             qc=self.qc,
+            a_long_obs=self.a_long_obs,
+            b_lat_obs=self.b_lat_obs,
+            apex_gain=self.apex_gain,
+            gate_depth=self.gate_depth,
+            lookahead=self.lookahead,
+            r3_cap=self.r3_cap,
         )
         
         print("✓ ACADOS solver initialized")

@@ -14,13 +14,20 @@ DEG2RAD = math.pi/180.0
 RAD2DEG = 180.0/math.pi
 
 
-def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None):
+def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
+                    a_long_obs=None, b_lat_obs=None, apex_gain=None,
+                    gate_depth=None, lookahead=None, r3_cap=None):
     # create render arguments
     ocp = AcadosOcp()
     dt = Tf/N
     # export model
     model, constraint = bicycle_model(dt, coeffs, knots, path_msg, degree,
-                                      use_cbf=True, qc=qc)
+                                      use_cbf=True, qc=qc,
+                                      a_long_obs=a_long_obs,
+                                      b_lat_obs=b_lat_obs,
+                                      apex_gain=apex_gain,
+                                      gate_depth=gate_depth,
+                                      lookahead=lookahead, r3_cap=r3_cap)
     # define acados ODE
     model_ac = AcadosModel()
     model_ac.f_impl_expr = model.f_impl_expr
