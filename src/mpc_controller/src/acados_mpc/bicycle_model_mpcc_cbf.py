@@ -54,7 +54,7 @@ def distance2obs_casadi_elliptical(s, n, s_obs, n_obs, a=3.5, b=1.4):
     return ellipse + behind * RELEASE
 
 
-def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
+def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None):
     # define structs
     constraint = types.SimpleNamespace()
     model = types.SimpleNamespace()
@@ -276,7 +276,10 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     # Define initial conditions
     model.x0 = np.array([0, 0, 0, 0, 0, 0, 0])
     ql = 3e-1     ## if this is low, the car starts to lag; theta is further than s
-    qc = 5e-2      # lateral penalty
+    # Lateral penalty.  At 5e-2 this is the second-SMALLEST weight in the cost:
+    # ~80x weaker than the progress reward, so deviation is nearly free until the
+    # corridor bound bites.  Overridable so it can be swept without editing.
+    qc = 5e-2 if qc is None else float(qc)      # lateral penalty
     qa = 9e-1      # Weight for heading error (alpha)
     gamma = 4e-1  ## TODO: Need to check what is the max
     r1 = 1e-1

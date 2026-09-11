@@ -40,6 +40,14 @@ sys.path.insert(0, os.path.join(
 
 def run(args):
     """Drive `episodes` episodes for each seed and collect per-episode records."""
+    # Diagnostics default ON here.  run_mpc_python.sh sets CARLA_MPC_DIAG but the
+    # benchmark invokes python directly, so every benchmark run so far recorded
+    # nothing -- which is why diagnostics/ was empty and the Frenet jump rate
+    # was never measured.  Set before importing the env: MPCController reads the
+    # variable in its constructor.
+    if not args.no_diag:
+        os.environ.setdefault("CARLA_MPC_DIAG", "1")
+
     from mpc_controller.envs.carlaEnv import CarlaMPCEnv
 
     episodes = []
@@ -60,6 +68,7 @@ def run(args):
             max_steps=args.max_steps,
             seed=seed,
             steer_norm_deg=args.steer_norm_deg,
+            qc=args.qc,
             residual_mode='fixed',   # alpha == 1, but action is 0 -> pure MPCC
         )
         interrupted = False
@@ -83,6 +92,7 @@ def run(args):
         'episodes_completed': len(episodes),
         'target_speed': args.target_speed,
         'steer_norm_deg': args.steer_norm_deg,
+        'qc': args.qc,
         'town': args.town,
         'max_steps': args.max_steps,
         'rendered': bool(args.render),
@@ -228,6 +238,7 @@ def write_report(res, path):
     if 'steer_norm_deg' in res:
         g = 70.0 / res['steer_norm_deg']
         L.append(f"  steer norm    : {res['steer_norm_deg']} deg  -> {g:.3f}x feedforward")
+    L.append(f"  qc (lateral)  : {res.get('qc') or 0.05}")
     L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  wall time     : {res['wall_time_s']/60:.1f} min")
     L.append(f"  driven with action = [0, 0]  -> pure MPCC, no RL residual")
@@ -410,6 +421,12 @@ def main():
     ap.add_argument('--steer-norm-deg', type=float, default=45.0,
                     help='steering feedforward: CARLA applies over 70 deg, so 45 '
                          'gives 1.556x gain. SMALLER = MORE steering. 70 = none.')
+    ap.add_argument('--qc', type=float, default=None,
+                    help='lateral tracking weight (default 5e-2 from the model). '
+                         'Higher = holds the path harder.')
+    ap.add_argument('--no-diag', action='store_true',
+                    help='disable solver diagnostics (on by default; writes '
+                         'diagnostics/*.npz for analyze_solver_failures.py)')
     ap.add_argument('--render', action='store_true',
                     help='move the CARLA spectator to follow the ego so you can '
                          'watch; does not affect the metrics')

@@ -78,6 +78,11 @@ class MPCController:
         #   40 deg -> 1.750x   35 deg -> 2.000x  (untested)
         self.steer_norm_deg = 45.0
 
+        # Lateral tracking weight in the OCP cost.  None = the model's own 5e-2.
+        # Raise it to make the car hold the path harder; the overtake gate scales
+        # it by 0.2 during a pass, so both regimes move together.
+        self.qc = None
+
         # Situational speed limits, applied as per-stage bounds on v (the speed
         # bound is already set per stage, so this needs no model change).
         #
@@ -138,7 +143,8 @@ class MPCController:
             coeffs=path_curvature_spline.c,
             knots=path_curvature_spline.t,
             path_msg=path_msg,
-            degree=3
+            degree=3,
+            qc=self.qc,
         )
         
         print("✓ ACADOS solver initialized")

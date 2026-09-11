@@ -44,6 +44,7 @@ class CarlaMPCEnv(gym.Env):
         discrete_actions: bool = False,
         render_mode: Optional[str] = None,
         steer_norm_deg: float = 45.0,
+        qc: float = None,
         residual_mode: str = 'adaptive',
         residual_max: float = 0.1,
     ):
@@ -146,6 +147,7 @@ class CarlaMPCEnv(gym.Env):
         # Steering feedforward gain: CARLA applies steer over 70 deg, so
         # normalising by 45 gives 1.556x.  Smaller => more gain.
         self.steer_norm_deg = steer_norm_deg
+        self.qc = qc          # lateral tracking weight; None = model default (5e-2)
         self.residual_mode = residual_mode
         self.residual_max = residual_max
         self.residual_authority = None   # built in _initialize_mpc()
@@ -808,6 +810,7 @@ class CarlaMPCEnv(gym.Env):
         # Give the controller the ego's real footprint so the corridor margin
         # matches the car actually being driven, not a hardcoded Model 3.
         self.mpc_controller.steer_norm_deg = self.steer_norm_deg
+        self.mpc_controller.qc = self.qc
         try:
             wheels = self.vehicle.get_physics_control().wheels
             real = max(w.max_steer_angle for w in wheels)
