@@ -59,6 +59,7 @@ def run(args):
             target_speed=args.target_speed,
             max_steps=args.max_steps,
             seed=seed,
+            steer_norm_deg=args.steer_norm_deg,
             residual_mode='fixed',   # alpha == 1, but action is 0 -> pure MPCC
         )
         interrupted = False
@@ -81,6 +82,7 @@ def run(args):
         'seeds': list(args.seeds),
         'episodes_completed': len(episodes),
         'target_speed': args.target_speed,
+        'steer_norm_deg': args.steer_norm_deg,
         'town': args.town,
         'max_steps': args.max_steps,
         'rendered': bool(args.render),
@@ -223,6 +225,9 @@ def write_report(res, path):
     L.append(f"  seeds         : {', '.join(str(x) for x in seeds)}"
              f"   ({res.get('episodes_per_seed', '?')} episodes each)")
     L.append(f"  target_speed  : {res['target_speed']} m/s")
+    if 'steer_norm_deg' in res:
+        g = 70.0 / res['steer_norm_deg']
+        L.append(f"  steer norm    : {res['steer_norm_deg']} deg  -> {g:.3f}x feedforward")
     L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  wall time     : {res['wall_time_s']/60:.1f} min")
     L.append(f"  driven with action = [0, 0]  -> pure MPCC, no RL residual")
@@ -384,6 +389,9 @@ def main():
     ap.add_argument('--host', default='localhost')
     ap.add_argument('--port', type=int, default=2000)
     ap.add_argument('--out-dir', default='results')
+    ap.add_argument('--steer-norm-deg', type=float, default=45.0,
+                    help='steering feedforward: CARLA applies over 70 deg, so 45 '
+                         'gives 1.556x gain. SMALLER = MORE steering. 70 = none.')
     ap.add_argument('--render', action='store_true',
                     help='move the CARLA spectator to follow the ego so you can '
                          'watch; does not affect the metrics')

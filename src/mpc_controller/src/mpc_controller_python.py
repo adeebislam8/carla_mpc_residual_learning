@@ -68,6 +68,24 @@ class MPCController:
         # is why the prediction turned while the car went straight.
         # CarlaMPCEnv overwrites this from the spawned actor's physics control.
         self.carla_max_steer = np.deg2rad(70.0)
+
+        # Steering feedforward, expressed as the angle the normalisation divides
+        # by.  CARLA's real max_steer_angle is 70 deg, so dividing by 45 applies
+        # 70/45 = 1.556x the planned steering -- a deliberate understeer
+        # compensation (see solve()).  SMALLER value = MORE gain.
+        #   45 deg -> 1.556x   (current; best measured, 65% collisions)
+        #   70 deg -> 1.000x   (no gain; much worse, 93.3%)
+        #   40 deg -> 1.750x   35 deg -> 2.000x  (untested)
+        self.steer_norm_deg = 45.0
+
+        # Tracking diagnostics: does the PLAN leave the corridor, or does the car
+        # fail to follow a plan that stayed inside it?  Four corridor changes have
+        # now failed to move "outside the corridor" off 64-69%, and raising Zl[2]
+        # tenfold changed nothing -- both consistent with a compliant plan the
+        # vehicle does not execute.  This measures it directly.
+        self.last_pred_n = None      # stage-1 predicted n from the previous solve
+        self.last_track_err = 0.0    # |actual n - previously predicted n|
+        self.last_plan_violation = 0.0  # how far the PLAN leaves the corridor
         self.lateral_clearance = 0.30
 
         # Solver-failure handling.  last_good_control is the most recent control
@@ -327,6 +345,29 @@ class MPCController:
 
         # 9. Extract control from solution
         x0 = self.acados_solver.get(1, "x")
+
+        # One-step tracking error: compare where we actually are against where
+        # the previous solve said we would be after one step.
+        if self.last_pred_n is not None:
+            self.last_track_err = abs(d - self.last_pred_n)
+        self.last_pred_n = float(x0[1])
+
+        # Does the planned trajectory itself leave the corridor?
+        try:
+            worst = 0.0
+            for k in range(1, self.N):
+                n_k = float(self.acados_solver.get(k, "x")[1])
+                worst = max(worst, diag_n_min - n_k, n_k - diag_n_max)
+            self.last_plan_violation = max(0.0, worst)
+        except Exception:
+            self.last_plan_violation = 0.0
+
+        # Amend the record appended before the solve was unpacked; record() runs
+        # earlier so that failed solves are captured too.
+        if self.diagnostics is not None and self.diagnostics.records:
+            self.diagnostics.records[-1].update(
+                track_err=float(self.last_track_err),
+                plan_violation=float(self.last_plan_violation))
         u0 = self.acados_solver.get(1, "u")
         
         # Update control derivatives for next iteration
@@ -344,9 +385,23 @@ class MPCController:
         else:
             throttle = target_D  # Negative for braking
         
-        # Normalise by the ACTUATOR range, not the model's own limit, so that a
-        # planned delta produces that same delta on the vehicle.
-        steering = target_delta / self.carla_max_steer
+        # Normalise by the MODEL's delta_max (45 deg), NOT CARLA's actual
+        # max_steer_angle (70 deg, measured -- see tools/check_steering.py).
+        #
+        # This looks like a units bug and is not.  Dividing by 45 while CARLA
+        # applies over 70 means the vehicle receives 70/45 = 1.556x the planned
+        # steering, and carlaEnv reads the angle back with the same 45 deg, so the
+        # MPC sees exactly what it planned.  The net effect is a constant 1.556x
+        # feedforward gain that compensates the understeer a slip-free kinematic
+        # bicycle cannot predict.
+        #
+        # "Fixing" it to divide by 70 was tried and was much worse: collisions
+        # 83.3% -> 93.3%, success 16.7% -> 6.7%, route completion 44.8% -> 30.8%,
+        # with left-side impacts doubling (16% -> 33.9%) as the car ran wide on
+        # every turn.  The vehicle genuinely needs that extra steering.
+        #
+        # Treat 45.0 as a tunable understeer gain, not a measurement.
+        steering = target_delta / np.deg2rad(self.steer_norm_deg)
         
         # Clip to valid range
         throttle = np.clip(throttle, -1.0, 1.0)

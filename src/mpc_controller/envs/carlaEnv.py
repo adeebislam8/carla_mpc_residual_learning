@@ -43,6 +43,7 @@ class CarlaMPCEnv(gym.Env):
         seed: int = 2547,
         discrete_actions: bool = False,
         render_mode: Optional[str] = None,
+        steer_norm_deg: float = 45.0,
         residual_mode: str = 'adaptive',
         residual_max: float = 0.1,
     ):
@@ -141,6 +142,9 @@ class CarlaMPCEnv(gym.Env):
         )
 
         # ── Residual authority ────────────────────────────────
+        # Steering feedforward gain: CARLA applies steer over 70 deg, so
+        # normalising by 45 gives 1.556x.  Smaller => more gain.
+        self.steer_norm_deg = steer_norm_deg
         self.residual_mode = residual_mode
         self.residual_max = residual_max
         self.residual_authority = None   # built in _initialize_mpc()
@@ -791,6 +795,7 @@ class CarlaMPCEnv(gym.Env):
         
         # Give the controller the ego's real footprint so the corridor margin
         # matches the car actually being driven, not a hardcoded Model 3.
+        self.mpc_controller.steer_norm_deg = self.steer_norm_deg
         try:
             wheels = self.vehicle.get_physics_control().wheels
             real = max(w.max_steer_angle for w in wheels)
@@ -838,10 +843,12 @@ class CarlaMPCEnv(gym.Env):
         else:
             self.current_throttle = control.throttle
         self.current_brake = control.brake
-        # Read the angle back with the SAME constant CARLA uses to apply it.
-        # This was hardcoded to 45 deg while the Model 3's real max_steer_angle
-        # is 70 deg, so the MPC's delta state was wrong by 1.556x.
-        self.current_steering = control.steer * self._carla_max_steer
+        # Read back with the MODEL's 45 deg, matching how the command was
+        # produced, so the MPC's delta state equals what it planned.  See the
+        # long comment in mpc_controller_python.solve(): the 45-vs-70 mismatch is
+        # a deliberate 1.556x understeer gain, and removing it was much worse.
+        self.current_steering = control.steer * np.deg2rad(
+            self.mpc_controller.steer_norm_deg if self.mpc_controller else 45.0)
 
         angular_velocity = self.vehicle.get_angular_velocity()
         yaw_rate = np.deg2rad(angular_velocity.z)

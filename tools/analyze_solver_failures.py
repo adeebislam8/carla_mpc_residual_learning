@@ -84,12 +84,19 @@ CHECKS = {
         lambda d: (d["n_active_obs"] > 0)
         & ((d["n"] < d["n_min"] + 0.5) | (d["n"] > d["n_max"] - 0.5)),
         "avoiding an obstacle while pressed against the road edge"),
+    "PLAN leaves corridor": (
+        lambda d: d["plan_violation"] > 0.05,
+        "the planned trajectory itself exits the corridor -> a constraint problem"),
+    "tracking err > 0.2 m/step": (
+        lambda d: d["track_err"] > 0.2,
+        "the car is not following its own plan -> a model/actuation problem"),
     "|kappa| > 0.05": (
         lambda d: np.abs(d["kappa"]) > 0.05,
         "high path curvature"),
 }
 
-STATE_KEYS = ["s", "n", "alpha", "v", "D", "delta", "kappa", "denom",
+STATE_KEYS = ["track_err", "plan_violation",
+              "s", "n", "alpha", "v", "D", "delta", "kappa", "denom",
               "denom_min_abs", "barrier_min", "prop_s_jump", "n_active_obs",
               "n_min", "n_max", "n_slack"]
 
