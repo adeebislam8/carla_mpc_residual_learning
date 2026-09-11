@@ -92,9 +92,17 @@ class MPCController:
         #    command grows, and it diverges instead of recovering.  Capping speed
         #    while off-path makes the correction executable.
         # Set either to None to disable.
-        self.curvature_speed_limit = True
-        self.recover_n_threshold = 2.5    # m off-path before the cap applies
-        self.recover_speed_cap = 6.0      # m/s while recovering
+        self.curvature_speed_limit = False   # OFF: not in the 65% baseline
+        self.recover_speed_cap = None     # OFF: not in the 65% baseline (6.0 to enable)
+        self.recover_margin = 0.5         # m OUTSIDE the corridor before it fires
+        #
+        # NOTE: this used to trigger on abs(n) > 2.5, which collided exactly with
+        # n_overtake = -2.5 in the cost -- so reaching the intended overtaking
+        # position was treated as an off-road emergency and the car braked
+        # alongside the vehicle it was passing.  At cap 0 it floored to the 1 m/s
+        # minimum and overtaking stopped completely (overtakes 0.88 -> 0.20,
+        # timeouts 0% -> 33%).  Being offset WITHIN the corridor is deliberate;
+        # only being outside it is an emergency.
 
         # Tracking diagnostics: does the PLAN leave the corridor, or does the car
         # fail to follow a plan that stayed inside it?  Four corridor changes have
@@ -286,9 +294,11 @@ class MPCController:
                             float(np.sqrt(self.constraint.alat_max / k_pred)))
                 except Exception:
                     pass
-            if (self.recover_speed_cap is not None
-                    and abs(d) > self.recover_n_threshold):
-                v_stage_max = min(v_stage_max, self.recover_speed_cap)
+            if self.recover_speed_cap is not None:
+                off_corridor = (d < n_min_adaptive - self.recover_margin
+                                or d > n_max_adaptive + self.recover_margin)
+                if off_corridor:
+                    v_stage_max = min(v_stage_max, self.recover_speed_cap)
             v_stage_max = max(v_stage_max, 1.0)   # never demand a full stop
 
             lh_constraints = np.array([

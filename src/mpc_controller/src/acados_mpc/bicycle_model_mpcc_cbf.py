@@ -357,7 +357,11 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     # Diagnostics confirmed the gate itself fires correctly (slot 0 held a
     # trailing obstacle 0.0% of the time; gate active 100% within its window),
     # so the gate was never the problem -- its target was.
-    n_overtake = -3.5   # left lane centre; n_min is -4.8, so this fits with margin
+    # -2.5, not -3.5: the barrier only demands |dn| >= b_lat*d_safe = 2.0 m, so
+    # -3.5 pulled 1.5 m wider than necessary and left just 1.3 m to the corridor
+    # edge.  -2.5 keeps 0.5 m over the barrier floor and 2.3 m to the edge.
+    # This is the value the 65% baseline was measured with.
+    n_overtake = -2.5
     n_ref = n_overtake * overtake_gate
 
     # closest_distance = fmin(dist_obs1, fmin(dist_obs2, fmin(dist_obs3, fmin(dist_obs4, fmin(dist_obs5, dist_obs6)))))
