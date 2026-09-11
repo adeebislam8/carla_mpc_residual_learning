@@ -90,12 +90,19 @@ CHECKS = {
     "tracking err > 0.2 m/step": (
         lambda d: d["track_err"] > 0.2,
         "the car is not following its own plan -> a model/actuation problem"),
+    "n JUMPED (>2x possible)": (
+        lambda d: d["dn_over_physical"] > 2.0,
+        "n moved further in one step than the car can travel sideways -- the "
+        "Frenet converter lost the path, so s/d/kappa/corridor are all garbage"),
+    "n jumped (>1x possible)": (
+        lambda d: d["dn_over_physical"] > 1.0,
+        "n moved further than lateral speed allows"),
     "|kappa| > 0.05": (
         lambda d: np.abs(d["kappa"]) > 0.05,
         "high path curvature"),
 }
 
-STATE_KEYS = ["track_err", "plan_violation",
+STATE_KEYS = ["dn", "dn_over_physical", "track_err", "plan_violation",
               "s", "n", "alpha", "v", "D", "delta", "kappa", "denom",
               "denom_min_abs", "barrier_min", "prop_s_jump", "n_active_obs",
               "n_min", "n_max", "n_slack"]
@@ -116,6 +123,16 @@ def load(paths):
         with np.load(f) as z:
             for k in z.files:
                 cols.setdefault(k, []).append(z[k])
+            # Step-to-step jump in n, computed WITHIN a file so episode
+            # boundaries are not differenced together.  Lateral speed cannot
+            # exceed v, so |dn| > v*dt is not motion -- it is the Frenet
+            # converter losing the path (_find_closest_s samples the whole path
+            # at only 100 points and Newton-refines from there).
+            n, v = z['n'], z['v']
+            dn = np.abs(np.diff(n, prepend=n[0]))
+            cols.setdefault('dn', []).append(dn)
+            cols.setdefault('dn_over_physical', []).append(
+                dn / np.maximum(v * 0.05, 1e-6))
     merged = {k: np.concatenate(v, axis=0) for k, v in cols.items()}
 
     # How far n is outside its bounds (0 when inside).  This is the quantity the
@@ -203,6 +220,18 @@ def main():
             print(f"   qp_stat {int(code)} among failures: "
                   f"{int((d['qp_stat'][fail] == code).sum())}")
     print("=" * 72)
+
+    if "dn_over_physical" in d:
+        r = d["dn_over_physical"]
+        print("\nFRENET CONVERTER HEALTH")
+        print("-" * 72)
+        for thr in (1.0, 2.0, 5.0):
+            k = int((r > thr).sum())
+            print(f"  |dn| > {thr:4.1f}x the physically possible step:"
+                  f"  {k:6d}  ({100*k/len(r):5.2f}%)")
+        print(f"  worst single step: {np.nanmax(r):.1f}x possible"
+              f"  (|dn| = {np.nanmax(d['dn']):.2f} m)")
+        print("  Anything above ~1x is the converter jumping, not the car moving.")
 
     overtaking_report(d)
 

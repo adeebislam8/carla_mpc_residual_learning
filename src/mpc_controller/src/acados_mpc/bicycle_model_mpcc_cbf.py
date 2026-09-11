@@ -364,10 +364,26 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True):
     n_overtake = -2.5
     n_ref = n_overtake * overtake_gate
 
+    # Saturating lateral cost (pseudo-Huber) instead of a raw square.
+    #
+    # qc*(n - n_ref)^2 has a gradient of 2*qc*e that grows without bound, so once
+    # the car is several metres off the path the cost demands a correction the
+    # tyres cannot deliver at speed.  It deviates further, e grows, the demand
+    # grows -- a divergence, which is the "panic" seen after leaving the road.
+    #
+    #     2*D^2*(sqrt(1 + (e/D)^2) - 1)
+    #
+    # is identical to e^2 for |e| << D and becomes linear beyond, so the gradient
+    # saturates at 2*D.  Normal lane keeping and overtaking (|e| <= 2.5 m) are
+    # unchanged; only far-off-path recovery is bounded.  D is the knee.
+    HUBER_D = 3.0
+    e_lat = n - n_ref
+    lat_cost = 2.0 * HUBER_D**2 * (sqrt(1.0 + (e_lat / HUBER_D)**2) - 1.0)
+
     # closest_distance = fmin(dist_obs1, fmin(dist_obs2, fmin(dist_obs3, fmin(dist_obs4, fmin(dist_obs5, dist_obs6)))))
     model.cost_expr_ext_cost = (
         (ql * (s - theta) ** 2)
-        + qc * (1 - 0.8 * overtake_gate) * (n - n_ref)**2
+        + qc * (1 - 0.8 * overtake_gate) * lat_cost
         + qa * alpha**2
         - gamma * derTheta * fmax(0, sign(path_length - s - DIST2STOP))
         + r1 * derD**2 * fmax(0, sign(path_length - s - DIST2STOP))
