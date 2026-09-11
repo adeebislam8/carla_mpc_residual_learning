@@ -381,6 +381,14 @@ class MPCController:
                            for i in range(self.N + 1)],
                 solver=self.acados_solver,
             )
+            # Stamp the tracking fields immediately.  They are only *computed*
+            # after a successful solve, but a failed solve returns early via the
+            # fallback, so without this the record would lack them entirely and
+            # SolverDiagnostics.save() would raise KeyError when it took its
+            # column names from the first (successful) record.
+            if self.diagnostics.records:
+                self.diagnostics.records[-1].setdefault('track_err', np.nan)
+                self.diagnostics.records[-1].setdefault('plan_violation', np.nan)
 
         if status != 0:
             # print(f"\n{'='*50}")

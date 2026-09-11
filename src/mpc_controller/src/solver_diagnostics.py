@@ -225,8 +225,17 @@ class SolverDiagnostics:
         os.makedirs(self.out_dir, exist_ok=True)
         path = os.path.join(self.out_dir, f"{tag}_{int(time.time())}.npz")
 
-        keys = [k for k in self.records[0] if k not in ("propagated_x", "obstacles")]
-        cols = {k: np.array([r[k] for r in self.records]) for k in keys}
+        # Union of keys, not just the first record's: some fields are attached
+        # conditionally (the tracking metrics only exist after a successful
+        # solve), and taking column names from records[0] raised KeyError as soon
+        # as a later record lacked one.  Missing values become NaN, which the
+        # analyzer already handles via nan-aware statistics.
+        keys = set()
+        for r in self.records:
+            keys.update(r)
+        keys -= {"propagated_x", "obstacles"}
+        cols = {k: np.array([r.get(k, np.nan) for r in self.records])
+                for k in sorted(keys)}
         cols["propagated_x"] = np.stack([r["propagated_x"] for r in self.records])
         cols["obstacles"] = np.stack([r["obstacles"] for r in self.records])
 
