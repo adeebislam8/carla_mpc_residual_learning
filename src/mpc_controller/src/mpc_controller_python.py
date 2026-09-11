@@ -179,33 +179,28 @@ class MPCController:
             # Predict arc length at timestep i
             s_pred = s + self.target_speed * (self.Tf / self.N) * i
             
-            # Lateral margin from the vehicle's actual footprint, not a constant.
+            # Constant margin.  A heading-aware margin
+            #     (L/2)|sin a| + (W/2)|cos a| + clearance
+            # was tried and REVERTED: collisions 75% -> 83.3%, success 25% ->
+            # 16.7%, route completion 56.3% -> 44.8%.  Two reasons it failed.
             #
-            # The corridor constrains the vehicle CENTRE, so a fixed 1.2 m margin
-            # is only correct when the car is aligned with the path.  The lateral
-            # extent of a rotated rectangle is
-            #     (L/2)|sin a| + (W/2)|cos a|
-            # which is 0.93 m at a = 0 but 1.94 m at a = 0.5 rad and 2.44 m at
-            # 0.94 rad -- and 0.94 rad was the peak heading error at collisions.
-            # The corners were swinging outside a corridor the solver believed it
-            # was respecting, worst while turning through junctions, which is
-            # where ~90% of collisions land.
+            # (1) right_width is only ~2.0 m (half a lane; Town01 has no right
+            #     lane), so past a ~0.4 rad heading error the margin exceeded it
+            #     and n_max went NEGATIVE -- the constraint then *required* the
+            #     car to sit left of its own lane centre.  The inversion guard
+            #     below never caught it because n_min < n_max throughout; the
+            #     corridor stayed ordered and simply migrated off-lane.
+            # (2) the per-stage heading came from the previous solution, so the
+            #     bounds swung on every solve during a turn.  A fast time-varying
+            #     hard bound destabilises SQP_RTI, which takes one warm-started
+            #     iteration.
             #
-            # The heading error is taken per stage from the previous solution, so
-            # the margin widens over exactly the part of the horizon that is
-            # turning instead of inflating the whole corridor.  At a = 0 this
-            # gives 0.93 + 0.30 = 1.23 m, i.e. unchanged on straights.
-            try:
-                alpha_pred = float(self.acados_solver.get(i, "x")[2])
-                if not np.isfinite(alpha_pred):
-                    alpha_pred = alpha
-            except Exception:
-                alpha_pred = alpha
-
-            half_extent = (0.5 * self.veh_length * abs(np.sin(alpha_pred))
-                           + 0.5 * self.veh_width * abs(np.cos(alpha_pred)))
-            safety_margin = half_extent + self.lateral_clearance
-
+            # The wider lesson from three attempts (Zl[2], junction width, this):
+            # tightening the corridor never helped, and "outside the corridor"
+            # stayed at 64-69% of collisions through every configuration.  The car
+            # is not violating a corridor it can see -- it is failing to TRACK the
+            # trajectory it planned.  That is model mismatch, not a constraint.
+            safety_margin = 1.2
             if road_widths is not None and road_width_s is not None and len(road_widths) > 0:
                 idx = np.argmin(np.abs(road_width_s - s_pred))
                 n_min_adaptive = -road_widths[idx, 0] + safety_margin   # negative = world left
