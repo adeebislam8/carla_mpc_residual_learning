@@ -83,6 +83,9 @@ def run(args):
         'target_speed': args.target_speed,
         'town': args.town,
         'max_steps': args.max_steps,
+        'rendered': bool(args.render),
+        'camera': args.camera if args.render else None,
+        'slowdown': args.slowdown,
         'wall_time_s': time.time() - t_start,
         'per_episode': episodes,
     }
@@ -103,6 +106,15 @@ def _run_seed(env, args, seed, episodes):
             n_hist.append(float(env.current_d))
             v_hist.append(float(env.current_speed))
             steps += 1
+
+            # Watching costs nothing measurable: render() only repositions the
+            # spectator, and CARLA runs in synchronous mode with a fixed
+            # delta, so neither the camera nor --slowdown changes the physics.
+            # Metrics stay comparable between rendered and unrendered runs.
+            if args.render:
+                env.render(camera_mode=args.camera)
+                if args.slowdown > 0:
+                    time.sleep(args.slowdown)
 
         rec = {
             'seed': seed,
@@ -214,6 +226,9 @@ def write_report(res, path):
     L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  wall time     : {res['wall_time_s']/60:.1f} min")
     L.append(f"  driven with action = [0, 0]  -> pure MPCC, no RL residual")
+    if res.get('rendered'):
+        L.append(f"  rendered      : yes ({res.get('camera')}), slowdown "
+                 f"{res.get('slowdown')} s/step -- physics unaffected")
     L.append("")
 
     if not s:
@@ -369,6 +384,15 @@ def main():
     ap.add_argument('--host', default='localhost')
     ap.add_argument('--port', type=int, default=2000)
     ap.add_argument('--out-dir', default='results')
+    ap.add_argument('--render', action='store_true',
+                    help='move the CARLA spectator to follow the ego so you can '
+                         'watch; does not affect the metrics')
+    ap.add_argument('--camera', default='follow',
+                    choices=['follow', 'top_down', 'side', 'first_person'],
+                    help='spectator view when --render is set (default: follow)')
+    ap.add_argument('--slowdown', type=float, default=0.0, metavar='SEC',
+                    help='sleep this long per step so the run is watchable '
+                         '(0.02 is comfortable); does not affect the metrics')
     ap.add_argument('--compare', nargs='+', metavar='JSON',
                     help='compare previously saved runs instead of driving')
     args = ap.parse_args()

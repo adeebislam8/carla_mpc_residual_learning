@@ -1301,6 +1301,8 @@ class CarlaMPCEnv(gym.Env):
                 self._draw_vehicle_info()
             
             self._draw_road_boundaries_ahead()
+            # --- comment either line out to remove the overlay -------------
+            self._visualize_vehicle_footprint()   # white box + green/red edges
             # self._visualize_detected_obstacles()
             # self._visualize_lidar_obstacles()
             self._visualize_cbf_ellipses()
@@ -1652,6 +1654,72 @@ class CarlaMPCEnv(gym.Env):
             #     color=carla.Color(255, 255, 0),
             #     life_time=0.15
             # )
+
+    def _visualize_vehicle_footprint(self, life_time=0.15):
+        """
+        Draw the ego's real bounding box AND the lateral extent the corridor
+        constraint actually reasons about, so "the box must not exceed the lane"
+        can be checked by eye.
+
+        The constraint is on the vehicle CENTRE with a margin of
+            (L/2)|sin a| + (W/2)|cos a| + clearance
+        so what matters is not the box itself but where its left/right edges land
+        relative to the corridor.  Those edges are drawn as points in the Frenet
+        frame at the ego's current s:
+
+            GREEN  edge is inside the corridor  -> constraint holding
+            RED    edge is outside              -> the corner is over the line
+
+        Compare the coloured points against the blue corridor dots from
+        _draw_road_boundaries_ahead(): green points should always sit inside them.
+        A red point with the solver reporting success means the margin is still
+        under-sized for that heading error.
+        """
+        if self.vehicle is None or self.frenet_converter is None:
+            return
+        if self._road_widths is None or self._road_width_s is None:
+            return
+
+        try:
+            debug = self.world.debug
+            tf = self.vehicle.get_transform()
+
+            # 1. the actual CARLA bounding box, for reference
+            bb = self.vehicle.bounding_box
+            debug.draw_box(
+                carla.BoundingBox(tf.transform(bb.location), bb.extent),
+                tf.rotation,
+                thickness=0.04,
+                color=carla.Color(255, 255, 255),
+                life_time=life_time,
+            )
+
+            # 2. the modelled lateral extent, using the SAME formula the
+            #    controller applies when it sizes the margin
+            mpc = self.mpc_controller
+            L = getattr(mpc, 'veh_length', 2.0 * bb.extent.x * 2.0)
+            W = getattr(mpc, 'veh_width', 2.0 * bb.extent.y * 2.0)
+            clearance = getattr(mpc, 'lateral_clearance', 0.30)
+            a = self.current_alpha
+            half = 0.5 * L * abs(np.sin(a)) + 0.5 * W * abs(np.cos(a))
+
+            idx = np.argmin(np.abs(self._road_width_s - self.current_s))
+            n_min = -self._road_widths[idx, 0]
+            n_max = self._road_widths[idx, 1]
+
+            for sign in (-1.0, +1.0):
+                n_edge = self.current_d + sign * half
+                # the constraint also demands `clearance` beyond the edge
+                inside = (n_edge - clearance >= n_min) if sign < 0 else \
+                         (n_edge + clearance <= n_max)
+                colour = carla.Color(0, 255, 0) if inside else carla.Color(255, 0, 0)
+                x, y, _ = self.frenet_converter.frenet_to_world(
+                    self.current_s, n_edge, 0.0)
+                debug.draw_point(
+                    carla.Location(x=x, y=y, z=1.2),
+                    size=0.12, color=colour, life_time=life_time)
+        except Exception:
+            pass
 
     def _visualize_detected_obstacles(self):
         """Visualize obstacles with different colors based on detection method"""
