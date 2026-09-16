@@ -51,8 +51,8 @@ class CarlaMPCEnv(gym.Env):
         gate_depth: float = None,
         route_min_m: float = 50.0,
         route_max_m: float = None,
-        npc_min: int = 3,
-        npc_max: int = 10,
+        npc_min: int = 0,
+        npc_max: int = 7,
         lookahead: float = None,
         r3_cap: float = None,
         residual_mode: str = 'adaptive',
@@ -206,10 +206,11 @@ class CarlaMPCEnv(gym.Env):
         # route_max_m caps the actual path length, not the straight-line gap.
         self.route_min_m = route_min_m
         self.route_max_m = route_max_m
-        # NPC count per episode, drawn from the per-episode RNG.  Was 0-7, which
-        # on a bounded 150 m route could leave an episode with no traffic at all
-        # -- and no traffic means no CBF activity, so nothing for the adaptive
-        # authority to act on.  Raising the floor guarantees interactions.
+        # NPC count per episode, drawn from the per-episode RNG.  3-10 was tried
+        # and reverted: on a bounded 150 m route only ~10 cars fit at all
+        # (min_gap 12 m over 130 m of usable length), so the high end packs the
+        # road solid and the NPCs interact with each other unpredictably rather
+        # than with the ego.
         self.npc_min = npc_min
         self.npc_max = npc_max
         self.gate_depth = gate_depth
@@ -743,7 +744,27 @@ class CarlaMPCEnv(gym.Env):
         for _ in range(num_cars):
             spawned = False
             for _try in range(50):
-                s = rng.uniform(2.0, self.path_length - 5.0)
+                # Spawn only where the ego can actually reach the NPC.
+                #
+                # The ego closes at (v_ego - v_npc); the NPC retires at
+                # path_length - goal_margin_m.  An encounter therefore needs
+                #     s / (v_ego - v_npc)  <  (L - margin - s) / v_npc
+                # which rearranges to
+                #     s  <  (L - margin) * (v_ego - v_npc) / v_ego
+                # With v_ego ~ 10 m/s achieved and NPCs at 4-6 m/s that is about
+                # half the route.  The old range was uniform(2, L - 5), so ~52%
+                # of NPCs were placed beyond the catchable point: they drove to
+                # the end, retired, teleported behind the ego and were never
+                # seen.  Episodes could contain traffic the ego never met.
+                #
+                # Trade-off: confining spawns to the first half also halves the
+                # length available for packing, so requesting 7 cars on a short
+                # route will yield fewer (min_gap is 12 m).
+                CATCHABLE_FRAC = 0.5
+                s_spawn_max = max(
+                    10.0,
+                    (self.path_length - self.goal_margin_m) * CATCHABLE_FRAC)
+                s = rng.uniform(2.0, s_spawn_max)
                 ds = s - self.current_s
                 if ds < ego_buffer:
                     continue

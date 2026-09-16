@@ -71,8 +71,12 @@ def run(args):
             guess = os.path.join(os.path.dirname(args.model), 'vecnormalize.pkl')
             vn = guess if os.path.exists(guess) else None
         if vn:
-            from stable_baselines3.common.vec_env import VecNormalize
-            obs_norm = VecNormalize.load(vn, venv=None)
+            # VecNormalize.load() calls set_venv(), which dereferences the venv
+            # -- passing None raises AttributeError.  Unpickle directly instead:
+            # normalize_obs() only needs obs_rms and clip_obs, not a live env.
+            import pickle
+            with open(vn, 'rb') as _f:
+                obs_norm = pickle.load(_f)
             obs_norm.training = False
             print(f"  applying observation normalisation from {vn}")
         else:
@@ -234,6 +238,16 @@ def summarize(res):
     def mean(key):
         return statistics.mean(e[key] for e in eps)
 
+    # Distance-normalised rates.  Episode-level success depends on route length
+    # -- an episode is pass/fail over the whole route, so bounding routes at
+    # 150 m mechanically raises it.  Per-km rates do not, which makes them the
+    # defensible headline when the route bound is an experimental choice rather
+    # than a claim.  They are also directly comparable against literature using
+    # different route lengths.
+    km = sum(e['progress_m'] for e in eps) / 1000.0
+    n_coll = sum(1 for e in eps if e['outcome'] == 'collision')
+    n_ovt = sum(e['overtakes'] for e in eps)
+
     finished = [e for e in eps if e['outcome'] == 'success']
     return {
         'n_episodes': n,
@@ -251,6 +265,9 @@ def summarize(res):
         'mean_solver_failure_rate': mean('solver_failure_rate'),
         'mean_lap_time_success': (statistics.mean(e['lap_time_s'] for e in finished)
                                   if finished else float('nan')),
+        'km_driven': km,
+        'collisions_per_km': (n_coll / km) if km > 0 else float('nan'),
+        'overtakes_per_km': (n_ovt / km) if km > 0 else float('nan'),
     }
 
 
@@ -263,6 +280,8 @@ PAPER_METRICS = [
     ('Mean speed (m/s)',        'mean_speed',                 1.0),
     ('Lap time, success (s)',   'mean_lap_time_success',      1.0),
     ('Solver failure (%)',      'mean_solver_failure_rate', 100.0),
+    ('Collisions per km',       'collisions_per_km',          1.0),
+    ('Overtakes per km',        'overtakes_per_km',           1.0),
 ]
 
 
@@ -348,6 +367,11 @@ def write_report(res, path):
                      f"  ({min(_pl):.0f}-{max(_pl):.0f} m)")
         L.append(f"  mean speed               {s['mean_speed']:8.2f} m/s")
         L.append(f"  mean lap time (success)  {s['mean_lap_time_success']:8.2f} s")
+        L.append("")
+        L.append("  LENGTH-NORMALISED (independent of the route bound)")
+        L.append(f"  distance driven          {s['km_driven']:8.2f} km")
+        L.append(f"  collisions per km        {s['collisions_per_km']:8.2f}")
+        L.append(f"  overtakes per km         {s['overtakes_per_km']:8.2f}")
         L.append("")
         L.append("LATERAL USE  (expected to RISE if the overtake attractor works)")
         L.append("-" * 72)
@@ -459,6 +483,8 @@ def compare(paths):
         ('mean max |n| m', 'mean_max_abs_n', 1.0, 'rise expected'),
         ('steps |n|>2 %', 'mean_frac_n_gt2', 100.0, 'rise expected'),
         ('solver failure %', 'mean_solver_failure_rate', 100.0, 'secondary'),
+        ('collisions / km', 'collisions_per_km', 1.0, 'LOWER better, length-indep'),
+        ('overtakes / km', 'overtakes_per_km', 1.0, 'higher better, length-indep'),
     ]
 
     L = ["=" * 78, "MPCC CONFIGURATION COMPARISON", "=" * 78, ""]
@@ -548,9 +574,9 @@ def main():
     ap.add_argument('--vecnormalize', default=None,
                     help='path to vecnormalize.pkl from training. Auto-detected '
                          'next to --model if not given.')
-    ap.add_argument('--npc-min', type=int, default=3,
+    ap.add_argument('--npc-min', type=int, default=0,
                     help='minimum NPC vehicles per episode (default 3)')
-    ap.add_argument('--npc-max', type=int, default=10,
+    ap.add_argument('--npc-max', type=int, default=7,
                     help='maximum NPC vehicles per episode (default 10)')
     ap.add_argument('--no-diag', action='store_true',
                     help='disable solver diagnostics (on by default; writes '

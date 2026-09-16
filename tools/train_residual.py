@@ -76,8 +76,8 @@ def main():
     ap.add_argument('--r3-cap', type=float, default=None)
     ap.add_argument('--route-min', type=float, default=50.0)
     ap.add_argument('--route-max', type=float, default=None)
-    ap.add_argument('--npc-min', type=int, default=3)
-    ap.add_argument('--npc-max', type=int, default=10)
+    ap.add_argument('--npc-min', type=int, default=0)
+    ap.add_argument('--npc-max', type=int, default=7)
     ap.add_argument('--target-speed', type=float, default=15.0)
     ap.add_argument('--max-steps', type=int, default=1500)
     ap.add_argument('--town', default='Town01')
@@ -108,8 +108,19 @@ def main():
         # usually matters more than the choice of algorithm.
         env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
+    # tensorboard_log raises ImportError at learn() time if tensorboard is not
+    # installed -- and because the save happens in a `finally`, that produced an
+    # UNTRAINED model on disk that looked like a successful run.
+    try:
+        import tensorboard  # noqa: F401
+        tb = os.path.join(out, 'tb')
+    except ImportError:
+        tb = None
+        print("tensorboard not installed -- logging to CSV only "
+              "(pip install tensorboard to enable)")
+
     common = dict(policy='MlpPolicy', env=env, verbose=1, seed=args.seed,
-                  tensorboard_log=os.path.join(out, 'tb'),
+                  tensorboard_log=tb,
                   policy_kwargs=dict(net_arch=[256, 256]))
 
     if args.algo == 'sac':
@@ -136,17 +147,28 @@ def main():
     ckpt = CheckpointCallback(save_freq=25_000, save_path=out,
                               name_prefix=args.label)
     print(f"\n=== training {args.algo.upper()} for {args.timesteps} steps -> {out}\n")
+    trained = False
     try:
         model.learn(total_timesteps=args.timesteps, callback=[ckpt],
                     progress_bar=True)
+        trained = True
     except KeyboardInterrupt:
         print("\ninterrupted -- saving what we have")
+        trained = True
+    except Exception as e:
+        # Do NOT save on an unexpected failure: a randomly-initialised policy
+        # written to final.zip is indistinguishable from a trained one and gets
+        # silently evaluated later.
+        print(f"\nTRAINING FAILED: {e!r}")
+        trained = False
+        raise
     finally:
-        model.save(os.path.join(out, 'final'))
-        if not args.no_normalize:
-            env.save(os.path.join(out, 'vecnormalize.pkl'))
+        if trained:
+            model.save(os.path.join(out, 'final'))
+            if not args.no_normalize:
+                env.save(os.path.join(out, 'vecnormalize.pkl'))
+            print(f"\nsaved -> {os.path.join(out, 'final.zip')}")
         env.close()
-        print(f"\nsaved -> {os.path.join(out, 'final.zip')}")
 
 
 if __name__ == '__main__':
