@@ -14,7 +14,8 @@ from typing import List, Tuple
 
 
 class PathPlanner:
-    def __init__(self, world: carla.World, carla_map: carla.Map, sampling_resolution: float = 1.0):
+    def __init__(self, world: carla.World, carla_map: carla.Map, sampling_resolution: float = 1.0,
+                 junction_margin: float = 4.0):
         """
         Args:
             world: CARLA world object
@@ -24,6 +25,7 @@ class PathPlanner:
         self.world = world
         self.map = carla_map
         self.grp = GlobalRoutePlanner(carla_map, sampling_resolution)
+        self.junction_margin = float(junction_margin)
     
     def calculate_route(
         self, 
@@ -64,10 +66,14 @@ class PathPlanner:
         # so the allowance must not go to zero -- but it should not reach the corner
         # either.  JUNCTION_MARGIN is the knob: raise it if turns become infeasible,
         # lower it if the car still clips corners.
-        JUNCTION_MARGIN = 4.0   # reverted: 1.5 made things worse (65% -> 75% collisions,
-                                #  overtakes 0.93 -> 0.63) while outside-corridor stayed
-                                #  at ~69%, i.e. narrowing the corridor never addressed
-                                #  why the car leaves it
+        # Set from --junction-margin.  1.5 was tried alone and regressed
+        # (65% -> 75% collisions) while outside-corridor stayed at ~69%.  That
+        # reads as a failed idea but is more likely the right fix in the wrong
+        # order: narrowing the corridor while alat_max is still soft at 1e-3
+        # only makes the plan MORE infeasible.  The two are confounded, which is
+        # why the 2x2 sweeps them together -- 48.4% of Town01 collisions happen
+        # INSIDE the corridor, i.e. against furniture this margin reaches into.
+        JUNCTION_MARGIN = self.junction_margin
         SHOULDER = 0.3          # genuinely no lane: road edge, keep tight
 
         left_lane = waypoint.get_left_lane()

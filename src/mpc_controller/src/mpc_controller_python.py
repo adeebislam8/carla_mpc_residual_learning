@@ -134,6 +134,11 @@ class MPCController:
         self.solve_failures = 0
         self.solve_calls = 0
 
+        # Slack weight on the lateral-acceleration row of con_h.  None keeps the
+        # historical (1e-3, 1e-3), which makes alat_max decorative -- see the
+        # comment in acados_settings_mpcc.py.  Set by the env from --alat-slack.
+        self.alat_slack = None
+
         # Records solver inputs so failures can be attributed instead of
         # guessed at.  Off unless CARLA_MPC_DIAG=1.
         self.diagnostics = SolverDiagnostics()
@@ -157,6 +162,7 @@ class MPCController:
             gate_depth=self.gate_depth,
             lookahead=self.lookahead,
             r3_cap=self.r3_cap,
+            alat_slack=self.alat_slack,
         )
         
         print("✓ ACADOS solver initialized")

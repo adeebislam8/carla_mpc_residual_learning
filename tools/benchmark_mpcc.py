@@ -113,6 +113,8 @@ def run(args):
             lookahead=args.lookahead,
             r3_cap=args.r3_cap,
             residual_mode=args.residual_mode,
+            alat_slack=args.alat_slack,
+            junction_margin=args.junction_margin,
         )
         interrupted = False
         try:
@@ -144,6 +146,8 @@ def run(args):
         'b_lat': args.b_lat,
         'apex_gain': args.apex_gain,
         'gate_depth': args.gate_depth,
+        'alat_slack': args.alat_slack,
+        'junction_margin': args.junction_margin,
         'route_min': args.route_min,
         'route_max': args.route_max,
         'npc_min': args.npc_min,
@@ -210,6 +214,17 @@ def _run_seed(env, args, seed, episodes, model=None, obs_norm=None):
             'collision_speed': info.get('collision_speed'),
             'collision_off_corridor': info.get('collision_off_corridor'),
             'collision_in_fallback': info.get('collision_in_fallback'),
+            'collision_kappa': info.get('collision_kappa'),
+            # Residual authority (spec S17.2).  _authority_metrics() has always
+            # computed these and step() has always attached them -- this
+            # whitelist dropped them, exactly like collision_kappa, so no run has
+            # ever recorded what alpha_safe actually did.  Without them b5 vs b2
+            # cannot distinguish "the authority never engaged" from "the
+            # authority engaged and hurt".
+            'alpha_mean': info.get('alpha_mean'),
+            'authority_interventions': info.get('authority_interventions'),
+            'strong_suppression_frac': info.get('strong_suppression_frac'),
+            'nominal_infeasible': info.get('nominal_infeasible'),
         }
         episodes.append(rec)
         # Inline progress: episodes done / total for this seed, a coarse bar, and
@@ -268,7 +283,19 @@ def summarize(res):
         'km_driven': km,
         'collisions_per_km': (n_coll / km) if km > 0 else float('nan'),
         'overtakes_per_km': (n_ovt / km) if km > 0 else float('nan'),
+        # nan-safe: absent on b0 runs, which never construct an authority.
+        'mean_alpha': _omean(eps, 'alpha_mean'),
+        'mean_interventions': _omean(eps, 'authority_interventions'),
+        'mean_strong_suppression': _omean(eps, 'strong_suppression_frac'),
+        'frac_nominal_infeasible': _omean(eps, 'nominal_infeasible'),
     }
+
+
+def _omean(eps, key):
+    """Mean over episodes that actually carry `key`; nan when none do."""
+    vals = [float(e[key]) for e in eps
+            if e.get(key) is not None and e[key] == e[key]]
+    return (sum(vals) / len(vals)) if vals else float('nan')
 
 
 PAPER_METRICS = [
@@ -282,6 +309,8 @@ PAPER_METRICS = [
     ('Solver failure (%)',      'mean_solver_failure_rate', 100.0),
     ('Collisions per km',       'collisions_per_km',          1.0),
     ('Overtakes per km',        'overtakes_per_km',           1.0),
+    ('Mean authority alpha',    'mean_alpha',                 1.0),
+    ('Strong suppression (%)',  'mean_strong_suppression',  100.0),
 ]
 
 
@@ -333,6 +362,10 @@ def write_report(res, path):
     _r3 = res.get('r3_cap') or 3e-2
     L.append(f"  corner slowdown: lookahead {_la} m, r3_cap {_r3}"
              f"  -> derTheta {0.4/(2*0.015):.1f} straight / {0.4/(2*_r3):.1f} in a bend")
+    _as = res.get('alat_slack')
+    L.append(f"  alat slack    : {_as if _as is not None else '1e-3 (decorative)'}"
+             f"   vs corridor 1e3")
+    L.append(f"  junction margin: {res.get('junction_margin', 4.0)} m extra left width")
     L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  route length  : {res.get('route_min', 50)} m min, "
              f"{res.get('route_max') or 'unbounded'} m max")
@@ -378,6 +411,21 @@ def write_report(res, path):
         L.append(f"  mean max |n|             {s['mean_max_abs_n']:8.2f} m")
         L.append(f"  fraction of steps |n|>2  {100*s['mean_frac_n_gt2']:8.2f}%")
         L.append("")
+        if s['mean_alpha'] == s['mean_alpha']:      # nan-safe: b0 has none
+            L.append("RESIDUAL AUTHORITY  (spec S17.2 -- what alpha_safe actually did)")
+            L.append("-" * 72)
+            L.append(f"  mean alpha               {s['mean_alpha']:8.3f}"
+                     "   (1.000 = authority never engaged)")
+            L.append(f"  interventions / episode  {s['mean_interventions']:8.1f}"
+                     "   (steps with alpha < 1)")
+            L.append(f"  strong suppression       {100*s['mean_strong_suppression']:8.2f}%"
+                     "  (steps with alpha < 0.2)")
+            L.append(f"  nominal infeasible       {100*s['frac_nominal_infeasible']:8.2f}%"
+                     "  (MPCC action already violated the CBF)")
+            if abs(s['mean_alpha'] - 1.0) < 1e-3:
+                L.append("  -> alpha never moved: b5 is behaviourally identical to b2,")
+                L.append("     so any b5-vs-b2 difference here is noise, not the filter.")
+            L.append("")
         L.append("SOLVER  (secondary -- a rise here is acceptable if overtakes rise too)")
         L.append("-" * 72)
         L.append(f"  mean failure rate        {100*s['mean_solver_failure_rate']:8.2f}%")
@@ -485,6 +533,8 @@ def compare(paths):
         ('solver failure %', 'mean_solver_failure_rate', 100.0, 'secondary'),
         ('collisions / km', 'collisions_per_km', 1.0, 'LOWER better, length-indep'),
         ('overtakes / km', 'overtakes_per_km', 1.0, 'higher better, length-indep'),
+        ('mean authority a', 'mean_alpha', 1.0, 'b5 only; 1.0 = never engaged'),
+        ('strong suppr. %', 'mean_strong_suppression', 100.0, 'frac of steps a<0.2'),
     ]
 
     L = ["=" * 78, "MPCC CONFIGURATION COMPARISON", "=" * 78, ""]
@@ -555,6 +605,16 @@ def main():
     ap.add_argument('--r3-cap', type=float, default=None,
                     help='cap on the curvature slowdown (model default 3e-2, '
                          'saturates at R=6 m). Higher = slower in tight turns.')
+    ap.add_argument('--alat-slack', type=float, default=None, metavar='L2',
+                    help='quadratic slack weight on the lateral-acceleration '
+                         'constraint. Default None keeps the historical 1e-3, '
+                         'which is ~1e6 cheaper than leaving the corridor (1e3) '
+                         'and makes alat_max decorative. Try 1e3 to make it real.')
+    ap.add_argument('--junction-margin', type=float, default=4.0, metavar='M',
+                    help='extra left-side corridor width granted at junctions, '
+                         'in metres. 4.0 reaches into the corner furniture that '
+                         '48.4%% of Town01 collisions hit from INSIDE the '
+                         'corridor; 1.5 regressed when tried alone.')
     ap.add_argument('--route-min', type=float, default=50.0,
                     help='minimum straight-line spawn-to-goal distance (m)')
     ap.add_argument('--route-max', type=float, default=None,

@@ -57,6 +57,8 @@ class CarlaMPCEnv(gym.Env):
         r3_cap: float = None,
         residual_mode: str = 'adaptive',
         residual_max: float = 0.1,
+        alat_slack: float = None,
+        junction_margin: float = 4.0,
     ):
         """
         residual_mode: 'adaptive' derives the residual authority from the CBF
@@ -216,6 +218,8 @@ class CarlaMPCEnv(gym.Env):
         self.gate_depth = gate_depth
         self.lookahead = lookahead
         self.r3_cap = r3_cap
+        self.alat_slack = alat_slack
+        self.junction_margin = float(junction_margin)
         self.residual_mode = residual_mode
         self.residual_max = residual_max
         self.residual_authority = None   # built in _initialize_mpc()
@@ -622,11 +626,13 @@ class CarlaMPCEnv(gym.Env):
             pass
     
     def _generate_path(self, start, goal):
-        cache_key = self.current_town  # e.g. 'Town12'
+        # Keyed on the margin too: it is baked into the corridor this planner
+        # reports, so two margins in one process would share the first's widths.
+        cache_key = (self.current_town, self.junction_margin)
         
         if cache_key not in CarlaMPCEnv._shared_planner_cache:
             CarlaMPCEnv._shared_planner_cache[cache_key] = PathPlanner(
-                self.world, self.map
+                self.world, self.map, junction_margin=self.junction_margin
             )
         
         self.path_planner = CarlaMPCEnv._shared_planner_cache[cache_key]
@@ -920,6 +926,7 @@ class CarlaMPCEnv(gym.Env):
         self.mpc_controller.gate_depth = self.gate_depth
         self.mpc_controller.lookahead = self.lookahead
         self.mpc_controller.r3_cap = self.r3_cap
+        self.mpc_controller.alat_slack = self.alat_slack
         try:
             wheels = self.vehicle.get_physics_control().wheels
             real = max(w.max_steer_angle for w in wheels)

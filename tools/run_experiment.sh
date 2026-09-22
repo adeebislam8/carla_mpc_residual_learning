@@ -37,23 +37,49 @@ EVAL_TOWNS=("Town01" "Town02" "Town03")
 # able to see an effect of that size.
 EVAL="--seeds 1 2 3 4 5 --episodes 30"
 
-# Ablation arms per town:  label | extra flags
+# Ablation arms per town:  label | residual mode ('' = no residual)
 #   b0  nominal MPCC, no residual          (the baseline everything is measured against)
 #   b2  fixed residual scale               (the previous architecture)
 #   b5  CBF-derived adaptive authority     (Contribution 1)
+#
+# TRAIN/EVAL MODE MATCH.  Until 2026-09-22 this script never passed
+# --residual-mode to train_residual.py, so BOTH arms were served by a single
+# policy trained under the 'fixed' default (u = u_nom + 0.1*pi(o)) while b5 was
+# evaluated under 'adaptive' (u = u_nom + alpha_safe*0.1*pi(o)).  The policy had
+# never seen its own actions scaled by alpha_safe, so b5 measured a train/test
+# mismatch rather than the authority mechanism -- which is the most likely
+# reason b5 came out WORSE than b2 in 5 of 6 comparisons.  Each mode now trains
+# its own policy and evaluates it under the same law it was trained on.
 ARMS=(
   "b0|"
-  "b2|--residual-mode fixed"
-  "b5|--residual-mode adaptive"
+  "b2|fixed"
+  "b5|adaptive"
 )
+
+# Modes needing a trained policy, derived from ARMS so the two cannot drift.
+TRAIN_MODES=()
+for _a in "${ARMS[@]}"; do
+  _m="${_a#*|}"
+  [ -n "$_m" ] && case " ${TRAIN_MODES[*]-} " in *" $_m "*) ;; *) TRAIN_MODES+=("$_m") ;; esac
+done
+
+# models/<algo>_<mode>_v1/.  A pre-2026-09-22 models/<algo>_v1 was trained
+# 'fixed' and is still valid for b2 -- reuse it with
+#     mv models/sac_v1 models/sac_fixed_v1
+# rather than retraining.  Training skips any mode whose model already exists.
+model_dir() { echo "models/$1_$2_v1"; }
 # ------------------------------------------------------------------------------
 
 DRY=0; EVAL_ONLY=0
-for a in "$@"; do
-  case "$a" in
-    --dry-run)   DRY=1 ;;
-    --eval-only) EVAL_ONLY=1 ;;
-    *) echo "unknown option: $a"; exit 1 ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)   DRY=1; shift ;;
+    --eval-only) EVAL_ONLY=1; shift ;;
+    # e.g. --algos "sac"  -- TD3 was significantly harmful (success -9.56pp,
+    # p = 2.3e-05), so training an adaptive TD3 costs ~5 h to re-confirm a
+    # known regression.
+    --algos)     read -r -a ALGOS <<< "$2"; shift 2 ;;
+    *) echo "unknown option: $1"; exit 1 ;;
   esac
 done
 
@@ -75,26 +101,28 @@ run() {  # run <description> <command...>
 # ---------------------------------------------------------------- TRAINING ---
 if [ "$EVAL_ONLY" -eq 0 ]; then
   for algo in "${ALGOS[@]}"; do
-    # shellcheck disable=SC2086
-    run "TRAIN ${algo} (${TIMESTEPS} steps, ${TRAIN_TOWN})" \
-      python tools/train_residual.py --label "${algo}_v1" --algo "$algo" \
-        --timesteps "$TIMESTEPS" --town "$TRAIN_TOWN" $CONTROLLER \
-        2>&1 | tee "results/train_${algo}_v1.log"
+    for mode in "${TRAIN_MODES[@]}"; do
+      label="${algo}_${mode}_v1"
+      if [ -f "$(model_dir "$algo" "$mode")/final.zip" ]; then
+        echo ">>> SKIP TRAIN ${label} -- $(model_dir "$algo" "$mode")/final.zip exists"
+        continue
+      fi
+      # shellcheck disable=SC2086
+      run "TRAIN ${label} (${TIMESTEPS} steps, ${TRAIN_TOWN}, mode=${mode})" \
+        python tools/train_residual.py --label "$label" --algo "$algo" \
+          --residual-mode "$mode" \
+          --timesteps "$TIMESTEPS" --town "$TRAIN_TOWN" $CONTROLLER \
+          2>&1 | tee "results/train_${label}.log"
+    done
   done
 fi
 
 # -------------------------------------------------------------- EVALUATION ---
 for algo in "${ALGOS[@]}"; do
-  MODEL="models/${algo}_v1/final.zip"
-  if [ "$DRY" -eq 0 ] && [ ! -f "$MODEL" ]; then
-    echo "!!! no model at ${MODEL} -- skipping ${algo} evaluation"
-    FAILED+=("eval ${algo}: model missing"); continue
-  fi
-
   for town in "${EVAL_TOWNS[@]}"; do
     JSONS=()
     for arm in "${ARMS[@]}"; do
-      name="${arm%%|*}"; flags="${arm#*|}"
+      name="${arm%%|*}"; mode="${arm#*|}"
       label="${algo}_${name}_${town}"
 
       # b0 is the nominal controller: no --model, action is always [0,0].
@@ -104,13 +132,19 @@ for algo in "${ALGOS[@]}"; do
         [ -f "results/${label}.json" ] && { JSONS+=("results/${label}.json"); continue; }
         MODEL_FLAGS=""
       else
-        MODEL_FLAGS="--model ${MODEL} --algo ${algo}"
+        # The policy trained UNDER THIS MODE, not a single shared one.
+        MODEL="$(model_dir "$algo" "$mode")/final.zip"
+        if [ "$DRY" -eq 0 ] && [ ! -f "$MODEL" ]; then
+          echo "!!! no model at ${MODEL} -- skipping ${label}"
+          FAILED+=("eval ${label}: model missing"); continue
+        fi
+        MODEL_FLAGS="--model ${MODEL} --algo ${algo} --residual-mode ${mode}"
       fi
 
       # shellcheck disable=SC2086
       run "EVAL ${label}" \
         python tools/benchmark_mpcc.py --label "$label" --town "$town" \
-          $EVAL $CONTROLLER $MODEL_FLAGS $flags \
+          $EVAL $CONTROLLER $MODEL_FLAGS \
           2>&1 | tee "results/${label}.log"
       [ -f "results/${label}.json" ] && JSONS+=("results/${label}.json")
     done

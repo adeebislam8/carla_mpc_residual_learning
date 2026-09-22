@@ -16,7 +16,8 @@ RAD2DEG = 180.0/math.pi
 
 def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
                     a_long_obs=None, b_lat_obs=None, apex_gain=None,
-                    gate_depth=None, lookahead=None, r3_cap=None):
+                    gate_depth=None, lookahead=None, r3_cap=None,
+                    alat_slack=None):
     # create render arguments
     ocp = AcadosOcp()
     dt = Tf/N
@@ -188,6 +189,26 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
         1e-1,
         1e-1,
                 ])
+
+    # con_h row 1 is a_lat, softened via idxsh = [0,1,2,3,6,...].  The slack
+    # arrays are indexed by POSITION IN idxsh, so entry 1 is a_lat and entry 2
+    # is the corridor n.  At the baseline a_lat costs (1e-3, 1e-3) to violate
+    # while n costs (2e0, 1e3) -- a ratio of ~1e6.  So whenever a corner is
+    # tighter than alat_max allows, the optimiser always prefers an impossible
+    # lateral acceleration to any lateral deviation.  It plans the corner, the
+    # tyres refuse, and the car understeers out of the corridor anyway: 51.6%
+    # of Town01 collisions are outside the corridor at a mean impact speed of
+    # 13.39 m/s against a mean driving speed of 10.19 m/s.
+    #
+    # alat_slack makes the limit real.  L1 is mirrored from the corridor's 2e0
+    # so that taking ANY violation is a deliberate choice; the swept L2 sets how
+    # fast the penalty grows with the SIZE of the violation, which is the part
+    # that should scale with how far over the limit the plan is.
+    if alat_slack is not None:
+        slack_L1_cost[1] = 2e0
+        slack_L2_cost[1] = float(alat_slack)
+    print(f"  slack      a_lat=({slack_L1_cost[1]:g}, {slack_L2_cost[1]:g})"
+          f"  n=({slack_L1_cost[2]:g}, {slack_L2_cost[2]:g})  [L1, L2]")
 
     ocp.cost.zl = slack_L1_cost
     ocp.cost.zu = slack_L1_cost

@@ -183,7 +183,13 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
     # overtaking.  Before the attractor existed the barrier gradient was the only
     # thing choosing a side, and lowering a_long increased overtaking; the sign
     # of the effect changed when n_ref took over.
-    a_long = 3 if a_long_obs is None else float(a_long_obs)
+    # Named a_obs, not a_long: this used to rebind a_long, which at line 162
+    # holds the dynamics Fxd/m.  constraint.expr below ships row 0 as a_long,
+    # so the rebind made the longitudinal-acceleration row the constant 3 and
+    # along_min/max were never enforced.  (Restoring it changes nothing on its
+    # own -- D in [-0.5, 1] already caps Fxd/m at [-2.6, +4.5], inside the +-5
+    # bounds -- but the row is now the quantity its bounds claim to limit.)
+    a_obs = 3 if a_long_obs is None else float(a_long_obs)
     b_lat = 2 if b_lat_obs is None else float(b_lat_obs)
 
 
@@ -194,22 +200,22 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
     # b4 = sqrt(((s - s_obs4)/1.0)**2 + ((n - n_obs4)/1.0)**2) 
     # b5 = sqrt(((s - s_obs5)/1.0)**2 + ((n - n_obs5)/1.0)**2) 
     # b6 = sqrt(((s - s_obs6)/1.0)**2 + ((n - n_obs6)/1.0)**2) 
-    b1 = distance2obs_casadi_elliptical(s, n, s_obs1, n_obs1, a_long, b_lat)
-    b2 = distance2obs_casadi_elliptical(s, n, s_obs2, n_obs2, a_long, b_lat)
-    b3 = distance2obs_casadi_elliptical(s, n, s_obs3, n_obs3, a_long, b_lat)
-    b4 = distance2obs_casadi_elliptical(s, n, s_obs4, n_obs4, a_long, b_lat)
-    b5 = distance2obs_casadi_elliptical(s, n, s_obs5, n_obs5, a_long, b_lat)
-    b6 = distance2obs_casadi_elliptical(s, n, s_obs6, n_obs6, a_long, b_lat)
+    b1 = distance2obs_casadi_elliptical(s, n, s_obs1, n_obs1, a_obs, b_lat)
+    b2 = distance2obs_casadi_elliptical(s, n, s_obs2, n_obs2, a_obs, b_lat)
+    b3 = distance2obs_casadi_elliptical(s, n, s_obs3, n_obs3, a_obs, b_lat)
+    b4 = distance2obs_casadi_elliptical(s, n, s_obs4, n_obs4, a_obs, b_lat)
+    b5 = distance2obs_casadi_elliptical(s, n, s_obs5, n_obs5, a_obs, b_lat)
+    b6 = distance2obs_casadi_elliptical(s, n, s_obs6, n_obs6, a_obs, b_lat)
     #all_dist = Function('all_dist', [s, n, s_obs1, n_obs1, s_obs2, n_obs2, s_obs3, n_obs3, s_obs4, n_obs4, s_obs5, n_obs5, s_obs6, n_obs6], [b1, b2, b3, b4, b5, b6])
     s_next = s + sdot * dt_
     n_next = n + ndot * dt_
 
-    b1_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs1, n_obs1, a_long, b_lat)
-    b2_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs2, n_obs2, a_long, b_lat)
-    b3_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs3, n_obs3, a_long, b_lat)
-    b4_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs4, n_obs4, a_long, b_lat)
-    b5_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs5, n_obs5, a_long, b_lat)
-    b6_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs6, n_obs6, a_long, b_lat)
+    b1_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs1, n_obs1, a_obs, b_lat)
+    b2_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs2, n_obs2, a_obs, b_lat)
+    b3_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs3, n_obs3, a_obs, b_lat)
+    b4_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs4, n_obs4, a_obs, b_lat)
+    b5_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs5, n_obs5, a_obs, b_lat)
+    b6_next = distance2obs_casadi_elliptical(s_next, n_next, s_obs6, n_obs6, a_obs, b_lat)
     print("s_next_type: ", type(s_next))
     print("n_next_type: ", type(n_next))
     #all_dist_next = Function('all_dist_next', [s_next, n_next, s_obs1, n_obs1, s_obs2, n_obs2, s_obs3, n_obs3, s_obs4, n_obs4, s_obs5, n_obs5, s_obs6, n_obs6], [b1_next, b2_next, b3_next, b4_next, b5_next, b6_next])
@@ -477,7 +483,7 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
     print(f"  lateral    n=[{model.n_min}, {model.n_max}]"
           f"  delta_max={model.delta_max:.3f} rad")
     print(f"  weights    ql={ql} qc={qc} qa={qa} gamma={gamma}")
-    print(f"  cbf        ellipse a={a_long} b={b_lat}"
+    print(f"  cbf        ellipse a={a_obs} b={b_lat}"
           f"  d_safe={SAFETY_DISTANCE} gamma={obs_gamma}")
     print(f"  overtake   gate=({GATE_BACK}, {GATE_FRONT}) m  n_overtake={n_overtake}")
     print("-" * 62)
