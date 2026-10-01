@@ -31,6 +31,13 @@ class CarlaMPCEnv(gym.Env):
     # COCO class ids this project treats as obstacles (car, motorcycle, bus,
     # truck, person) -- matches what the CBF's elliptical slots are meant for.
     _PERCEPTION_CLASSES = {0, 2, 3, 5, 7}
+    # Drop the bottom slice of the frame before detection: the camera is
+    # windshield-mounted and pitched down, so a sliver of the ego's own
+    # hood/roof is unavoidably in frame and YOLO occasionally classifies it
+    # as a car -- a false positive with no real NPC to match. Cropping rows
+    # (not shifting the origin) keeps pixel (u, v) consistent with the
+    # intrinsics, which are computed from the FULL frame height.
+    _HOOD_CROP_FRAC = 0.88
 
     @classmethod
     def _get_yolo_model(cls):
@@ -634,6 +641,11 @@ class CarlaMPCEnv(gym.Env):
         cam_loc = cam_transform.location
         return cam_loc.x + t * dir_world.x, cam_loc.y + t * dir_world.y
 
+    def _crop_hood(self, frame):
+        """Drop the bottom _HOOD_CROP_FRAC slice -- see the class docstring."""
+        keep_rows = int(frame.shape[0] * self._HOOD_CROP_FRAC)
+        return frame[:keep_rows]
+
     def _detect_obstacles_perception(self):
         """
         Perception-pipeline replacement for the ground-truth loop in
@@ -648,7 +660,7 @@ class CarlaMPCEnv(gym.Env):
             return
 
         model = self._get_yolo_model()
-        results = model.predict(frame, verbose=False, conf=0.35)[0]
+        results = model.predict(self._crop_hood(frame), verbose=False, conf=0.35)[0]
 
         detections = []
         for box in results.boxes:

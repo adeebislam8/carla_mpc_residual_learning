@@ -94,7 +94,7 @@ def main():
             continue
 
         model = CarlaMPCEnv._get_yolo_model()
-        results = model.predict(frame, verbose=False, conf=0.35)[0]
+        results = model.predict(env._crop_hood(frame), verbose=False, conf=0.35)[0]
 
         # Ground truth NPC world positions this step, for matching -- but only
         # ones actually in the window the real obstacle pipeline cares about
