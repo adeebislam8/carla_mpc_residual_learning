@@ -116,6 +116,7 @@ def run(args):
             alat_slack=args.alat_slack,
             junction_margin=args.junction_margin,
             n_overtake=args.n_overtake,
+            use_perception=args.perception,
         )
         interrupted = False
         try:
@@ -150,6 +151,7 @@ def run(args):
         'alat_slack': args.alat_slack,
         'junction_margin': args.junction_margin,
         'n_overtake': args.n_overtake,
+        'perception': args.perception,
         'route_min': args.route_min,
         'route_max': args.route_max,
         'npc_min': args.npc_min,
@@ -372,6 +374,7 @@ def write_report(res, path):
     _no = res.get('n_overtake')
     L.append(f"  overtake target: n_ref = {_no if _no is not None else -2.5} m"
              f"  ({'LEFT pull DISABLED' if _no == 0.0 else 'pulls left'})")
+    L.append(f"  obstacle feed : {'pretrained YOLO + ground-plane projection' if res.get('perception') else 'ground truth'}")
     L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  route length  : {res.get('route_min', 50)} m min, "
              f"{res.get('route_max') or 'unbounded'} m max")
@@ -628,6 +631,12 @@ def main():
                          'in metres. 4.0 reaches into the corner furniture that '
                          '48.4%% of Town01 collisions hit from INSIDE the '
                          'corridor; 1.5 regressed when tried alone.')
+    ap.add_argument('--perception', action='store_true',
+                    help='replace ground-truth obstacle positions with a '
+                         'pretrained YOLO detector on a forward RGB camera, '
+                         'projected to world coords via a flat-ground-plane '
+                         'assumption (no depth sensor/network). Default off '
+                         '(ground truth). Needs `pip install ultralytics`.')
     ap.add_argument('--route-min', type=float, default=50.0,
                     help='minimum straight-line spawn-to-goal distance (m)')
     ap.add_argument('--route-max', type=float, default=None,
