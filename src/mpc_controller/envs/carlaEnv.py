@@ -569,6 +569,14 @@ class CarlaMPCEnv(gym.Env):
             camera_bp, camera_transform, attach_to=self.vehicle
         )
 
+        # Weather is never set anywhere else in this codebase -- the camera
+        # would otherwise render whatever state happens to be left on the
+        # CARLA server (previous session, server default), which is neither
+        # reproducible nor necessarily clear enough to debug the pipeline
+        # against.  Pinned here so perception runs are deterministic; a
+        # weather sweep is a reasonable later ablation, not needed yet.
+        self.world.set_weather(carla.WeatherParameters.ClearNoon)
+
         # Square-pixel pinhole intrinsics from the horizontal FOV -- standard
         # simplification, not metrologically exact, but the ground-plane
         # projection downstream is already an approximation (flat-road
@@ -1746,16 +1754,23 @@ class CarlaMPCEnv(gym.Env):
 
             if hasattr(self, 'render_mode') and self.render_mode == 'human':
                 self._draw_vehicle_info()
-            
-            self._draw_road_boundaries_ahead()
-            # --- comment either line out to remove the overlay -------------
-            self._visualize_vehicle_footprint()   # white box + green/red edges
-            # self._visualize_detected_obstacles()
-            # self._visualize_lidar_obstacles()
-            self._visualize_cbf_ellipses()
-                
-            if self.current_step % 5 == 0:
-                self._visualize_mpc_prediction()
+
+            # These debug.draw_* calls inject real 3D geometry into the CARLA
+            # world -- any camera sensor pointed at the scene sees them, not
+            # just a spectator window.  Harmless when nothing reads camera
+            # pixels, but with use_perception on they paint corridor/CBF
+            # markers straight onto the road in front of the detector, so
+            # they're suppressed there.
+            if not self.use_perception:
+                self._draw_road_boundaries_ahead()
+                # --- comment either line out to remove the overlay ---------
+                self._visualize_vehicle_footprint()   # white box + green/red edges
+                # self._visualize_detected_obstacles()
+                # self._visualize_lidar_obstacles()
+                self._visualize_cbf_ellipses()
+
+                if self.current_step % 5 == 0:
+                    self._visualize_mpc_prediction()
 
             
             return obs, reward, done, False, info
