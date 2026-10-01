@@ -53,7 +53,11 @@ def main():
     ap.add_argument('--port', type=int, default=2000)
     ap.add_argument('--town', default='Town01')
     ap.add_argument('--seed', type=int, default=2547)
-    ap.add_argument('--steps', type=int, default=40)
+    ap.add_argument('--steps', type=int, default=300,
+                     help='20 Hz control loop, so 300 steps = 15 s of driving. '
+                          'NPCs are spread across the whole route, not '
+                          'clustered at the start, so a short run can easily '
+                          'see nothing even with a working pipeline.')
     ap.add_argument('--save-every', type=int, default=5,
                      help='save an annotated frame every N steps (default 5)')
     ap.add_argument('--match-radius', type=float, default=5.0, metavar='M',
@@ -92,12 +96,27 @@ def main():
         model = CarlaMPCEnv._get_yolo_model()
         results = model.predict(frame, verbose=False, conf=0.35)[0]
 
-        # Ground truth NPC world positions this step, for matching.
+        # Ground truth NPC world positions this step, for matching -- but only
+        # ones actually in the window the real obstacle pipeline cares about
+        # (-5 < ds < 30 m, same as _detect_obstacles). Counting every alive
+        # NPC regardless of position was misleading: a route can easily have
+        # several NPCs total while none are anywhere near the camera.
         gt_positions = []
+        nearest_ds = None
         for npc_data in env.racing_npcs:
             npc = npc_data.get("actor")
-            if npc is not None and npc.is_alive:
-                loc = npc.get_location()
+            if npc is None or not npc.is_alive:
+                continue
+            loc = npc.get_location()
+            try:
+                s_obs, _, _ = env.frenet_converter.world_to_frenet(
+                    loc.x, loc.y, 0, s_hint=npc_data.get("s"))
+            except Exception:
+                continue
+            ds = s_obs - env.current_s
+            if nearest_ds is None or abs(ds) < abs(nearest_ds):
+                nearest_ds = ds
+            if -5.0 < ds < 30.0:
                 gt_positions.append((loc.x, loc.y))
 
         step_errors = []
@@ -127,8 +146,10 @@ def main():
 
         err_txt = (f"mean err {np.mean(step_errors):.2f} m "
                    f"(n={len(step_errors)})" if step_errors else "no matches")
+        ds_txt = f"{nearest_ds:+.1f}" if nearest_ds is not None else "?"
         print(f"step {step:3d}: {n_detections} detections, "
-              f"{len(gt_positions)} real NPCs nearby -> {err_txt}")
+              f"{len(gt_positions)} NPC(s) in the -5..30m window "
+              f"(nearest any NPC: ds={ds_txt} m) -> {err_txt}")
 
         if args.save_every > 0 and step % args.save_every == 0:
             import cv2
