@@ -56,7 +56,8 @@ def distance2obs_casadi_elliptical(s, n, s_obs, n_obs, a=3.5, b=1.4):
 
 def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
                   a_long_obs=None, b_lat_obs=None, apex_gain=None,
-                  gate_depth=None, lookahead=None, r3_cap=None):
+                  gate_depth=None, lookahead=None, r3_cap=None,
+                  n_overtake=None):
     # define structs
     constraint = types.SimpleNamespace()
     model = types.SimpleNamespace()
@@ -389,7 +390,22 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
     # -3.5 pulled 1.5 m wider than necessary and left just 1.3 m to the corridor
     # edge.  -2.5 keeps 0.5 m over the barrier floor and 2.3 m to the edge.
     # This is the value the 65% baseline was measured with.
-    n_overtake = -2.5
+    #
+    # EXPOSED as --n-overtake (2026-10-01) to test whether this attractor is
+    # itself the dominant collision mechanism.  It is obstacle-BLIND: it commits
+    # to n_ref = -2.5 whenever an NPC is in the gate window, with no check that
+    # the target is clear, and the CBF only guards the 6 modelled NPC slots.
+    # Nothing in the formulation knows a pole is there.  Supporting evidence on
+    # Town01 (150 episodes, cell A of the 2x2): 74% of collisions on straight
+    # road, left impacts 3.00x right (p = 1.3e-03, and this attractor pulls
+    # LEFT since d > 0 is right), >=40 of 100 collisions are static objects hit
+    # from INSIDE the legal corridor, and collisions/km correlates with
+    # overtakes/km at r = +0.775 across 17 configs.
+    #
+    # Set 0.0 to disable the lateral pull entirely.  Expect overtaking to stop
+    # and timeouts to rise -- judge this on collisions/km and the static-object
+    # count, NOT on success rate.
+    n_overtake = -2.5 if n_overtake is None else float(n_overtake)
     # Apex offset: bias the car toward the INSIDE of an upcoming bend.
     #
     # Tracking error pushes a car to the OUTSIDE of a curve, and the corridor is

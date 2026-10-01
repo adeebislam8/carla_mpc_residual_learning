@@ -17,7 +17,7 @@ RAD2DEG = 180.0/math.pi
 def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
                     a_long_obs=None, b_lat_obs=None, apex_gain=None,
                     gate_depth=None, lookahead=None, r3_cap=None,
-                    alat_slack=None):
+                    alat_slack=None, n_overtake=None):
     # create render arguments
     ocp = AcadosOcp()
     dt = Tf/N
@@ -28,7 +28,8 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
                                       b_lat_obs=b_lat_obs,
                                       apex_gain=apex_gain,
                                       gate_depth=gate_depth,
-                                      lookahead=lookahead, r3_cap=r3_cap)
+                                      lookahead=lookahead, r3_cap=r3_cap,
+                                      n_overtake=n_overtake)
     # define acados ODE
     model_ac = AcadosModel()
     model_ac.f_impl_expr = model.f_impl_expr

@@ -59,6 +59,7 @@ class CarlaMPCEnv(gym.Env):
         residual_max: float = 0.1,
         alat_slack: float = None,
         junction_margin: float = 4.0,
+        n_overtake: float = None,
     ):
         """
         residual_mode: 'adaptive' derives the residual authority from the CBF
@@ -219,6 +220,7 @@ class CarlaMPCEnv(gym.Env):
         self.lookahead = lookahead
         self.r3_cap = r3_cap
         self.alat_slack = alat_slack
+        self.n_overtake = n_overtake
         self.junction_margin = float(junction_margin)
         self.residual_mode = residual_mode
         self.residual_max = residual_max
@@ -927,6 +929,7 @@ class CarlaMPCEnv(gym.Env):
         self.mpc_controller.lookahead = self.lookahead
         self.mpc_controller.r3_cap = self.r3_cap
         self.mpc_controller.alat_slack = self.alat_slack
+        self.mpc_controller.n_overtake = self.n_overtake
         try:
             wheels = self.vehicle.get_physics_control().wheels
             real = max(w.max_steer_angle for w in wheels)

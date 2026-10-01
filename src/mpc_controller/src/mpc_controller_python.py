@@ -138,6 +138,9 @@ class MPCController:
         # historical (1e-3, 1e-3), which makes alat_max decorative -- see the
         # comment in acados_settings_mpcc.py.  Set by the env from --alat-slack.
         self.alat_slack = None
+        # Lateral overtake target in the cost. None keeps -2.5. Set by the env
+        # from --n-overtake; 0.0 disables the lateral pull.
+        self.n_overtake = None
 
         # Records solver inputs so failures can be attributed instead of
         # guessed at.  Off unless CARLA_MPC_DIAG=1.
@@ -163,6 +166,7 @@ class MPCController:
             lookahead=self.lookahead,
             r3_cap=self.r3_cap,
             alat_slack=self.alat_slack,
+            n_overtake=self.n_overtake,
         )
         
         print("✓ ACADOS solver initialized")

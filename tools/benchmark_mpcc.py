@@ -115,6 +115,7 @@ def run(args):
             residual_mode=args.residual_mode,
             alat_slack=args.alat_slack,
             junction_margin=args.junction_margin,
+            n_overtake=args.n_overtake,
         )
         interrupted = False
         try:
@@ -148,6 +149,7 @@ def run(args):
         'gate_depth': args.gate_depth,
         'alat_slack': args.alat_slack,
         'junction_margin': args.junction_margin,
+        'n_overtake': args.n_overtake,
         'route_min': args.route_min,
         'route_max': args.route_max,
         'npc_min': args.npc_min,
@@ -215,6 +217,7 @@ def _run_seed(env, args, seed, episodes, model=None, obs_norm=None):
             'collision_off_corridor': info.get('collision_off_corridor'),
             'collision_in_fallback': info.get('collision_in_fallback'),
             'collision_kappa': info.get('collision_kappa'),
+            'collision_n': info.get('collision_n'),
             # Residual authority (spec S17.2).  _authority_metrics() has always
             # computed these and step() has always attached them -- this
             # whitelist dropped them, exactly like collision_kappa, so no run has
@@ -366,6 +369,9 @@ def write_report(res, path):
     L.append(f"  alat slack    : {_as if _as is not None else '1e-3 (decorative)'}"
              f"   vs corridor 1e3")
     L.append(f"  junction margin: {res.get('junction_margin', 4.0)} m extra left width")
+    _no = res.get('n_overtake')
+    L.append(f"  overtake target: n_ref = {_no if _no is not None else -2.5} m"
+             f"  ({'LEFT pull DISABLED' if _no == 0.0 else 'pulls left'})")
     L.append(f"  town          : {res.get('town', res.get('towns', ['?'])[0])}")
     L.append(f"  route length  : {res.get('route_min', 50)} m min, "
              f"{res.get('route_max') or 'unbounded'} m max")
@@ -610,6 +616,13 @@ def main():
                          'constraint. Default None keeps the historical 1e-3, '
                          'which is ~1e6 cheaper than leaving the corridor (1e3) '
                          'and makes alat_max decorative. Try 1e3 to make it real.')
+    ap.add_argument('--n-overtake', type=float, default=None, metavar='N',
+                    help='lateral overtake target in the cost, metres. Default '
+                         'None keeps -2.5 (negative = LEFT, since d>0 is right). '
+                         '0.0 disables the lateral pull entirely. This attractor '
+                         'is obstacle-blind, so judge changes on collisions/km '
+                         'and the static-object count, not success rate -- '
+                         'disabling it stops overtaking and raises timeouts.')
     ap.add_argument('--junction-margin', type=float, default=4.0, metavar='M',
                     help='extra left-side corridor width granted at junctions, '
                          'in metres. 4.0 reaches into the corner furniture that '
