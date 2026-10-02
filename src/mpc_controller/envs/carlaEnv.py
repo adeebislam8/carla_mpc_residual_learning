@@ -219,6 +219,11 @@ class CarlaMPCEnv(gym.Env):
         self.lane_invasion = False
         self.sensor_detected_obstacles = []
         self.start_time = 0.0
+        # Consecutive-stall counter for _check_done()'s stall termination, and
+        # the separate cap on how many steps _calculate_reward() charges the
+        # stall penalty for (see reset() for why both must be cleared there).
+        self.speed_stall_count = 0
+        self._stall_penalty_steps = 0
         
         # Gymnasium spaces
         self.action_space = spaces.Box(
@@ -1087,7 +1092,14 @@ class CarlaMPCEnv(gym.Env):
         y = transform.location.y
         yaw = np.deg2rad(transform.rotation.yaw)
 
-        s, d, alpha = self.frenet_converter.world_to_frenet(x, y, yaw)
+        # Hinted with the NPC's own last s, same discipline as the ego
+        # (_update_vehicle_state) and _detect_obstacles.  This was the one
+        # unhinted Frenet call left: a branch jump here corrupted NPC
+        # steering, the obstacle-detection hint seeded from npc_data["s"],
+        # AND minted a phantom overtake bonus in the reward (ds crossing the
+        # (5, 40) window from a jump, not an actual pass).
+        s, d, alpha = self.frenet_converter.world_to_frenet(
+            x, y, yaw, s_hint=npc_data.get("s"))
 
         # Lookahead along Frenet path
         lookahead = 6.0
@@ -1444,8 +1456,20 @@ class CarlaMPCEnv(gym.Env):
             reward -= 1.0
 
         # Stalling is worse than being slow: dense, so it survives discounting.
+        # But UNCAPPED this inverts the intended ordering -- stalling is safe,
+        # colliding is not, so it must cost strictly less than a collision's
+        # flat -200.  Charged every step with no cap, a policy that dithers
+        # around the 1.0 m/s threshold for most of a long episode (never
+        # tripping _check_done's 500-CONSECUTIVE-step termination, since each
+        # brief recovery resets that counter) could rack up ~-5000 over one
+        # episode -- 25x a collision.  Capped at the first 25 charged steps
+        # (~1.25s, still dense enough to be felt under discounting) so total
+        # exposure is bounded at -125 regardless of how the stalled steps are
+        # distributed across the episode.
         if self.current_speed < 1.0:
-            reward -= 5.0
+            if self._stall_penalty_steps < 25:
+                reward -= 5.0
+                self._stall_penalty_steps += 1
 
         # --- residual-relative term -----------------------------------------
         # Attributable to the action by construction.  Small weight: it shapes,
@@ -1570,6 +1594,14 @@ class CarlaMPCEnv(gym.Env):
         try:
             self.episode_count += 1
             self.overtaken_npcs = set()
+            # Neither counter was reset here before.  _check_done() never
+            # reset speed_stall_count on episode boundary, so an episode that
+            # ended via the stall condition (count > 500) left it > 500 for
+            # the NEXT episode -- which starts near-zero speed at spawn like
+            # every episode does, so count immediately exceeds 500 again and
+            # the new episode gets killed as a false "stall" after one step.
+            self.speed_stall_count = 0
+            self._stall_penalty_steps = 0
             # if self.episode_count % self.episodes_per_town == 0 and self.episode_count > 0:
             #     self._load_random_town()
             # Disable because of resource
