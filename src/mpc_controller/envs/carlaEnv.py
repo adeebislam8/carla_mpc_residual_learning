@@ -31,13 +31,35 @@ class CarlaMPCEnv(gym.Env):
     # COCO class ids this project treats as obstacles (car, motorcycle, bus,
     # truck, person) -- matches what the CBF's elliptical slots are meant for.
     _PERCEPTION_CLASSES = {0, 2, 3, 5, 7}
-    # Drop the bottom slice of the frame before detection: the camera is
-    # windshield-mounted and pitched down, so a sliver of the ego's own
-    # hood/roof is unavoidably in frame and YOLO occasionally classifies it
-    # as a car -- a false positive with no real NPC to match. Cropping rows
-    # (not shifting the origin) keeps pixel (u, v) consistent with the
+    # Drop the bottom slice of the frame before detection: any body-mounted,
+    # downward-pitched camera unavoidably has a sliver of the ego's own
+    # body (hood, mirror housing) in frame, and YOLO occasionally classifies
+    # it as a car -- a false positive with no real NPC to match. Cropping
+    # rows (not shifting the origin) keeps pixel (u, v) consistent with the
     # intrinsics, which are computed from the FULL frame height.
     _HOOD_CROP_FRAC = 0.88
+
+    # Three-camera rig: a forward windshield camera (the original single-
+    # camera pipeline) plus two side mirror-position cameras added to cover
+    # the blind spot a 90 deg forward-only FOV has exactly where it matters
+    # most -- the paired perception-vs-ground-truth run (2026-10-02, n=300/
+    # arm) found +28 extra NPC-vehicle collisions under single-camera
+    # perception, concentrated in the close-range overtake window the front
+    # camera stops seeing once ds drops under ~9 m.  Each entry is
+    # (name, x, y, z, pitch_deg, yaw_deg, fov_deg) in the vehicle's local
+    # frame (x forward, y right, z up).  Not a full Tesla-style 8-camera
+    # surround rig -- scoped to the specific side/near-range gap found, not
+    # 360 deg coverage nothing has shown a need for yet.
+    _PERCEPTION_CAMERA_SPECS = [
+        ('front', 1.5, 0.0, 1.4, -5.0,   0.0, 90),
+        ('left',  0.5, -1.0, 1.1,  0.0, -90.0, 100),
+        ('right', 0.5,  1.0, 1.1,  0.0,  90.0, 100),
+    ]
+    # Detections from different cameras within this radius of each other are
+    # the same physical object seen twice (the front/side FOVs overlap near
+    # +-45 deg) and are merged before tracking, so overlap doesn't spawn a
+    # duplicate track or make one object's position jitter between cameras.
+    _FUSION_DEDUP_RADIUS_M = 2.5
 
     @classmethod
     def _get_yolo_model(cls):
@@ -249,12 +271,11 @@ class CarlaMPCEnv(gym.Env):
         # Frenet (s, d) pairs in self.selected_obstacles, so nothing past this
         # flag needs to know which producer filled it.
         self.use_perception = use_perception
-        self._perception_camera = None
-        self._perception_frame = None
+        # name -> {'actor', 'frame', 'fx', 'fy', 'cx', 'cy', 'height'}, one
+        # entry per spec in _PERCEPTION_CAMERA_SPECS once attached.
+        self._perception_cameras = {}
         self._perception_tracks = []
         self._next_track_id = 0
-        self._perception_cam_height = None
-        self._cam_fx = self._cam_fy = self._cam_cx = self._cam_cy = None
         self.residual_mode = residual_mode
         self.residual_max = residual_max
         self.residual_authority = None   # built in _initialize_mpc()
@@ -544,39 +565,23 @@ class CarlaMPCEnv(gym.Env):
         )
 
         if self.use_perception:
-            self._attach_perception_camera()
+            self._attach_perception_cameras()
 
         self.world.tick()
 
-    def _attach_perception_camera(self):
+    def _attach_perception_cameras(self):
         """
-        Forward-facing RGB camera for the pretrained-YOLO obstacle pipeline.
+        RGB camera rig for the pretrained-YOLO obstacle pipeline: one entry
+        per _PERCEPTION_CAMERA_SPECS.
 
         Separate from _attach_camera(), which is a top-down video-recording
-        camera and has no bearing on control.  This one's output feeds
+        camera and has no bearing on control.  These cameras' output feeds
         _detect_obstacles_perception() instead of ground-truth actor state.
         """
         blueprint_library = self.world.get_blueprint_library()
-        camera_bp = blueprint_library.find('sensor.camera.rgb')
-        width, height, fov = 640, 480, 90
-        camera_bp.set_attribute('image_size_x', str(width))
-        camera_bp.set_attribute('image_size_y', str(height))
-        camera_bp.set_attribute('fov', str(fov))
+        width, height = 640, 480
 
-        # Windshield-ish mount, nose-down a few degrees so the road ahead
-        # (not the sky) fills the frame.  Height is also the "known camera
-        # height above the ground plane" the back-projection assumes.
-        self._perception_cam_height = 1.4
-        camera_transform = carla.Transform(
-            carla.Location(x=1.5, y=0.0, z=self._perception_cam_height),
-            carla.Rotation(pitch=-5.0, yaw=0.0, roll=0.0)
-        )
-
-        self._perception_camera = self.world.spawn_actor(
-            camera_bp, camera_transform, attach_to=self.vehicle
-        )
-
-        # Weather is never set anywhere else in this codebase -- the camera
+        # Weather is never set anywhere else in this codebase -- the cameras
         # would otherwise render whatever state happens to be left on the
         # CARLA server (previous session, server default), which is neither
         # reproducible nor necessarily clear enough to debug the pipeline
@@ -584,60 +589,79 @@ class CarlaMPCEnv(gym.Env):
         # weather sweep is a reasonable later ablation, not needed yet.
         self.world.set_weather(carla.WeatherParameters.ClearNoon)
 
-        # Square-pixel pinhole intrinsics from the horizontal FOV -- standard
-        # simplification, not metrologically exact, but the ground-plane
-        # projection downstream is already an approximation (flat-road
-        # assumption) so this is not the limiting error source.
-        self._cam_width, self._cam_height = width, height
-        self._cam_fx = width / (2.0 * math.tan(math.radians(fov) / 2.0))
-        self._cam_fy = self._cam_fx
-        self._cam_cx = width / 2.0
-        self._cam_cy = height / 2.0
-
-        self._perception_frame = None
+        self._perception_cameras = {}
         self._perception_tracks = []
         self._next_track_id = 0
 
-        weak_self = weakref.ref(self)
-        self._perception_camera.listen(
-            lambda image: CarlaMPCEnv._on_perception_image(weak_self, image)
-        )
-        print("✓ Perception camera attached")
+        for name, x, y, z, pitch, yaw, fov in self._PERCEPTION_CAMERA_SPECS:
+            camera_bp = blueprint_library.find('sensor.camera.rgb')
+            camera_bp.set_attribute('image_size_x', str(width))
+            camera_bp.set_attribute('image_size_y', str(height))
+            camera_bp.set_attribute('fov', str(fov))
+
+            camera_transform = carla.Transform(
+                carla.Location(x=x, y=y, z=z),
+                carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0)
+            )
+            actor = self.world.spawn_actor(
+                camera_bp, camera_transform, attach_to=self.vehicle
+            )
+
+            # Square-pixel pinhole intrinsics from the horizontal FOV --
+            # standard simplification, not metrologically exact, but the
+            # ground-plane projection downstream is already an approximation
+            # (flat-road assumption) so this is not the limiting error source.
+            fx = width / (2.0 * math.tan(math.radians(fov) / 2.0))
+            self._perception_cameras[name] = {
+                'actor': actor, 'frame': None,
+                'fx': fx, 'fy': fx, 'cx': width / 2.0, 'cy': height / 2.0,
+                'height': z,
+            }
+
+            weak_self = weakref.ref(self)
+            actor.listen(
+                lambda image, n=name: CarlaMPCEnv._on_perception_image(weak_self, n, image)
+            )
+
+        print(f"✓ Perception camera rig attached ({len(self._perception_cameras)} cameras)")
 
     @staticmethod
-    def _on_perception_image(weak_self, image):
+    def _on_perception_image(weak_self, cam_name, image):
         """Runs on CARLA's sensor thread -- just stash the frame, no inference here."""
         self = weak_self()
-        if self is None:
+        if self is None or cam_name not in self._perception_cameras:
             return
         try:
             array = np.frombuffer(image.raw_data, dtype=np.uint8)
             array = array.reshape((image.height, image.width, 4))
-            self._perception_frame = array[:, :, :3][:, :, ::-1].copy()  # BGRA -> RGB
+            self._perception_cameras[cam_name]['frame'] = \
+                array[:, :, :3][:, :, ::-1].copy()  # BGRA -> RGB
         except Exception:
             pass
 
-    def _pixel_to_ground_world(self, u, v):
+    def _pixel_to_ground_world(self, cam_name, u, v):
         """
-        Back-project an image pixel to world (x, y), assuming it lies on the
-        flat ground plane at the camera's mount height.  This is the standard
-        monocular "known camera height" distance method -- the same assumption
-        single-camera ADAS forward-distance systems make -- chosen instead of
-        a depth sensor/network so the pipeline stays RGB + one pretrained
-        detector.  It inherits that method's real failure mode: a few pixels
-        of box-bottom error near the horizon maps to a large ground-distance
+        Back-project an image pixel from camera `cam_name` to world (x, y),
+        assuming it lies on the flat ground plane at that camera's mount
+        height.  This is the standard monocular "known camera height"
+        distance method -- the same assumption single-camera ADAS
+        forward-distance systems make -- chosen instead of a depth
+        sensor/network so the pipeline stays RGB + one pretrained detector.
+        It inherits that method's real failure mode: a few pixels of
+        box-bottom error near the horizon maps to a large ground-distance
         error, so accuracy degrades with range by construction, not by bug.
 
         Returns None if the ray points above the horizon (nothing a flat-road
         assumption can resolve -- e.g. a false detection on the sky/horizon).
         """
-        x_local = (u - self._cam_cx) / self._cam_fx
-        z_local = -(v - self._cam_cy) / self._cam_fy  # image v grows down; local z grows up
-        cam_transform = self._perception_camera.get_transform()
+        cam = self._perception_cameras[cam_name]
+        x_local = (u - cam['cx']) / cam['fx']
+        z_local = -(v - cam['cy']) / cam['fy']  # image v grows down; local z grows up
+        cam_transform = cam['actor'].get_transform()
         dir_world = cam_transform.transform_vector(carla.Vector3D(x=1.0, y=x_local, z=z_local))
         if dir_world.z >= -1e-3:
             return None
-        t = self._perception_cam_height / (-dir_world.z)
+        t = cam['height'] / (-dir_world.z)
         cam_loc = cam_transform.location
         return cam_loc.x + t * dir_world.x, cam_loc.y + t * dir_world.y
 
@@ -646,30 +670,60 @@ class CarlaMPCEnv(gym.Env):
         keep_rows = int(frame.shape[0] * self._HOOD_CROP_FRAC)
         return frame[:keep_rows]
 
+    def _detect_fused_perception_points(self):
+        """
+        Run YOLO on every attached camera independently and back-project each
+        detection to world (x, y) in its OWN camera's frame -- not pixel
+        stitching, which assumes nearby objects line up across views and
+        breaks under parallax.  Fusion happens here, after projection, in
+        world coordinates: detections from different cameras within
+        _FUSION_DEDUP_RADIUS_M are the same physical object seen twice (the
+        front/side FOVs overlap near +-45 deg) and are merged to one point
+        before the tracker ever sees them.
+        """
+        model = self._get_yolo_model()
+        raw_points = []
+        for cam_name, cam in self._perception_cameras.items():
+            frame = cam['frame']
+            if frame is None:
+                continue
+            results = model.predict(self._crop_hood(frame), verbose=False, conf=0.35)[0]
+            for box in results.boxes:
+                if int(box.cls[0]) not in self._PERCEPTION_CLASSES:
+                    continue
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                world_xy = self._pixel_to_ground_world(cam_name, (x1 + x2) / 2.0, y2)
+                if world_xy is not None:
+                    raw_points.append(world_xy)
+
+        # Greedy single-pass clustering: fine here because duplicates only
+        # arise from genuine FOV overlap between two (not many) cameras, so
+        # clusters of size > 2 are not expected.
+        fused = []
+        for wx, wy in raw_points:
+            for cluster in fused:
+                if math.hypot(wx - cluster[0], wy - cluster[1]) < self._FUSION_DEDUP_RADIUS_M:
+                    n = cluster[2]
+                    cluster[0] = (cluster[0] * n + wx) / (n + 1)
+                    cluster[1] = (cluster[1] * n + wy) / (n + 1)
+                    cluster[2] = n + 1
+                    break
+            else:
+                fused.append([wx, wy, 1])
+        return [(c[0], c[1]) for c in fused]
+
     def _detect_obstacles_perception(self):
         """
         Perception-pipeline replacement for the ground-truth loop in
-        _detect_obstacles(): pretrained YOLO on the forward camera frame,
-        ground-plane back-projection to world (x, y), then the exact same
-        Frenet conversion and (num_obstacles, 2) [s, d] output the CBF already
-        expects.  Nothing past self.selected_obstacles changes.
+        _detect_obstacles(): the fused multi-camera detections above, then
+        the exact same Frenet conversion and (num_obstacles, 2) [s, d] output
+        the CBF already expects.  Nothing past self.selected_obstacles changes.
         """
         self.selected_obstacles = np.ones((self.num_obstacles, 2)) * -100
-        frame = self._perception_frame
-        if frame is None or self._perception_camera is None:
+        if not self._perception_cameras:
             return
 
-        model = self._get_yolo_model()
-        results = model.predict(self._crop_hood(frame), verbose=False, conf=0.35)[0]
-
-        detections = []
-        for box in results.boxes:
-            if int(box.cls[0]) not in self._PERCEPTION_CLASSES:
-                continue
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            world_xy = self._pixel_to_ground_world((x1 + x2) / 2.0, y2)  # box-bottom = ground contact
-            if world_xy is not None:
-                detections.append(world_xy)
+        detections = self._detect_fused_perception_points()
 
         # Nearest-neighbour association against last step's tracks, so each
         # obstacle keeps a persistent Frenet s_hint across frames.  Without
@@ -1823,10 +1877,11 @@ class CarlaMPCEnv(gym.Env):
             try:
                 self.lane_invasion_sensor.stop()
             except: pass
-        if hasattr(self, '_perception_camera') and self._perception_camera is not None:
-            try:
-                self._perception_camera.stop()
-            except: pass
+        if hasattr(self, '_perception_cameras'):
+            for cam in self._perception_cameras.values():
+                try:
+                    cam['actor'].stop()
+                except: pass
 
         actors_to_destroy = []
 
@@ -1840,9 +1895,10 @@ class CarlaMPCEnv(gym.Env):
         if hasattr(self, 'obstacle_sensor') and self.obstacle_sensor is not None:
             actors_to_destroy.append(self.obstacle_sensor)
 
-        if hasattr(self, '_perception_camera') and self._perception_camera is not None:
-            actors_to_destroy.append(self._perception_camera)
-        
+        if hasattr(self, '_perception_cameras'):
+            for cam in self._perception_cameras.values():
+                actors_to_destroy.append(cam['actor'])
+
         # Then collect the vehicle
         if self.vehicle is not None:
             actors_to_destroy.append(self.vehicle)
@@ -1870,8 +1926,7 @@ class CarlaMPCEnv(gym.Env):
         self.collision_sensor = None
         self.lane_invasion_sensor = None
         self.obstacle_sensor = None
-        self._perception_camera = None
-        self._perception_frame = None
+        self._perception_cameras = {}
         self._perception_tracks = []
         self.sensor_detected_obstacles = []
         self.vehicle = None

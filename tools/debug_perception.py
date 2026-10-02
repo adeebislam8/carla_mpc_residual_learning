@@ -4,15 +4,20 @@ Visual + numeric sanity check for the pretrained-YOLO obstacle pipeline
 (carlaEnv.py's use_perception path) -- NOT a benchmark.
 
 Runs one episode with --perception on, drives the nominal MPCC (zero
-residual) for a handful of steps, and for each step:
-  - saves the raw camera frame with YOLO boxes drawn, so a sign/axis error
-    in the mount transform or FOV shows up visually (e.g. boxes on cars but
+residual) for a handful of steps, and for each step, for EACH camera in the
+rig (front/left/right -- see CarlaMPCEnv._PERCEPTION_CAMERA_SPECS):
+  - saves that camera's raw frame with YOLO boxes drawn, so a sign/axis error
+    in its mount transform or FOV shows up visually (e.g. boxes on cars but
     the frame looks like it's pointed at the sky).
   - back-projects every detection to world (x, y) and matches it against the
     nearest REAL NPC position (ground truth, from the same actors the old
     ground-truth obstacle path reads), so a bug in
     CarlaMPCEnv._pixel_to_ground_world shows up as a large, consistent
     position error rather than as a benchmark number that's merely "worse".
+
+This checks each camera independently (not the fused output of
+_detect_fused_perception_points) so a problem with one camera's mount/FOV
+doesn't hide behind the other two still working.
 
 This is the 30-second check mentioned when the perception path was added:
 run it before trusting any --perception benchmark result.
@@ -79,22 +84,13 @@ def main():
     print(f"resetting on {args.town} ...")
     env.reset()
 
-    all_errors = []
-    unmatched_detections = 0
-    frames_with_detections = 0
+    cam_names = list(env._perception_cameras.keys())
+    all_errors = {name: [] for name in cam_names}
+    unmatched_detections = {name: 0 for name in cam_names}
+    frames_with_detections = {name: 0 for name in cam_names}
 
     for step in range(args.steps):
         obs, reward, terminated, truncated, info = env.step(np.zeros(2))
-
-        frame = env._perception_frame
-        if frame is None:
-            print(f"step {step:3d}: no camera frame yet")
-            if terminated or truncated:
-                break
-            continue
-
-        model = CarlaMPCEnv._get_yolo_model()
-        results = model.predict(env._crop_hood(frame), verbose=False, conf=0.35)[0]
 
         # Ground truth NPC world positions this step, for matching -- but only
         # ones actually in the window the real obstacle pipeline cares about
@@ -119,43 +115,55 @@ def main():
             if -5.0 < ds < 30.0:
                 gt_positions.append((loc.x, loc.y))
 
-        step_errors = []
-        n_detections = 0
-        for box in results.boxes:
-            cls_id = int(box.cls[0])
-            if cls_id not in CarlaMPCEnv._PERCEPTION_CLASSES:
-                continue
-            n_detections += 1
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            world_xy = env._pixel_to_ground_world((x1 + x2) / 2.0, y2)
-            if world_xy is None:
-                continue
-            wx, wy = world_xy
-            if not gt_positions:
-                continue
-            dists = [math.hypot(wx - gx, wy - gy) for gx, gy in gt_positions]
-            best = min(dists)
-            if best <= args.match_radius:
-                step_errors.append(best)
-            else:
-                unmatched_detections += 1
+        model = CarlaMPCEnv._get_yolo_model()
+        per_cam_summary = []
 
-        if n_detections:
-            frames_with_detections += 1
-        all_errors.extend(step_errors)
+        for cam_name in cam_names:
+            frame = env._perception_cameras[cam_name]['frame']
+            if frame is None:
+                per_cam_summary.append(f"{cam_name}=no frame yet")
+                continue
 
-        err_txt = (f"mean err {np.mean(step_errors):.2f} m "
-                   f"(n={len(step_errors)})" if step_errors else "no matches")
+            results = model.predict(env._crop_hood(frame), verbose=False, conf=0.35)[0]
+
+            step_errors = []
+            n_detections = 0
+            for box in results.boxes:
+                cls_id = int(box.cls[0])
+                if cls_id not in CarlaMPCEnv._PERCEPTION_CLASSES:
+                    continue
+                n_detections += 1
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                world_xy = env._pixel_to_ground_world(cam_name, (x1 + x2) / 2.0, y2)
+                if world_xy is None:
+                    continue
+                wx, wy = world_xy
+                if not gt_positions:
+                    continue
+                dists = [math.hypot(wx - gx, wy - gy) for gx, gy in gt_positions]
+                best = min(dists)
+                if best <= args.match_radius:
+                    step_errors.append(best)
+                else:
+                    unmatched_detections[cam_name] += 1
+
+            if n_detections:
+                frames_with_detections[cam_name] += 1
+            all_errors[cam_name].extend(step_errors)
+
+            err_txt = (f"err {np.mean(step_errors):.1f}m(n={len(step_errors)})"
+                       if step_errors else "no match")
+            per_cam_summary.append(f"{cam_name}={n_detections}det/{err_txt}")
+
+            if args.save_every > 0 and step % args.save_every == 0:
+                import cv2
+                annotated = _draw_boxes(frame, results, CarlaMPCEnv._PERCEPTION_CLASSES)
+                out_path = os.path.join(args.out_dir, f"frame_{cam_name}_{step:04d}.png")
+                cv2.imwrite(out_path, annotated)
+
         ds_txt = f"{nearest_ds:+.1f}" if nearest_ds is not None else "?"
-        print(f"step {step:3d}: {n_detections} detections, "
-              f"{len(gt_positions)} NPC(s) in the -5..30m window "
-              f"(nearest any NPC: ds={ds_txt} m) -> {err_txt}")
-
-        if args.save_every > 0 and step % args.save_every == 0:
-            import cv2
-            annotated = _draw_boxes(frame, results, CarlaMPCEnv._PERCEPTION_CLASSES)
-            out_path = os.path.join(args.out_dir, f"frame_{step:04d}.png")
-            cv2.imwrite(out_path, annotated)
+        print(f"step {step:3d}: {len(gt_positions)} NPC(s) in -5..30m window "
+              f"(nearest ds={ds_txt}m) -> " + "  ".join(per_cam_summary))
 
         if terminated or truncated:
             print("episode ended, stopping")
@@ -165,19 +173,23 @@ def main():
 
     summary_path = os.path.join(args.out_dir, "summary.txt")
     with open(summary_path, 'w') as f:
-        f.write(f"town: {args.town}  steps: {args.steps}\n")
-        f.write(f"frames with >=1 detection: {frames_with_detections}\n")
-        f.write(f"matched detections: {len(all_errors)}\n")
-        f.write(f"unmatched detections (false positive or bad projection, "
-                f">{args.match_radius} m from any real NPC): "
-                f"{unmatched_detections}\n")
-        if all_errors:
-            f.write(f"back-projection error: mean {np.mean(all_errors):.2f} m, "
-                    f"median {np.median(all_errors):.2f} m, "
-                    f"max {np.max(all_errors):.2f} m\n")
-        else:
-            f.write("no matched detections at all -- check the mount "
-                    "transform/FOV/intrinsics before trusting anything else.\n")
+        f.write(f"town: {args.town}  steps: {args.steps}\n\n")
+        for cam_name in cam_names:
+            errs = all_errors[cam_name]
+            f.write(f"[{cam_name}]\n")
+            f.write(f"  frames with >=1 detection: {frames_with_detections[cam_name]}\n")
+            f.write(f"  matched detections: {len(errs)}\n")
+            f.write(f"  unmatched detections (false positive or bad "
+                    f"projection, >{args.match_radius} m from any real NPC): "
+                    f"{unmatched_detections[cam_name]}\n")
+            if errs:
+                f.write(f"  back-projection error: mean {np.mean(errs):.2f} m, "
+                        f"median {np.median(errs):.2f} m, "
+                        f"max {np.max(errs):.2f} m\n")
+            else:
+                f.write("  no matched detections at all -- check this "
+                        "camera's mount transform/FOV/intrinsics.\n")
+            f.write("\n")
 
     print(f"\nsaved annotated frames + summary to {args.out_dir}/")
     print(open(summary_path).read())
