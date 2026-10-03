@@ -26,6 +26,7 @@ overtakes and fewer collisions is a trade worth taking.
 """
 
 import argparse
+import csv
 import json
 import os
 import statistics
@@ -231,6 +232,33 @@ def _run_seed(env, args, seed, episodes, model=None, obs_norm=None):
             'strong_suppression_frac': info.get('strong_suppression_frac'),
             'nominal_infeasible': info.get('nominal_infeasible'),
         }
+        # Reward-term breakdown (_reward_term_metrics() in carlaEnv.py).
+        # Prefix-whitelisted rather than named one by one -- the term set
+        # lives in _calculate_reward and can grow without a matching edit
+        # here, same as PAPER_METRICS does not need to enumerate every raw
+        # per-episode field.
+        for k, v in info.items():
+            if k.startswith('reward_mean_'):
+                rec[k] = v
+
+        # Misbehaviour trace: only present when the episode ended in
+        # collision (carlaEnv.py only attaches it then).  Written to its own
+        # CSV rather than kept in `episodes` -- that list is already
+        # per-episode scalars, and a few hundred per-step rows per collision
+        # would bloat the JSON this run also writes.
+        trace = info.get('step_trace')
+        if trace:
+            trace_dir = os.path.join(args.out_dir, 'traces')
+            os.makedirs(trace_dir, exist_ok=True)
+            trace_path = os.path.join(
+                trace_dir, f"{args.label}_seed{seed}_ep{ep}.csv")
+            fieldnames = sorted({k for row in trace for k in row})
+            with open(trace_path, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                w.writerows(trace)
+            rec['trace_file'] = trace_path
+
         episodes.append(rec)
         # Inline progress: episodes done / total for this seed, a coarse bar, and
         # a running success tally, so a 50-minute sweep shows movement rather
@@ -269,8 +297,19 @@ def summarize(res):
     n_ovt = sum(e['overtakes'] for e in eps)
 
     finished = [e for e in eps if e['outcome'] == 'success']
+    # Reward-term breakdown: term set is dynamic (set in carlaEnv.py's
+    # _calculate_reward, not enumerated here), mean per-step contribution
+    # averaged across episodes, nan-safe for b0 runs the same way alpha is
+    # (the key is only absent if _calculate_reward was never called, which
+    # does not happen -- but _omean's nan-safety costs nothing to reuse).
+    reward_term_keys = {k for e in eps for k in e if k.startswith('reward_mean_')}
+    reward_terms = {
+        k.replace('reward_mean_', 'mean_reward_', 1): _omean(eps, k)
+        for k in reward_term_keys
+    }
     return {
         'n_episodes': n,
+        **reward_terms,
         'success_rate': frac('success'),
         'collision_rate': frac('collision'),
         'stall_rate': frac('stall'),
@@ -434,6 +473,23 @@ def write_report(res, path):
             if abs(s['mean_alpha'] - 1.0) < 1e-3:
                 L.append("  -> alpha never moved: b5 is behaviourally identical to b2,")
                 L.append("     so any b5-vs-b2 difference here is noise, not the filter.")
+            L.append("")
+        reward_rows = sorted(
+            ((k[len('mean_reward_'):], v) for k, v in s.items()
+             if k.startswith('mean_reward_') and v == v),   # nan-safe
+            key=lambda kv: -abs(kv[1]))
+        if reward_rows:
+            L.append("REWARD TERM BREAKDOWN  (mean contribution per step, by term)")
+            L.append("-" * 72)
+            total = sum(v for _, v in reward_rows)
+            for name, v in reward_rows:
+                share = f"{100*abs(v)/abs(total):5.1f}%" if total else "    -"
+                L.append(f"  {name:<16} {v:+9.4f} / step   ({share} of |total|)")
+            L.append(f"  {'TOTAL':<16} {total:+9.4f} / step")
+            L.append("  -> ranked by |contribution| -- the policy's own action")
+            L.append("     only ever touches 'counterfactual' and 'action_penalty'.")
+            L.append("     if those two are small next to the rest, the residual")
+            L.append("     cannot meaningfully influence its own reward.")
             L.append("")
         L.append("SOLVER  (secondary -- a rise here is acceptable if overtakes rise too)")
         L.append("-" * 72)

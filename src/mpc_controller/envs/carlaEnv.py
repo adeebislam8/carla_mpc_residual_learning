@@ -286,6 +286,8 @@ class CarlaMPCEnv(gym.Env):
         self.residual_authority = None   # built in _initialize_mpc()
         self.last_authority_info = {}
         self.authority_history = []      # per-step alpha, for Section 17 metrics
+        self.reward_term_history = []    # per-step {term: value}, for _reward_term_metrics()
+        self._step_trace = []            # per-step misbehaviour trace, see step()
 
         # ── Recording ─────────────────────────────────────────
         self.camera_sensor = None
@@ -937,11 +939,21 @@ class CarlaMPCEnv(gym.Env):
         self.path_length = self.frenet_converter.get_path_length()
         self._road_widths = np.array(road_widths)
 
+        # Waypoints are in path order (output of calculate_route), so the
+        # hint for each is simply the previous one's own computed s -- same
+        # fix already applied to _frenet_follow_controller. Unhinted, this
+        # table could land on a wrong branch; its Town03 jump rate (10.4%)
+        # directly explains the clamped-looking max|n|=50.00 values and the
+        # 81.7% outside-corridor figure seen on the unbounded Town03 ablation
+        # (2026-10-02) -- off_corridor and the reward's corridor bounds both
+        # read this table.
         road_width_s_list = []
+        s_hint = None
         for x, y in waypoint_coords:
-            s, _, _ = self.frenet_converter.world_to_frenet(x, y, 0)
+            s, _, _ = self.frenet_converter.world_to_frenet(x, y, 0, s_hint=s_hint)
             road_width_s_list.append(s)
-        
+            s_hint = s
+
         self._road_width_s = np.array(road_width_s_list)
         
         return True
@@ -1415,14 +1427,25 @@ class CarlaMPCEnv(gym.Env):
         * Finish time is measured in SIMULATION time.  It used time.time(), so
           the reward depended on machine speed, rendering and logging.
         """
+        # Per-step breakdown by named term, so a policy's reward can be
+        # attributed to WHY it got what it got, not just the summed scalar.
+        # Appended to self.reward_term_history every call; _reward_term_metrics()
+        # averages it per episode. See [[reward-function-defects]] for why this
+        # was needed -- three of these terms turned out to dominate by
+        # 2-3 orders of magnitude over anything the residual itself controls.
+        terms = {}
+
         if self.collision:
+            terms['collision'] = -200.0
+            self.reward_term_history.append(terms)
             return -200.0
 
         sim_time = self.current_step * self.mpc_dt
 
         # --- progress -------------------------------------------------------
         progress = self.current_s - self.prev_s
-        reward = progress / (self.target_speed * self.mpc_dt)
+        terms['progress'] = progress / (self.target_speed * self.mpc_dt)
+        reward = terms['progress']
 
         # --- lateral deviation, gated on an obstacle ahead -------------------
         # Same logic as the MPCC's overtake gate: leaving the lane is penalised
@@ -1441,19 +1464,22 @@ class CarlaMPCEnv(gym.Env):
                 break
         gate = 0.1 if obstacle_ahead else 1.0
 
-        reward += gate * (-2.0 * (2 * d_normalized - 1) ** 4)
+        terms['lateral_dev'] = gate * (-2.0 * (2 * d_normalized - 1) ** 4)
+        reward += terms['lateral_dev']
 
         # Leaving the drivable corridor is never acceptable, gate or not.
-        if not (n_min < self.current_d < n_max):
-            reward -= 5.0
+        terms['off_corridor'] = -5.0 if not (n_min < self.current_d < n_max) else 0.0
+        reward += terms['off_corridor']
 
         # --- comfort / speed -------------------------------------------------
-        reward -= 0.1 * abs(self.lateral_accel)
+        terms['comfort'] = -0.1 * abs(self.lateral_accel)
+        reward += terms['comfort']
 
         speed_error = abs(self.current_speed - self.target_speed)
-        reward -= 0.05 * speed_error
-        if self.current_speed > self.target_speed * 1.3:
-            reward -= 1.0
+        terms['speed_error'] = -0.05 * speed_error
+        reward += terms['speed_error']
+        terms['overspeed'] = -1.0 if self.current_speed > self.target_speed * 1.3 else 0.0
+        reward += terms['overspeed']
 
         # Stalling is worse than being slow: dense, so it survives discounting.
         # But UNCAPPED this inverts the intended ordering -- stalling is safe,
@@ -1466,23 +1492,29 @@ class CarlaMPCEnv(gym.Env):
         # (~1.25s, still dense enough to be felt under discounting) so total
         # exposure is bounded at -125 regardless of how the stalled steps are
         # distributed across the episode.
+        terms['stall'] = 0.0
         if self.current_speed < 1.0:
             if self._stall_penalty_steps < 25:
-                reward -= 5.0
+                terms['stall'] = -5.0
+                reward += terms['stall']
                 self._stall_penalty_steps += 1
 
         # --- residual-relative term -----------------------------------------
         # Attributable to the action by construction.  Small weight: it shapes,
         # it does not dominate.
+        terms['counterfactual'] = 0.0
         if u_nom is not None and u_final is not None:
-            reward += 2.0 * self._nominal_counterfactual(u_nom, u_final)
+            terms['counterfactual'] = 2.0 * self._nominal_counterfactual(u_nom, u_final)
+            reward += terms['counterfactual']
 
         # --- keep the residual small unless it earns its place ---------------
         # "RL is an optional adaptive correction, not an equally trusted
         # controller" -- make that a property of the objective, not a hope.
-        reward -= 0.05 * float(np.sum(np.square(action)))
+        terms['action_penalty'] = -0.05 * float(np.sum(np.square(action)))
+        reward += terms['action_penalty']
 
         # --- overtaking -------------------------------------------------------
+        terms['overtake'] = 0.0
         for npc_data in self.racing_npcs:
             npc = npc_data.get("actor")
             if npc is None or not npc.is_alive:
@@ -1494,6 +1526,7 @@ class CarlaMPCEnv(gym.Env):
             ds = self.current_s - npc_s
             if 5.0 < ds < 40.0 and npc_id not in self.overtaken_npcs:
                 self.overtaken_npcs.add(npc_id)
+                terms['overtake'] += 50.0
                 reward += 50.0
                 print(f"🏎️  Overtook NPC {npc_id}! Total overtakes: {len(self.overtaken_npcs)}")
 
@@ -1502,21 +1535,41 @@ class CarlaMPCEnv(gym.Env):
         # the pressure to keep moving is applied every step instead.  This is
         # what stops the policy dawdling without needing a terminal bonus to
         # survive 800 steps of discounting.
-        reward -= 0.02
+        terms['urgency'] = -0.02
+        reward += terms['urgency']
 
         # --- goal -------------------------------------------------------------
+        terms['goal'] = 0.0
         if self.current_s >= self.path_length - self.goal_margin_m:
-            reward += 200.0
             expected_time = self.path_length / max(self.target_speed, 1e-6)
             time_ratio = expected_time / max(sim_time, 1.0)
             time_bonus = 100.0 * min(time_ratio, 2.0)     # simulation time
-            reward += time_bonus
             overtake_finish_bonus = len(self.overtaken_npcs) * 25.0
-            reward += overtake_finish_bonus
+            terms['goal'] = 200.0 + time_bonus + overtake_finish_bonus
+            reward += terms['goal']
             print(f"🏁 Finished in {sim_time:.1f}s sim! Time bonus: {time_bonus:.1f}, "
                   f"Overtakes: {len(self.overtaken_npcs)} (+{overtake_finish_bonus:.1f})")
 
+        self.reward_term_history.append(terms)
         return reward
+
+    def _reward_term_metrics(self) -> Dict:
+        """
+        Mean per-step contribution of each named reward term, averaged over
+        the episode so far.  Same pattern as _authority_metrics(): attached to
+        every step's info so benchmark_mpcc.py can aggregate without extra
+        plumbing.  Answers "how much does each term actually contribute",
+        which a summed scalar reward cannot.
+        """
+        if not self.reward_term_history:
+            return {}
+        keys = set()
+        for t in self.reward_term_history:
+            keys.update(t.keys())
+        return {
+            f"reward_mean_{k}": float(np.mean([t.get(k, 0.0) for t in self.reward_term_history]))
+            for k in keys
+        }
 
     def _authority_metrics(self) -> Dict:
         """
@@ -1706,6 +1759,8 @@ class CarlaMPCEnv(gym.Env):
             self.start_time = time.time()
             self.prev_s = 0.0
             self.authority_history = []
+            self.reward_term_history = []
+            self._step_trace = []
             self.last_authority_info = {}
             self._ego_s_hint = None
             
@@ -1849,6 +1904,35 @@ class CarlaMPCEnv(gym.Env):
                 u_final=(final_throttle, final_steering))
             done, info = self._check_done()
             info.update(self._authority_metrics())
+            info.update(self._reward_term_metrics())
+
+            # Per-step misbehaviour trace -- buffered every step (cheap: a
+            # list of small dicts, freed at the next reset()), but only
+            # ATTACHED to info -- and so only ever written to disk by the
+            # benchmark harness -- when the episode ends in collision.
+            # Aggregate metrics (mean_reward_*, mean_alpha, ...) answer "how
+            # much does each term contribute on average"; this answers "what
+            # was happening in the steps leading up to a specific failure",
+            # which an average cannot.
+            nearest_obs_ds = None
+            for s_obs, _ in self.selected_obstacles:
+                if s_obs > -50.0:
+                    ds_obs = s_obs - self.current_s
+                    if nearest_obs_ds is None or abs(ds_obs) < abs(nearest_obs_ds):
+                        nearest_obs_ds = ds_obs
+            self._step_trace.append({
+                'step': self.current_step, 's': float(self.current_s),
+                'd': float(self.current_d),
+                'residual_throttle': float(action[0]), 'residual_steer': float(action[1]),
+                'alpha': float(self.authority_history[-1]) if self.authority_history else 1.0,
+                'mpc_throttle': float(mpc_throttle), 'mpc_steering': float(mpc_steering),
+                'final_throttle': float(final_throttle), 'final_steering': float(final_steering),
+                'nearest_obstacle_ds': nearest_obs_ds,
+                'reward': float(reward),
+                **(self.reward_term_history[-1] if self.reward_term_history else {}),
+            })
+            if done and info.get('done_reason') == 'collision':
+                info['step_trace'] = self._step_trace
 
             if hasattr(self, 'render_mode') and self.render_mode == 'human':
                 self._draw_vehicle_info()

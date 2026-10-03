@@ -26,7 +26,7 @@ TIMESTEPS=300000
 # Nominal controller.  MUST match between training and evaluation -- a residual
 # learns "given THIS nominal behaviour, what correction helps", so training it
 # against a different MPCC config makes it invalid.
-CONTROLLER="--qc 0.5 --gate-depth 0.98"
+CONTROLLER="--qc 0.5 --gate-depth 0.98 --route-max 150"
 
 TRAIN_TOWN="Town01"                 # train on ONE town; cross-town IS the shift
 EVAL_TOWNS=("Town01" "Town02" "Town03")
