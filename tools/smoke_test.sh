@@ -22,7 +22,7 @@ bad()  { echo "  FAIL  $1"; FAIL=$((FAIL+1)); }
 step() { echo; echo "=================================================="; \
          echo ">>> $1"; echo "=================================================="; }
 
-rm -rf "models/${TMP_LABEL}" "results/${TMP_LABEL}"*.json \
+rm -rf "models/${TMP_LABEL}" "models/${TMP_LABEL}_v2" "results/${TMP_LABEL}"*.json \
        "results/${TMP_LABEL}"*.txt diagnostics_smoke 2>/dev/null
 
 # ---------------------------------------------------------------- 1. NOMINAL
@@ -60,6 +60,24 @@ fi
   || bad "no vecnormalize.pkl (evaluation would feed the policy raw observations)"
 
 # ------------------------------------------------------- 3/4. EVAL WITH MODEL
+# The model above was trained 'fixed'.  Evaluating it 'adaptive' is exactly the
+# b5 train/test mismatch, so the contract check must refuse it unprompted...
+step "3/5  policy contract refuses a mode the policy was not trained in"
+if [ -f "models/${TMP_LABEL}/final.zip" ]; then
+  if python tools/benchmark_mpcc.py --label "${TMP_LABEL}_refuse" \
+       --model "models/${TMP_LABEL}/final.zip" --algo sac \
+       --residual-mode adaptive --seeds 1 --episodes 1 \
+       --route-max 150 --qc 0.5 --gate-depth 0.98 \
+       > "results/${TMP_LABEL}_refuse.log" 2>&1; then
+    bad "evaluated a 'fixed' policy as 'adaptive' without complaint"
+  else
+    grep -q "policy contract mismatch" "results/${TMP_LABEL}_refuse.log" \
+      && ok "mismatch refused" || { bad "failed, but not on the contract check"; \
+                                    tail -10 "results/${TMP_LABEL}_refuse.log"; }
+  fi
+fi
+
+# ...and both code paths still run when the mismatch is deliberate.
 for MODE in fixed adaptive; do
   step "3/5  evaluation with model, residual-mode=${MODE}"
   if [ ! -f "models/${TMP_LABEL}/final.zip" ]; then
@@ -68,7 +86,7 @@ for MODE in fixed adaptive; do
   if python tools/benchmark_mpcc.py --label "${TMP_LABEL}_${MODE}" \
        --model "models/${TMP_LABEL}/final.zip" --algo sac \
        --residual-mode "$MODE" --seeds 1 --episodes 2 \
-       --route-max 150 --qc 0.5 --gate-depth 0.98 \
+       --route-max 150 --qc 0.5 --gate-depth 0.98 --allow-config-mismatch \
        > "results/${TMP_LABEL}_${MODE}.log" 2>&1; then
     ok "eval (${MODE}) completed"
     grep -q "applying observation normalisation" "results/${TMP_LABEL}_${MODE}.log" \
@@ -77,6 +95,42 @@ for MODE in fixed adaptive; do
     bad "eval (${MODE}) crashed"; tail -15 "results/${TMP_LABEL}_${MODE}.log"
   fi
 done
+
+# ---------------------------------------------------- 4b. RL v2 CONFIGURATION
+# The overnight RL v2 run: v2 observation, residual window with the skip
+# wrapper, 10-step authority rollout with the corridor, residual_max 0.5.
+V2_FLAGS="--residual-mode adaptive --residual-max 0.5 --authority-horizon 10 \
+--residual-window 25 --obs-version v2 --route-max 150 --qc 0.5 --gate-depth 0.98"
+step "4b/5  RL v2 config: train 2000 steps, then evaluate under the same flags"
+# shellcheck disable=SC2086
+if python tools/train_residual.py --label "${TMP_LABEL}_v2" --algo sac \
+     --timesteps 2000 --buffer-size 5000 $V2_FLAGS \
+     > "results/${TMP_LABEL}_v2_train.log" 2>&1; then
+  ok "v2 training completed"
+else
+  bad "v2 training crashed"; tail -20 "results/${TMP_LABEL}_v2_train.log"
+fi
+[ -f "models/${TMP_LABEL}_v2/train_config.json" ] && ok "train_config.json written" \
+  || bad "no train_config.json"
+if [ -s "models/${TMP_LABEL}_v2/outcomes.csv" ] \
+   && [ "$(wc -l < "models/${TMP_LABEL}_v2/outcomes.csv")" -ge 2 ]; then
+  ok "outcomes.csv has episodes ($(($(wc -l < "models/${TMP_LABEL}_v2/outcomes.csv") - 1)))"
+else
+  bad "outcomes.csv missing or empty -- no learning curve would be recorded"
+fi
+if [ -f "models/${TMP_LABEL}_v2/final.zip" ]; then
+  # shellcheck disable=SC2086
+  if python tools/benchmark_mpcc.py --label "${TMP_LABEL}_v2" \
+       --model "models/${TMP_LABEL}_v2/final.zip" --algo sac \
+       --seeds 1 --episodes 2 $V2_FLAGS \
+       > "results/${TMP_LABEL}_v2_eval.log" 2>&1; then
+    ok "v2 eval completed"
+    grep -q "policy contract matches" "results/${TMP_LABEL}_v2_eval.log" \
+      && ok "  contract matched" || bad "  contract not confirmed"
+  else
+    bad "v2 eval crashed"; tail -15 "results/${TMP_LABEL}_v2_eval.log"
+  fi
+fi
 
 # ------------------------------------------------------------- 5. COMPARISON
 step "5/5  comparison table"

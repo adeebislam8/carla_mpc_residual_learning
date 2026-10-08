@@ -29,6 +29,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -37,6 +38,48 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
+
+
+# Same tuple as train_residual.POLICY_CONTRACT, keyed by the argparse dest
+# names the two scripts share.  Kept literal rather than imported so this
+# script stays importable without the training dependencies.
+_POLICY_CONTRACT = ('residual_mode', 'residual_max', 'authority_horizon',
+                    'residual_window', 'obs_version', 'qc', 'gate_depth',
+                    'route_max', 'target_speed')
+
+
+def _check_policy_contract(args):
+    """
+    Refuse to evaluate a policy under flags it was not trained with.
+
+    b5 once ran for weeks evaluating an 'adaptive' arm whose policy had been
+    trained 'fixed' -- a silent train/test mismatch that invalidated the arm.
+    train_residual.py now writes train_config.json next to the model; this
+    compares every flag that changes what the policy sees or how its action
+    is applied.  Models trained before that file existed are let through with
+    a warning.
+    """
+    path = os.path.join(os.path.dirname(args.model), 'train_config.json')
+    if not os.path.exists(path):
+        print(f"  WARNING: no {path} -- cannot verify this policy is being "
+              f"evaluated under the flags it was trained with")
+        return
+    with open(path) as f:
+        trained = json.load(f)
+    mismatches = []
+    for key in _POLICY_CONTRACT:
+        if key in trained and getattr(args, key, None) != trained[key]:
+            mismatches.append(f"    --{key.replace('_', '-')}: trained "
+                              f"{trained[key]!r}, evaluating {getattr(args, key, None)!r}")
+    if mismatches:
+        msg = "policy contract mismatch with " + path + ":\n" + "\n".join(mismatches)
+        if args.allow_config_mismatch:
+            print("  WARNING: " + msg)
+        else:
+            raise SystemExit(msg + "\n  (pass --allow-config-mismatch only for "
+                                   "a deliberate transfer test)")
+    else:
+        print(f"  policy contract matches {path}")
 
 
 def run(args):
@@ -67,10 +110,21 @@ def run(args):
         # raw ones it is being asked about inputs it has never seen.  Use the
         # TRAINING statistics (never re-estimate on the eval town) -- that is
         # the whole point of freezing them for a distribution-shift experiment.
+        _check_policy_contract(args)
+
         vn = args.vecnormalize
         if vn is None:
-            guess = os.path.join(os.path.dirname(args.model), 'vecnormalize.pkl')
-            vn = guess if os.path.exists(guess) else None
+            # final.zip -> vecnormalize.pkl; a CheckpointCallback snapshot
+            # <prefix>_<N>_steps.zip -> <prefix>_vecnormalize_<N>_steps.pkl.
+            model_dir = os.path.dirname(args.model)
+            base = os.path.basename(args.model)
+            m = re.match(r'(.+)_(\d+)_steps\.zip$', base)
+            candidates = []
+            if m:
+                candidates.append(os.path.join(
+                    model_dir, f'{m.group(1)}_vecnormalize_{m.group(2)}_steps.pkl'))
+            candidates.append(os.path.join(model_dir, 'vecnormalize.pkl'))
+            vn = next((c for c in candidates if os.path.exists(c)), None)
         if vn:
             # VecNormalize.load() calls set_venv(), which dereferences the venv
             # -- passing None raises AttributeError.  Unpickle directly instead:
@@ -114,6 +168,10 @@ def run(args):
             lookahead=args.lookahead,
             r3_cap=args.r3_cap,
             residual_mode=args.residual_mode,
+            residual_max=args.residual_max,
+            authority_horizon=args.authority_horizon,
+            residual_window_m=args.residual_window,
+            obs_version=args.obs_version,
             alat_slack=args.alat_slack,
             junction_margin=args.junction_margin,
             n_overtake=args.n_overtake,
@@ -709,6 +767,18 @@ def main():
                     help="'fixed' = u_nom + residual_max*a (B2); 'adaptive' = "
                          "scaled by the CBF-derived alpha_safe (B5). Irrelevant "
                          "without --model, since the action is zero.")
+    ap.add_argument('--residual-max', type=float, default=0.1,
+                    help='must match training (train_config.json is checked)')
+    ap.add_argument('--authority-horizon', type=int, default=1,
+                    help='authority gate rollout steps; must match training')
+    ap.add_argument('--residual-window', type=float, default=None, metavar='M',
+                    help='residual acts only with an obstacle 0 < ds < M ahead; '
+                         'must match training')
+    ap.add_argument('--obs-version', default='v1', choices=['v1', 'v2'],
+                    help='observation layout; must match training')
+    ap.add_argument('--allow-config-mismatch', action='store_true',
+                    help='evaluate even if flags differ from train_config.json '
+                         '(only for deliberate transfer tests)')
     ap.add_argument('--vecnormalize', default=None,
                     help='path to vecnormalize.pkl from training. Auto-detected '
                          'next to --model if not given.')

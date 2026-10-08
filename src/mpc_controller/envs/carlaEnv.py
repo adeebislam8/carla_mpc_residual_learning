@@ -103,6 +103,9 @@ class CarlaMPCEnv(gym.Env):
         junction_margin: float = 4.0,
         n_overtake: float = None,
         use_perception: bool = False,
+        authority_horizon: int = 1,
+        residual_window_m: float = None,
+        obs_version: str = 'v1',
     ):
         """
         residual_mode: 'adaptive' derives the residual authority from the CBF
@@ -112,6 +115,18 @@ class CarlaMPCEnv(gym.Env):
         residual_max: residual magnitude that alpha = 1 corresponds to.  Left at
             0.1 so 'adaptive' at full authority matches the old fixed law, which
             makes the B2-vs-B5 comparison a clean single-variable change.
+        authority_horizon: steps the authority gate rolls the final action
+            forward (see ResidualAuthority).  1 = the original one-step check,
+            which cannot see throttle; 10 is needed before residual_max is
+            raised much above 0.1.
+        residual_window_m: if set, the residual is applied only while an
+            obstacle is between 0 and this many metres ahead; elsewhere the
+            final action is the nominal MPCC action.  None = always applied.
+        obs_version: 'v1' = the original 116-dim observation (absolute s,
+            remaining distance, step count, a never-updated 60-dim MPC
+            prediction).  'v2' = route-position-free, with relative obstacle
+            positions and speeds -- see _get_observation_v2().  Policies are
+            tied to the version they were trained with.
         """
         super().__init__()
         random.seed(seed)
@@ -166,6 +181,11 @@ class CarlaMPCEnv(gym.Env):
         self.current_step = 0
         self.lookahead_distance = lookahead_distance
         self.num_obstacles = num_obstacles
+        if obs_version not in ('v1', 'v2'):
+            raise ValueError(f"obs_version must be 'v1' or 'v2', got {obs_version!r}")
+        self.obs_version = obs_version
+        if obs_version == 'v2':
+            state_dim = self._obs_v2_dim(num_obstacles)
         self.state_dim = state_dim
         
         # MPC parameters
@@ -212,6 +232,8 @@ class CarlaMPCEnv(gym.Env):
         
         # Obstacles
         self.selected_obstacles = np.ones((num_obstacles, 2)) * -100
+        # Speed along the path of each selected obstacle, m/s (0 when unknown).
+        self.selected_obstacle_vs = np.zeros(num_obstacles)
         self.overtaken_npcs = set()
         
         # Episode state
@@ -283,6 +305,9 @@ class CarlaMPCEnv(gym.Env):
         self._next_track_id = 0
         self.residual_mode = residual_mode
         self.residual_max = residual_max
+        self.authority_horizon = authority_horizon
+        self.residual_window_m = residual_window_m
+        self.residual_active = True      # set per step; see _residual_window_active()
         self.residual_authority = None   # built in _initialize_mpc()
         self.last_authority_info = {}
         self.authority_history = []      # per-step alpha, for Section 17 metrics
@@ -727,6 +752,7 @@ class CarlaMPCEnv(gym.Env):
         the CBF already expects.  Nothing past self.selected_obstacles changes.
         """
         self.selected_obstacles = np.ones((self.num_obstacles, 2)) * -100
+        self.selected_obstacle_vs = np.zeros(self.num_obstacles)
         if not self._perception_cameras:
             return
 
@@ -783,14 +809,25 @@ class CarlaMPCEnv(gym.Env):
                     track['x'], track['y'], 0, s_hint=track['s_hint'])
             except Exception:
                 continue
+            # Path speed by finite difference against this track's previous
+            # fresh fix.  Noisy (detections jitter), but it is all perception
+            # can offer; 0 on a track's first fix.
+            v_obs = 0.0
+            if track['s_hint'] is not None and track.get('s_step') is not None:
+                elapsed = (self.current_step - track['s_step']) * self.mpc_dt
+                if elapsed > 0:
+                    v_obs = (s_obs - track['s_hint']) / elapsed
             track['s_hint'] = s_obs
+            track['s_step'] = self.current_step
             ds = s_obs - self.current_s
             if -5.0 < ds < 30.0:
-                obstacles.append({'s': s_obs, 'd': d_obs, 'distance': ds})
+                obstacles.append({'s': s_obs, 'd': d_obs, 'distance': ds,
+                                  'v': v_obs})
 
         obstacles.sort(key=lambda o: o['distance'])
         for i, obs in enumerate(obstacles[:self.num_obstacles]):
             self.selected_obstacles[i] = [obs['s'], obs['d']]
+            self.selected_obstacle_vs[i] = obs['v']
 
     def _on_collision(self, event):
         """
@@ -1251,7 +1288,8 @@ class CarlaMPCEnv(gym.Env):
         # Residual authority re-verifies the CBF on the residual-modified
         # action, so it must be built from the same model the OCP compiled.
         self.residual_authority = ResidualAuthority.from_mpc_model(
-            self.mpc_controller.model, dt=self.mpc_dt
+            self.mpc_controller.model, dt=self.mpc_dt,
+            horizon_steps=self.authority_horizon,
         )
     
     def _update_vehicle_state(self):
@@ -1298,8 +1336,9 @@ class CarlaMPCEnv(gym.Env):
             self._detect_obstacles_perception()
             return
         self.selected_obstacles = np.ones((self.num_obstacles, 2)) * -100
+        self.selected_obstacle_vs = np.zeros(self.num_obstacles)
         obstacles = []
-        
+
         MAX_OBS_LOOKAHEAD = 30.0  # Only care about obstacles within 30m
         
         for npc_data in self.racing_npcs:
@@ -1312,20 +1351,120 @@ class CarlaMPCEnv(gym.Env):
                     loc.x, loc.y, 0, s_hint=npc_data.get("s"))
                 ds = s_obs - self.current_s
                 if ds > -5.0 and ds < MAX_OBS_LOOKAHEAD:
+                    vel = npc.get_velocity()
                     obstacles.append({
                         's': s_obs,
                         'd': d_obs,
                         'distance': ds,
-                        'type': 'npc'
+                        'type': 'npc',
+                        # NPCs follow the route forward, so speed magnitude
+                        # is their speed along the path.
+                        'v': math.sqrt(vel.x ** 2 + vel.y ** 2),
                     })
             except:
                 pass
-        
+
         obstacles.sort(key=lambda x: x['distance'])
         for i, obs in enumerate(obstacles[:self.num_obstacles]):
             self.selected_obstacles[i] = [obs['s'], obs['d']]
+            self.selected_obstacle_vs[i] = obs['v']
     
+    # ── corridor / residual window helpers ──────────────────────────────
+
+    def _corridor_at(self, s):
+        """(n_min, n_max) of the drivable corridor at arc length s, from the
+        same per-episode road-width table the reward and MPCC use.  None if
+        the table is not built yet."""
+        if self._road_widths is None or self._road_width_s is None:
+            return None
+        idx = int(np.argmin(np.abs(self._road_width_s - s)))
+        return (-float(self._road_widths[idx, 0]), float(self._road_widths[idx, 1]))
+
+    def _residual_window_active(self) -> bool:
+        """True when the residual may act this step: always if no window is
+        configured, else only with an obstacle 0 < ds < residual_window_m.
+        Outside the window the residual has nothing to correct -- lane keeping
+        is the MPCC's job -- and every transition it produced there was noise
+        in the replay buffer."""
+        if self.residual_window_m is None:
+            return True
+        for s_obs, _ in self.selected_obstacles:
+            if s_obs > -50.0 and 0.0 < (s_obs - self.current_s) < self.residual_window_m:
+                return True
+        return False
+
+    # ── observation ─────────────────────────────────────────────────────
+
+    _OBS_V2_EGO = 7        # d, heading, speed, lat accel, throttle, brake, steer
+    _OBS_V2_CORRIDOR = 2   # n_min, n_max at the current s
+    _OBS_V2_NOMINAL = 4    # MPC control now and previous
+    _OBS_V2_SPEED_ERR = 1
+    _OBS_V2_KAPPA = 30
+    _OBS_V2_PER_OBS = 4    # present, ds, d, relative speed
+    _OBS_V2_FAR_DS = 30.0  # ds written into empty slots (detection lookahead)
+
+    @classmethod
+    def _obs_v2_dim(cls, num_obstacles):
+        return (cls._OBS_V2_EGO + cls._OBS_V2_CORRIDOR + cls._OBS_V2_NOMINAL
+                + cls._OBS_V2_SPEED_ERR + cls._OBS_V2_KAPPA
+                + cls._OBS_V2_PER_OBS * num_obstacles)
+
     def _get_observation(self) -> np.ndarray:
+        if self.obs_version == 'v2':
+            obs = self._get_observation_v2()
+        else:
+            obs = self._get_observation_v1()
+        obs = obs.astype(np.float64)
+        # Catch NaN/Inf before they enter the buffer
+        if not np.isfinite(obs).all():
+            obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
+        return np.clip(obs, -1e6, 1e6)
+
+    def _get_observation_v2(self) -> np.ndarray:
+        """
+        Route-position-free observation for cross-town generalisation.
+
+        Dropped from v1: absolute s, remaining distance and step count (they
+        let a policy memorise where on a Town01 route it is), absolute
+        obstacle s (same leak), and the 60-dim MPC prediction (never updated
+        after initialisation, so always zero).  Added: corridor bounds,
+        obstacle positions RELATIVE to the ego, and obstacle speed relative to
+        the ego -- v1 had position only, so closing speed was unobservable.
+        """
+        mpc_control = self.mpc_controller.get_last_control() if self.mpc_controller else np.zeros(2)
+        mpc_prev = self.mpc_controller.get_previous_control() if self.mpc_controller else np.zeros(2)
+
+        corridor = self._corridor_at(self.current_s)
+        if corridor is None:
+            model = getattr(self.mpc_controller, 'model', None)
+            corridor = (getattr(model, 'n_min', -4.25), getattr(model, 'n_max', 1.0))
+
+        s_samples = np.linspace(
+            self.current_s,
+            min(self.current_s + self.lookahead_distance, self.path_length),
+            self._OBS_V2_KAPPA)
+        kappa_samples = np.array([
+            self.frenet_converter.get_curvature(s) for s in s_samples])
+
+        obstacles = np.zeros((self.num_obstacles, self._OBS_V2_PER_OBS))
+        obstacles[:, 1] = self._OBS_V2_FAR_DS
+        for i, (s_obs, d_obs) in enumerate(self.selected_obstacles):
+            if s_obs > -50.0:
+                obstacles[i] = [1.0, s_obs - self.current_s, d_obs,
+                                self.selected_obstacle_vs[i] - self.current_speed]
+
+        return np.concatenate([
+            [self.current_d, self.current_alpha, self.current_speed,
+             self.lateral_accel, self.current_throttle, self.current_brake,
+             self.current_steering],
+            corridor,
+            mpc_control, mpc_prev,
+            [self.current_speed - self.target_speed],
+            kappa_samples,
+            obstacles.flatten(),
+        ])
+
+    def _get_observation_v1(self) -> np.ndarray:
         """
         Construct observation vector:
         - Remaining distance to goal
@@ -1367,44 +1506,50 @@ class CarlaMPCEnv(gym.Env):
             [self.current_step],  # Step count
             mpc_pred_flat  # MPC prediction
         ])
-        
-        obs = obs.astype(np.float64)
-
-        # Catch NaN/Inf before they enter the buffer
-        if not np.isfinite(obs).all():
-            obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
-
-        return np.clip(obs, -1e6, 1e6)
+        return obs
     
     def _nominal_counterfactual(self, u_nom, u_final):
         """
-        One-step model counterfactual: how much better is the state the residual
-        steers us to than the one the nominal action alone would have reached?
+        Model counterfactual: how much better is the state the residual steers
+        us to than the one the nominal action alone would have reached?
 
         A true residual-relative reward needs to know what u_nom would have done,
         which CARLA cannot tell us without forking the simulator.  But the
-        residual's immediate effect IS computable: propagate both actions one
-        step through the same modelled dynamics the controller uses, and compare.
+        residual's short-horizon effect IS computable: roll both actions
+        through the same modelled dynamics the controller uses, and compare.
 
         Returns (value_final - value_nominal), positive when the residual helped.
         This is attributable to the action by construction, which is the whole
         point -- collisions and route completion are dominated by the MPCC, so
         grading the policy on them is mostly grading something it did not do.
+
+        Rewritten 2026-10-08.  The old version used throttle nowhere (one
+        Euler step of (s, n) with v held, through the gate's mirrored steering
+        sign) and scored lateral offset as -0.5*n^2, which fought every
+        overtake.  Now: hold each action for _CF_STEPS steps of the OCP's model
+        (throttle moves speed), and score progress, speed error and how far
+        the action pushes the CBF and corridor margins below zero.
         """
         auth = getattr(self, 'residual_authority', None)
         if auth is None:
             return 0.0
+        corridor = self._corridor_at(self.current_s)
         try:
             def value(u):
-                delta = float(u[1]) * auth.delta_max
-                s_n, n_n = auth._propagate(
+                traj = auth.rollout(
                     self.current_s, self.current_d, self.current_alpha,
-                    self.current_speed, delta)
-                # Cheap cost-to-go proxy: progress is good, lateral error is bad.
-                return 1.0 * (s_n - self.current_s) - 0.5 * (n_n ** 2)
+                    self.current_speed, float(u[0]), float(u[1]),
+                    steps=self._CF_STEPS)
+                progress = traj[-1, 0] - self.current_s
+                speed_err = abs(traj[-1, 3] - self.target_speed)
+                cbf = max(-10.0, min(0.0, auth.cbf_margin(traj, self.selected_obstacles)))
+                cor = max(-10.0, min(0.0, auth.corridor_margin(traj, corridor)))
+                return progress - 0.1 * speed_err + cbf + cor
             return float(value(u_final) - value(u_nom))
         except Exception:
             return 0.0
+
+    _CF_STEPS = 10   # 0.5 s at mpc_dt = 0.05
 
     def _calculate_reward(self, action: np.ndarray,
                           u_nom=None, u_final=None) -> float:
@@ -1825,6 +1970,14 @@ class CarlaMPCEnv(gym.Env):
             # (project spec Sections 6-7).  'fixed' keeps the old law for B2.
             du = np.array([action[0], action[1]], dtype=float) * self.residual_max
 
+            # Outside the obstacle window the residual is switched off, so the
+            # final action is exactly the nominal one.  Applied in evaluation
+            # as well as training: the policy is only ever asked to act where
+            # it was trained to.
+            self.residual_active = self._residual_window_active()
+            if not self.residual_active:
+                du = np.zeros(2)
+
             if self.residual_mode == 'adaptive':
                 alpha, self.last_authority_info = self.residual_authority.compute(
                     s=self.current_s,
@@ -1835,6 +1988,7 @@ class CarlaMPCEnv(gym.Env):
                     du=du,
                     obstacles=self.selected_obstacles,
                     support_gate=1.0,  # until the support monitor lands
+                    corridor=self._corridor_at(self.current_s),
                 )
             else:
                 alpha = 1.0
@@ -1903,6 +2057,7 @@ class CarlaMPCEnv(gym.Env):
                 u_nom=(mpc_throttle, mpc_steering),
                 u_final=(final_throttle, final_steering))
             done, info = self._check_done()
+            info['residual_active'] = bool(self.residual_active)
             info.update(self._authority_metrics())
             info.update(self._reward_term_metrics())
 
