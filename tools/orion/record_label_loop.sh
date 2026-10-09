@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
-# Record -> label -> prune, one seed at a time, so disk use stays at about one
+# Record -> label (-> optionally prune), one seed at a time.  With PRUNE=1 disk use stays at about one
 # chunk of JPEGs instead of the whole dataset (~25 GB for 300 episodes).
 #
-#   ./tools/orion/record_label_loop.sh                  # seeds 1..12, 25 episodes each
-#   SEEDS="1 2 3" EPISODES=10 ./tools/orion/record_label_loop.sh
+#   ./tools/orion/record_label_loop.sh                  # seeds 101..112, 25 episodes each
+#   SEEDS="101 102" EPISODES=10 PRUNE=1 ./tools/orion/record_label_loop.sh
+#
+# SEEDS: a seed fixes the whole route/traffic sequence (CarlaMPCEnv's per-
+# episode RNG), and benchmark_mpcc.py evaluates on seeds 1-5.  Recording on
+# those seeds would train the student on the exact evaluation routes, so
+# training data uses 101+ (round 0), 201+ (DAgger), 301+ (Town02 adaptation).
+#
+# PRUNE=1 deletes each episode's JPEGs once its labels verify.  Default 0:
+# keep the frames, so they can be re-labelled later (e.g. a compressed or
+# token-pruned teacher, or a different --stride) without re-recording.
 #
 # Per seed:
 #   1. start CARLA, record EPISODES episodes        (residual_mpc env)
@@ -24,7 +33,13 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
-SEEDS=${SEEDS:-"1 2 3 4 5 6 7 8 9 10 11 12"}
+SEEDS=${SEEDS:-"101 102 103 104 105 106 107 108 109 110 111 112"}
+PRUNE=${PRUNE:-0}
+for _s in $SEEDS; do
+  if [ "$_s" -le 5 ]; then
+    echo "seed $_s is an evaluation seed (benchmark uses 1-5) -- refusing"; exit 1
+  fi
+done
 EPISODES=${EPISODES:-25}
 TOWN=${TOWN:-Town01}
 D=${D:-$HOME/Documents/nett/orion_data}
@@ -71,9 +86,14 @@ EOF
 }
 
 for SEED in $SEEDS; do
-  EPS=("$REC/${TOWN}_s${SEED}_e"*)
-  if [ -e "${EPS[0]}" ] && ! ls "$REC/${TOWN}_s${SEED}_e"*/CAM_FRONT >/dev/null 2>&1; then
-    log "seed $SEED already recorded, labelled and pruned -- skipping"; continue
+  # Skip a seed only when all of its episodes exist and every one has a
+  # complete label file -- pruned or not.
+  n_done=0
+  for ep in "$REC/${TOWN}_s${SEED}_e"*; do
+    [ -d "$ep" ] && labelled_ok "$ep" && n_done=$((n_done + 1))
+  done
+  if [ "$n_done" -ge "$EPISODES" ]; then
+    log "seed $SEED already recorded and labelled ($n_done episodes) -- skipping"; continue
   fi
   if [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; then
     log "only $(free_gb) GB free (< ${MIN_FREE_GB}) -- stopping before seed $SEED"; exit 1
@@ -95,14 +115,13 @@ for SEED in $SEEDS; do
     --episode "$REC/${TOWN}_s${SEED}_e"* --out "$LAB" 2>&1 \
     | grep -E "^\[|peak|Error|error" | tee -a "$D/label.log"
 
-  log "=== seed $SEED: prune JPEGs of fully labelled episodes"
   for ep in "$REC/${TOWN}_s${SEED}_e"*; do
-    if labelled_ok "$ep"; then
+    if ! labelled_ok "$ep"; then
+      log "  $(basename "$ep"): label missing or incomplete -- frames kept"
+    elif [ "$PRUNE" = "1" ]; then
       rm -rf "$ep"/CAM_* "$ep"/montage_*.png
-    else
-      log "  KEEPING frames of $(basename "$ep") -- label missing or incomplete"
     fi
   done
   log "seed $SEED done ($(free_gb) GB free)"
 done
-log "all seeds done.  labels: $LAB   recordings (no frames): $REC"
+log "all seeds done.  labels: $LAB   recordings: $REC"
