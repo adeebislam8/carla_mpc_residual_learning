@@ -308,6 +308,10 @@ class CarlaMPCEnv(gym.Env):
         self.authority_horizon = authority_horizon
         self.residual_window_m = residual_window_m
         self.residual_active = True      # set per step; see _residual_window_active()
+        # g_support in [0, 1] for the NEXT step's authority (spec Section 8).
+        # Written by the policy (e.g. StudentPolicy from ensemble disagreement);
+        # stays 1.0 -- no effect -- for every other caller.
+        self.support_gate = 1.0
         self.residual_authority = None   # built in _initialize_mpc()
         self.last_authority_info = {}
         self.authority_history = []      # per-step alpha, for Section 17 metrics
@@ -1987,7 +1991,7 @@ class CarlaMPCEnv(gym.Env):
                     u_nom=(mpc_throttle, mpc_steering),
                     du=du,
                     obstacles=self.selected_obstacles,
-                    support_gate=1.0,  # until the support monitor lands
+                    support_gate=self.support_gate,
                     corridor=self._corridor_at(self.current_s),
                 )
             else:

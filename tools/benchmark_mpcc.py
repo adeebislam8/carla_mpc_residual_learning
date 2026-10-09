@@ -100,7 +100,17 @@ def run(args):
     #   --model X --residual-mode adaptive-> B5, CBF-derived authority
     model = None
     obs_norm = None
-    if args.model:
+    if args.model and args.algo == 'student':
+        # Distilled student: numpy-only, normalises its own inputs, and is
+        # attached to each env so it can see the residual window and the gate.
+        _check_policy_contract(args)
+        from student.policy import StudentPolicy
+        model = StudentPolicy(args.model, chunk_mode=args.student_chunk_mode,
+                              support_sigma=args.support_sigma)
+        print(f"loaded student from {args.model} "
+              f"({model.net.n_params()} parameters, {model.net.n_members} members, "
+              f"chunk K={model.net.K}, mode={args.student_chunk_mode})")
+    elif args.model:
         from stable_baselines3 import SAC, PPO, TD3
         algo = {'sac': SAC, 'ppo': PPO, 'td3': TD3}[args.algo]
         model = algo.load(args.model)
@@ -177,6 +187,8 @@ def run(args):
             n_overtake=args.n_overtake,
             use_perception=args.perception,
         )
+        if hasattr(model, 'attach'):
+            model.attach(env)
         interrupted = False
         try:
             _run_seed(env, args, seed, episodes, model=model,
@@ -231,6 +243,8 @@ def _run_seed(env, args, seed, episodes, model=None, obs_norm=None):
     zero = np.zeros(2, dtype=float)
     for ep in range(args.episodes):
         obs, _ = env.reset()
+        if hasattr(model, 'reset'):
+            model.reset()
 
         n_hist, v_hist = [], []
         steps = 0
@@ -288,6 +302,11 @@ def _run_seed(env, args, seed, episodes, model=None, obs_norm=None):
             'alpha_mean': info.get('alpha_mean'),
             'authority_interventions': info.get('authority_interventions'),
             'strong_suppression_frac': info.get('strong_suppression_frac'),
+            # Student inference cost: how often the network actually ran.
+            # n_active = steps with the residual window open; n_queries <
+            # n_active is the speculative-chunk saving.
+            **({f'student_{k}': v for k, v in model.episode.items()}
+               if hasattr(model, 'episode') else {}),
             'nominal_infeasible': info.get('nominal_infeasible'),
         }
         # Reward-term breakdown (_reward_term_metrics() in carlaEnv.py).
@@ -760,7 +779,15 @@ def main():
     ap.add_argument('--model', default=None,
                     help='path to a trained residual policy (.zip). Omit for '
                          'pure MPCC -- the action is then always [0, 0].')
-    ap.add_argument('--algo', default='sac', choices=['sac', 'ppo', 'td3'],
+    ap.add_argument('--student-chunk-mode', default='speculative',
+                    choices=['speculative', 'every_step'],
+                    help="--algo student only: 'speculative' plays the K-step "
+                         "draft while the CBF gate accepts it; 'every_step' "
+                         "re-queries every step")
+    ap.add_argument('--support-sigma', type=float, default=None,
+                    help='--algo student only: scale the authority by '
+                         'clip(1 - ensemble std / SIGMA, 0, 1); off by default')
+    ap.add_argument('--algo', default='sac', choices=['sac', 'ppo', 'td3', 'student'],
                     help='algorithm the --model was trained with')
     ap.add_argument('--residual-mode', default='fixed',
                     choices=['fixed', 'adaptive'],

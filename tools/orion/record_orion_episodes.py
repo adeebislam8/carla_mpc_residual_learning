@@ -182,7 +182,10 @@ def _vec(v):
     return [float(v.x), float(v.y), float(v.z)]
 
 
-def record_episode(env, ep_dir, args):
+def record_episode(env, ep_dir, args, policy=None):
+    """policy: None = nominal MPCC (round 0); a StudentPolicy = DAgger round,
+    the student drives under the authority gate and ORION later labels the
+    states IT visited."""
     import cv2
 
     for name in _DEBUG_DRAWERS:
@@ -198,10 +201,13 @@ def record_episode(env, ep_dir, args):
 
     observations, n_saved, outcome = [], 0, 'running'
     zero = np.zeros(env.action_space.shape)
+    if policy is not None:
+        policy.reset()
     try:
         with open(ep_dir / 'meta.jsonl', 'w') as meta_f:
             for _ in range(args.max_steps):
-                obs, _, done, trunc, info = env.step(zero)
+                action = zero if policy is None else policy.predict(obs)[0]
+                obs, _, done, trunc, info = env.step(action)
                 frame = env.world.get_snapshot().frame
                 data = rig.read(frame)
 
@@ -251,7 +257,9 @@ def record_episode(env, ep_dir, args):
             else np.zeros((0, env.state_dim), np.float32))
     with open(ep_dir / 'summary.json', 'w') as f:
         json.dump({'outcome': outcome, 'frames': n_saved,
-                   'last_step': int(env.current_step), 'flags': vars(args)},
+                   'last_step': int(env.current_step), 'flags': vars(args),
+                   'driver': 'mpcc' if policy is None else 'student',
+                   'student_counts': None if policy is None else policy.episode},
                   f, indent=2)
     return outcome, n_saved
 
@@ -281,9 +289,37 @@ def main():
     ap.add_argument('--turn-threshold-deg', type=float, default=30.0)
     ap.add_argument('--near-node-m', type=float, default=10.0,
                     help="distance ahead of the 'next route node' ORION's PID logs")
+    # DAgger: drive with a trained student instead of the nominal MPCC.  The
+    # residual flags must be the ones the student was trained for; they are
+    # checked against its train_config.json.
+    ap.add_argument('--student', default=None, metavar='DIR',
+                    help='student directory (DAgger round); omit for round 0')
+    ap.add_argument('--residual-mode', default='adaptive', choices=['fixed', 'adaptive'])
+    ap.add_argument('--residual-max', type=float, default=0.5)
+    ap.add_argument('--authority-horizon', type=int, default=10)
+    ap.add_argument('--residual-window', type=float, default=25.0)
     ap.add_argument('--host', default='localhost')
     ap.add_argument('--port', type=int, default=2000)
     args = ap.parse_args()
+
+    policy = None
+    if args.student:
+        from student.policy import StudentPolicy
+        with open(Path(args.student) / 'train_config.json') as f:
+            contract = json.load(f)
+        mine = dict(residual_mode=args.residual_mode, residual_max=args.residual_max,
+                    authority_horizon=args.authority_horizon,
+                    residual_window=args.residual_window, obs_version=args.obs_version,
+                    qc=args.qc, gate_depth=args.gate_depth, route_max=args.route_max,
+                    target_speed=args.target_speed)
+        bad = {k: (contract[k], v) for k, v in mine.items()
+               if k in contract and contract[k] != v}
+        if bad:
+            raise SystemExit(f'student {args.student} was trained under different '
+                             f'flags (trained, given): {bad}')
+        policy = StudentPolicy(args.student)
+        print(f'DAgger: student {args.student} drives '
+              f'({policy.net.n_params()} parameters)')
 
     from mpc_controller.envs.carlaEnv import CarlaMPCEnv
     out = Path(args.out)
@@ -294,12 +330,17 @@ def main():
             max_steps=args.max_steps, seed=seed, qc=args.qc,
             gate_depth=args.gate_depth, route_min_m=args.route_min,
             route_max_m=args.route_max, npc_min=args.npc_min,
-            npc_max=args.npc_max, obs_version=args.obs_version)
+            npc_max=args.npc_max, obs_version=args.obs_version,
+            residual_mode=args.residual_mode, residual_max=args.residual_max,
+            authority_horizon=args.authority_horizon,
+            residual_window_m=args.residual_window)
+        if policy is not None:
+            policy.attach(env)
         try:
             for e in range(args.episodes):
                 ep_dir = out / f'{args.town}_s{seed}_e{e:03d}'
                 t0 = time.time()
-                outcome, n = record_episode(env, ep_dir, args)
+                outcome, n = record_episode(env, ep_dir, args, policy)
                 print(f'{ep_dir.name}: {outcome:9s} {n:4d} frames '
                       f'({time.time() - t0:.0f} s wall)')
         finally:

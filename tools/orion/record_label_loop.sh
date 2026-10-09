@@ -10,6 +10,11 @@
 # those seeds would train the student on the exact evaluation routes, so
 # training data uses 101+ (round 0), 201+ (DAgger), 301+ (Town02 adaptation).
 #
+# STUDENT=<dir>: DAgger round -- the student drives (under the authority gate)
+# instead of the nominal MPCC; use a fresh seed range and REC/LAB names, e.g.
+#   STUDENT=models/student_r0 SEEDS="201 202 203 204" TOWN=Town01 \
+#     D=~/Documents/nett/orion_data/dagger1 ./tools/orion/record_label_loop.sh
+#
 # PRUNE=1 deletes each episode's JPEGs once its labels verify.  Default 0:
 # keep the frames, so they can be re-labelled later (e.g. a compressed or
 # token-pruned teacher, or a different --stride) without re-recording.
@@ -35,6 +40,7 @@ cd "$(dirname "$0")/../.."
 
 SEEDS=${SEEDS:-"101 102 103 104 105 106 107 108 109 110 111 112"}
 PRUNE=${PRUNE:-0}
+STUDENT=${STUDENT:-}
 for _s in $SEEDS; do
   if [ "$_s" -le 5 ]; then
     echo "seed $_s is an evaluation seed (benchmark uses 1-5) -- refusing"; exit 1
@@ -104,6 +110,7 @@ for SEED in $SEEDS; do
   # shellcheck disable=SC2086
   "$CONDA" run --no-capture-output -n residual_mpc python tools/orion/record_orion_episodes.py \
     --town "$TOWN" --seeds "$SEED" --episodes "$EPISODES" $CONTROLLER --out "$REC" \
+    ${STUDENT:+--student "$STUDENT"} \
     2>&1 | grep -E "^${TOWN}_s|Error|error" | tee -a "$D/record.log"
   "$CONDA" run --no-capture-output -n residual_mpc python tools/orion/check_orion_recording.py \
     "$REC/${TOWN}_s${SEED}_e"* --montage-every 0 2>&1 | tail -1 | tee -a "$D/record.log"
