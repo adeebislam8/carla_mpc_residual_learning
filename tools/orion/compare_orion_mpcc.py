@@ -34,6 +34,32 @@ from pathlib import Path
 
 import numpy as np
 
+# Longitudinal model of bicycle_model_mpcc_cbf.py (same constants as
+# residual_authority._MODEL_LONG).
+_M, _CM1, _CM2 = 2065.03, 9.36424211e+03, 4.08690122e+01
+_CR0, _CR2, _CR3 = 5.84856121e+02, 2.04799356e+00, 1.13995833e+01
+D_MIN, D_MAX = -0.5, 1.0          # the authority gate's actuator bounds
+
+
+def throttle_from_speed(v_target, v, tau=1.0):
+    """
+    Throttle D that reaches v_target in tau seconds under the MPCC's own
+    longitudinal model, by inverting Fxd = (Cm1 - Cm2 v) D - Cr2 v^2
+    - Cr0 tanh(Cr3 v) with a = Fxd / m.
+
+    ORION's PID turns its plan into a bang-bang brake (0 or 1), which makes a
+    useless regression target: 56% of du* was clipped on the first episode.
+    Its planned SPEED is smooth, so the longitudinal label comes from that,
+    in the same units the MPCC commands.
+
+    tau = 1 s: ORION's desired speed (from its PID's formula) is already the
+    speed ~0.5-1 s down the plan.  At tau = 0.5 s a 2 m/s gap demands 4 m/s^2
+    and saturates the throttle, recreating the bang-bang label.
+    """
+    a = (v_target - v) / tau
+    D = (_M * a + _CR2 * v * v + _CR0 * np.tanh(_CR3 * v)) / (_CM1 - _CM2 * v)
+    return float(np.clip(D, D_MIN, D_MAX))
+
 
 def load(rec_dir, label_path):
     recs = [json.loads(l) for l in open(rec_dir / 'meta.jsonl') if l.strip()]
@@ -58,6 +84,8 @@ def load(rec_dir, label_path):
             command=recs[i]['command'],
             nom_thr=float(u_nom[0]), nom_steer=float(u_nom[1]),
             teach_thr=float(thr - brake), teach_steer=float(-steer),
+            teach_thr_v=throttle_from_speed(float(lab['desired_speed'][j]),
+                                            recs[i]['speed']),
         ))
     return rows, summary.get('outcome'), lab
 
@@ -65,6 +93,7 @@ def load(rec_dir, label_path):
 def report(name, rows, outcome, residual_max, window):
     a = {k: np.array([r[k] for r in rows]) for k in rows[0]}
     du_thr = a['teach_thr'] - a['nom_thr']
+    du_thr_v = a['teach_thr_v'] - a['nom_thr']
     du_steer = a['teach_steer'] - a['nom_steer']
 
     print(f'\n== {name}  outcome={outcome}  frames compared={len(rows)}')
@@ -80,8 +109,10 @@ def report(name, rows, outcome, residual_max, window):
              if big.any() else float('nan'))
     print(f'   steering: corr(ORION, MPCC) {corr:+.2f} | same direction on '
           f'{agree:.0f}% of frames where either steers > 0.05')
-    for label, du in (('throttle', du_thr), ('steering', du_steer)):
-        print(f'   du* {label:8s}: median |du| {np.median(np.abs(du)):.3f}, '
+    for label, du in (('throttle (ORION PID)', du_thr),
+                      ('throttle (from planned speed)', du_thr_v),
+                      ('steering', du_steer)):
+        print(f'   du* {label:29s}: median |du| {np.median(np.abs(du)):.3f}, '
               f'p90 {np.percentile(np.abs(du), 90):.3f}, '
               f'clipped by residual_max={residual_max}: '
               f'{np.mean(np.abs(du) > residual_max) * 100:.0f}%')
@@ -92,8 +123,9 @@ def report(name, rows, outcome, residual_max, window):
         print(f'     ego speed {a["speed"][w].mean():.2f} m/s vs ORION planned '
               f'{a["v_orion"][w].mean():.2f} m/s '
               f'({"ORION would be slower" if a["v_orion"][w].mean() < a["speed"][w].mean() - 0.5 else "no slowdown from ORION"})')
-        print(f'     throttle: MPCC {a["nom_thr"][w].mean():+.2f} vs ORION '
-              f'{a["teach_thr"][w].mean():+.2f} | steering: MPCC '
+        print(f'     throttle: MPCC {a["nom_thr"][w].mean():+.2f} vs ORION PID '
+              f'{a["teach_thr"][w].mean():+.2f} / from speed '
+              f'{a["teach_thr_v"][w].mean():+.2f} | steering: MPCC '
               f'{a["nom_steer"][w].mean():+.2f} vs ORION {a["teach_steer"][w].mean():+.2f}')
     return a
 
@@ -111,7 +143,8 @@ def plot(a, out_png, title):
     ax[1].plot(t, a['teach_steer'], label='ORION steering (model sign)')
     ax[1].set_ylabel('steer (+ = left)')
     ax[2].plot(t, a['nom_thr'], label='MPCC throttle')
-    ax[2].plot(t, a['teach_thr'], label='ORION throttle - brake')
+    ax[2].plot(t, a['teach_thr'], label='ORION PID throttle - brake', alpha=0.4)
+    ax[2].plot(t, a['teach_thr_v'], label='ORION from planned speed (label)')
     ax[2].set_ylabel('throttle')
     ax[2].set_xlabel('simulator step (0.05 s)')
     junction = a['command'] != 4
