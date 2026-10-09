@@ -220,6 +220,13 @@ class OrionTeacher:
         cfg = Config.fromfile('adzoo/orion/configs/orion_stage3_fp16.py')
         agent_cfg = Config.fromfile('adzoo/orion/configs/orion_stage3_agent.py')
         cfg.model.train_cfg = None
+        # The FP16 config also sets fp16_eval=True, which sends simple_test_pts
+        # down its open-loop EVALUATION branch: it reads ground-truth labels
+        # (gt_attr_labels, gt_bboxes_3d) from the Bench2Drive dataset and
+        # crashes with KeyError without them.  The closed-loop agent never
+        # takes that branch.  fp16_infer stays on; Orion.__init__ allows
+        # fp16_infer=True with fp16_eval=False.
+        cfg.model.fp16_eval = False
 
         model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
         _custom_wrap_fp16_model(model)
