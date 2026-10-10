@@ -72,9 +72,18 @@ class StudentPolicy:
     residual window and authority gate."""
 
     def __init__(self, path, chunk_mode='speculative', accept_alpha=0.999,
-                 support_sigma=None):
+                 support_sigma=None, axes='both'):
         if chunk_mode not in ('speculative', 'every_step'):
             raise ValueError(chunk_mode)
+        # axes='steer' zeroes the throttle residual.  ORION's planned speed is
+        # anchored to the ego's current speed (it sees it as input), so its
+        # longitudinal labels say "hold whatever speed you have" -- in closed
+        # loop that has no restoring force and the first round-0 student that
+        # acted everywhere slowed to a crawl (0.68 m/s on Town03).
+        if axes not in ('both', 'steer', 'throttle'):
+            raise ValueError(axes)
+        self._mask = {'both': np.array([1.0, 1.0]), 'steer': np.array([0.0, 1.0]),
+                      'throttle': np.array([1.0, 0.0])}[axes]
         self.net = StudentEnsemble.load(path)
         self.chunk_mode = chunk_mode
         self.accept_alpha = accept_alpha
@@ -129,7 +138,7 @@ class StudentPolicy:
         if self.support_sigma and self.env is not None:
             self.env.support_gate = float(np.clip(
                 1.0 - std.mean() / self.support_sigma, 0.0, 1.0))
-        return np.asarray(action, dtype=float), None
+        return np.asarray(action, dtype=float) * self._mask, None
 
     def query_fraction(self, which='episode'):
         c = self.episode if which == 'episode' else self.total

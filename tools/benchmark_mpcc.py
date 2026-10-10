@@ -106,10 +106,12 @@ def run(args):
         _check_policy_contract(args)
         from student.policy import StudentPolicy
         model = StudentPolicy(args.model, chunk_mode=args.student_chunk_mode,
-                              support_sigma=args.support_sigma)
+                              support_sigma=args.support_sigma,
+                              axes=args.student_axes)
         print(f"loaded student from {args.model} "
               f"({model.net.n_params()} parameters, {model.net.n_members} members, "
-              f"chunk K={model.net.K}, mode={args.student_chunk_mode})")
+              f"chunk K={model.net.K}, mode={args.student_chunk_mode}, "
+              f"axes={args.student_axes})")
     elif args.model:
         from stable_baselines3 import SAC, PPO, TD3
         algo = {'sac': SAC, 'ppo': PPO, 'td3': TD3}[args.algo]
@@ -784,6 +786,9 @@ def main():
                     help="--algo student only: 'speculative' plays the K-step "
                          "draft while the CBF gate accepts it; 'every_step' "
                          "re-queries every step")
+    ap.add_argument('--student-axes', default='both', choices=['both', 'steer', 'throttle'],
+                    help="--algo student only: which residual channels to apply "
+                         "('steer' zeroes the throttle residual)")
     ap.add_argument('--support-sigma', type=float, default=None,
                     help='--algo student only: scale the authority by '
                          'clip(1 - ensemble std / SIGMA, 0, 1); off by default')
