@@ -65,6 +65,10 @@ def make_skip_wrapper():
             super().__init__(env)
             self.max_reset_tries = max_reset_tries
             self._zero = np.zeros(env.action_space.shape)
+            # Every simulator tick, including the ones fast-forwarded inside
+            # reset() -- those never reach a step() info, so a logger summing
+            # per-step counts misses them (RL v2's sim_steps undercounted).
+            self.sim_steps = 0
 
         def _window_open(self):
             return self.env.unwrapped._residual_window_active()
@@ -77,6 +81,7 @@ def make_skip_wrapper():
             while not self._window_open():
                 obs, r, term, trunc, info = self.env.step(self._zero)
                 n += 1
+                self.sim_steps += 1
                 if term or trunc:
                     return obs, r, term, trunc, info, n
             return obs, 0.0, False, False, info, n
@@ -94,11 +99,13 @@ def make_skip_wrapper():
 
         def step(self, action):
             obs, r, term, trunc, info = self.env.step(action)
+            self.sim_steps += 1
             skipped = 0
             if not (term or trunc):
                 obs, r_end, term, trunc, info, skipped = self._fast_forward(obs, info)
                 r += r_end
             info['skipped_steps'] = skipped
+            info['sim_steps_total'] = self.sim_steps
             return obs, r, term, trunc, info
 
     return SkipInactiveSteps
@@ -126,7 +133,10 @@ def make_outcome_logger(path):
 
         def _on_step(self):
             for info, done in zip(self.locals['infos'], self.locals['dones']):
-                self.sim_steps += 1 + int(info.get('skipped_steps', 0))
+                # The skip wrapper counts every tick itself (including the
+                # fast-forward inside reset); without it, one agent step is
+                # one tick.
+                self.sim_steps = int(info.get('sim_steps_total', self.sim_steps + 1))
                 if not done:
                     continue
                 outcome = info.get('done_reason', 'unknown')
