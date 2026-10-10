@@ -176,6 +176,7 @@ def build_env(args, seed, for_eval=False):
         authority_horizon=args.authority_horizon,
         residual_window_m=args.residual_window,
         obs_version=args.obs_version,
+        reward_mode=args.reward_mode,
     )
 
 
@@ -211,6 +212,9 @@ def main():
                          'training also skips the agent past closed-window steps')
     ap.add_argument('--obs-version', default='v1', choices=['v1', 'v2'],
                     help="'v2' drops route-position features (see carlaEnv)")
+    ap.add_argument('--reward-mode', default='shaped', choices=['shaped', 'outcome'],
+                    help="'outcome' = collision / success / action penalty only, "
+                         "the control arm against reward-shaping criticism")
     ap.add_argument('--qc', type=float, default=0.5)
     ap.add_argument('--gate-depth', type=float, default=0.98)
     ap.add_argument('--a-long', type=float, default=None)

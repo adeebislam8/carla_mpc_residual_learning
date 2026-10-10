@@ -106,6 +106,7 @@ class CarlaMPCEnv(gym.Env):
         authority_horizon: int = 1,
         residual_window_m: float = None,
         obs_version: str = 'v1',
+        reward_mode: str = 'shaped',
     ):
         """
         residual_mode: 'adaptive' derives the residual authority from the CBF
@@ -307,6 +308,11 @@ class CarlaMPCEnv(gym.Env):
         self.residual_max = residual_max
         self.authority_horizon = authority_horizon
         self.residual_window_m = residual_window_m
+        # 'shaped' = _calculate_reward's full term set; 'outcome' = collision,
+        # success and the action penalty only (the reward-design control arm).
+        if reward_mode not in ('shaped', 'outcome'):
+            raise ValueError(f"reward_mode must be 'shaped' or 'outcome', got {reward_mode!r}")
+        self.reward_mode = reward_mode
         self.residual_active = True      # set per step; see _residual_window_active()
         # g_support in [0, 1] for the NEXT step's authority (spec Section 8).
         # Written by the policy (e.g. StudentPolicy from ensemble disagreement);
@@ -1591,6 +1597,17 @@ class CarlaMPCEnv(gym.Env):
 
         sim_time = self.current_step * self.mpc_dt
 
+        if self.reward_mode == 'outcome':
+            # Outcome-only: no shaping at all, so no shaping weight can be
+            # blamed.  Collision is charged above; success here; the action
+            # penalty keeps the residual small unless it pays off.
+            terms['action_penalty'] = -0.05 * float(np.sum(np.square(action)))
+            terms['goal'] = 0.0
+            if self.current_s >= self.path_length - self.goal_margin_m:
+                terms['goal'] = 200.0
+            self.reward_term_history.append(terms)
+            return terms['action_penalty'] + terms['goal']
+
         # --- progress -------------------------------------------------------
         progress = self.current_s - self.prev_s
         terms['progress'] = progress / (self.target_speed * self.mpc_dt)
@@ -1613,7 +1630,15 @@ class CarlaMPCEnv(gym.Env):
                 break
         gate = 0.1 if obstacle_ahead else 1.0
 
-        terms['lateral_dev'] = gate * (-2.0 * (2 * d_normalized - 1) ** 4)
+        # BOUNDED to [-2, 0] (2026-10-10).  The quartic was unbounded: any
+        # step with d outside the road-width table's range -- a Frenet jump,
+        # or a table narrower than the real road -- gave d_normalized of 2-3
+        # and up to -1250 in one step.  In RL v2's evaluation this one term
+        # was 99.8% of |total reward| (-30.6/step) while the action-
+        # attributable counterfactual was 0.04%.  Leaving the corridor is
+        # already charged by off_corridor below.
+        d_clamped = min(max(d_normalized, 0.0), 1.0)
+        terms['lateral_dev'] = gate * (-2.0 * (2 * d_clamped - 1) ** 4)
         reward += terms['lateral_dev']
 
         # Leaving the drivable corridor is never acceptable, gate or not.
