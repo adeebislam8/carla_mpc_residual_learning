@@ -228,9 +228,15 @@ def main():
         dataset_config=cfg, metrics=metrics, args=vars(args))
     with open(out / 'student_meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
+    # --all-frames: trained on every frame, so it is meant to act everywhere
+    # -- evaluate with no residual window (benchmark: omit --residual-window).
+    window = None if args.all_frames else cfg['window']
+    meta['window'] = window
+    with open(out / 'student_meta.json', 'w') as f:
+        json.dump(meta, f, indent=2)
     contract = dict(residual_mode=args.residual_mode, residual_max=cfg['residual_max'],
                     authority_horizon=args.authority_horizon,
-                    residual_window=cfg['window'], obs_version=cfg['obs_version'],
+                    residual_window=window, obs_version=cfg['obs_version'],
                     qc=args.qc, gate_depth=args.gate_depth, route_max=args.route_max,
                     target_speed=args.target_speed)
     with open(out / 'train_config.json', 'w') as f:
