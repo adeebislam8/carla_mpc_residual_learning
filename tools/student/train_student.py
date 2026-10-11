@@ -59,6 +59,56 @@ def load_datasets(paths):
     return data, config, names
 
 
+# obs v2 index of (speed - target_speed), see carlaEnv._get_observation_v2.
+OBS_V2_SPEED_ERR = 13
+SPEED_BIN_EDGES = np.arange(0.0, 21.0, 1.0)     # 1 m/s bins, last open-ended
+
+
+def soft_threshold(y, t):
+    return np.sign(y) * np.maximum(np.abs(y) - t, 0.0)
+
+
+def shape_targets(data, X, args, train_frames):
+    """Edit data['Y'] in place; return a record of what was done.
+
+    ORION's throttle target is negative at every speed (it plans near the
+    ego's current speed -- the BC inertia problem), but more negative before
+    collisions.  Debiasing removes the speed-conditioned mean, fit on training
+    frames not followed by a collision, so what is left is the hazard part.
+    The deadbands zero the small style-level differences the student cannot
+    fit anyway (round-0 R2 ~0.5) and would otherwise add as noise every step.
+    """
+    rec = dict(debias_throttle=bool(args.debias_throttle),
+               thr_deadband=args.thr_deadband, steer_deadband=args.steer_deadband)
+    Y = data['Y']
+    if args.debias_throttle:
+        v = X[:, OBS_V2_SPEED_ERR] + args.target_speed
+        b = np.clip(np.digitize(v, SPEED_BIN_EDGES) - 1, 0, len(SPEED_BIN_EDGES) - 2)
+        fit = train_frames & ~data['precoll'] & data['M'][:, 0]
+        overall = float(Y[fit, 0, 0].mean())
+        bias = np.array([Y[fit & (b == k), 0, 0].mean() if (fit & (b == k)).sum() >= 50
+                         else overall for k in range(len(SPEED_BIN_EDGES) - 1)])
+        # Every chunk step uses frame i's speed bin -- the speed changes little in 0.5 s.
+        Y[:, :, 0] -= bias[b][:, None]
+        rec['throttle_bias_by_speed'] = bias.round(4).tolist()
+        print('throttle bias removed, by 1 m/s speed bin: '
+              + ' '.join(f'{x:+.2f}' for x in bias))
+    if args.thr_deadband > 0:
+        Y[:, :, 0] = soft_threshold(Y[:, :, 0], args.thr_deadband)
+    if args.steer_deadband > 0:
+        Y[:, :, 1] = soft_threshold(Y[:, :, 1], args.steer_deadband)
+    np.clip(Y, -1.0, 1.0, out=Y)
+
+    pc, m = data['precoll'], data['M'][:, 0]
+    for d, name in enumerate(('throttle', 'steering')):
+        for tag, sel in (('normal', m & ~pc), ('precoll', m & pc)):
+            y = Y[sel, 0, d]
+            if len(y):
+                print(f'  shaped {name:8s} {tag:7s}: mean {y.mean():+.3f}  '
+                      f'mean |y| {np.abs(y).mean():.3f}  nonzero {np.mean(y != 0) * 100:3.0f}%')
+    return rec
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -79,6 +129,15 @@ def main():
     ap.add_argument('--val-frac', type=float, default=0.15)
     ap.add_argument('--fraction', type=float, default=1.0,
                     help='use this fraction of the TRAINING episodes')
+    ap.add_argument('--debias-throttle', action='store_true',
+                    help="subtract ORION's mean throttle target at each speed (fit on "
+                         "training frames not followed by a collision), so the student "
+                         "learns only the hazard-specific part, not the inertia offset")
+    ap.add_argument('--thr-deadband', type=float, default=0.0,
+                    help='soft-threshold the throttle target by this much (after debias)')
+    ap.add_argument('--steer-deadband', type=float, default=0.0,
+                    help='soft-threshold the steering target: style noise -> 0, '
+                         'large ORION/MPCC disagreements kept')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='auto')
     # Policy contract: the env flags this student is valid under.  Written to
@@ -121,6 +180,7 @@ def main():
             f'also train on closed-window frames.')
 
     X = data['X'].astype(np.float32)
+    shaping = shape_targets(data, X, args, np.isin(data['ep'], train_eps))
     mean = X[is_train_pool].mean(axis=0)
     std = np.maximum(X[is_train_pool].std(axis=0), 1e-3)
     Xn = (X - mean) / std
@@ -204,6 +264,16 @@ def main():
             float(np.mean(np.sign(mean_pred[big, d]) == np.sign(y0[big, d])))
             if big.any() else float('nan'))
         metrics[f'val_mae_{name}'] = float(np.mean(np.abs(y0[:, d] - mean_pred[:, d])))
+    # Does the student react before crashes?  Mean |prediction| on validation
+    # frames followed by a collision vs the rest.
+    pc_v = data['precoll'][is_val]
+    for d, name in enumerate(('throttle', 'steering')):
+        metrics[f'val_mean_pred_{name}_precoll'] = (
+            float(mean_pred[pc_v, d].mean()) if pc_v.any() else float('nan'))
+        metrics[f'val_mean_pred_{name}_normal'] = float(mean_pred[~pc_v, d].mean())
+        metrics[f'val_abs_pred_{name}_precoll'] = (
+            float(np.abs(mean_pred[pc_v, d]).mean()) if pc_v.any() else float('nan'))
+        metrics[f'val_abs_pred_{name}_normal'] = float(np.abs(mean_pred[~pc_v, d]).mean())
     metrics['val_ensemble_std'] = spread
     metrics['val_loss_members'] = member_val
 
@@ -225,6 +295,7 @@ def main():
         train_episodes=int(len(train_eps)), val_episodes=int(n_val),
         train_frames=int(is_train_pool.sum()), val_frames=int(is_val.sum()),
         fraction=args.fraction, datasets=[str(p) for p in args.data],
+        label_shaping=shaping,
         dataset_config=cfg, metrics=metrics, args=vars(args))
     with open(out / 'student_meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
