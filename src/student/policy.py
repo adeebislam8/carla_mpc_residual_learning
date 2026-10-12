@@ -100,7 +100,9 @@ class StudentPolicy:
     def reset(self):
         """Call at every episode start."""
         self._chunk, self._chunk_std, self._idx = None, None, 0
-        self.episode = dict(n_steps=0, n_active=0, n_queries=0)
+        # std_sum / std_max: ensemble spread on active steps (used axes only),
+        # the out-of-distribution signal the support gate is calibrated from.
+        self.episode = dict(n_steps=0, n_active=0, n_queries=0, std_sum=0.0, std_max=0.0)
 
     def _count(self, key):
         self.episode[key] += 1
@@ -135,9 +137,11 @@ class StudentPolicy:
         std = self._chunk_std[self._idx]
         self._idx += 1
 
+        s = float(std[self._mask > 0].mean())
+        self.episode['std_sum'] += s
+        self.episode['std_max'] = max(self.episode['std_max'], s)
         if self.support_sigma and self.env is not None:
-            self.env.support_gate = float(np.clip(
-                1.0 - std.mean() / self.support_sigma, 0.0, 1.0))
+            self.env.support_gate = float(np.clip(1.0 - s / self.support_sigma, 0.0, 1.0))
         return np.asarray(action, dtype=float) * self._mask, None
 
     def query_fraction(self, which='episode'):

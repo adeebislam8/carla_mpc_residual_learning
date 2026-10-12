@@ -138,6 +138,12 @@ def main():
     ap.add_argument('--steer-deadband', type=float, default=0.0,
                     help='soft-threshold the steering target: style noise -> 0, '
                          'large ORION/MPCC disagreements kept')
+    ap.add_argument('--init', default=None,
+                    help='few-shot adaptation: start every member from this trained '
+                         'student (same --hidden) and keep its obs normalisation')
+    ap.add_argument('--train-layers', type=int, default=0,
+                    help='with --init: train only the last N linear layers, freeze the '
+                         'rest (0 = train all)')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='auto')
     # Policy contract: the env flags this student is valid under.  Written to
@@ -183,6 +189,17 @@ def main():
     shaping = shape_targets(data, X, args, np.isin(data['ep'], train_eps))
     mean = X[is_train_pool].mean(axis=0)
     std = np.maximum(X[is_train_pool].std(axis=0), 1e-3)
+    init_w = None
+    if args.init:
+        init_meta = json.load(open(Path(args.init) / 'student_meta.json'))
+        if list(init_meta['hidden']) != list(args.hidden) or int(init_meta['chunk']) != K:
+            raise SystemExit(f"--init {args.init}: hidden {init_meta['hidden']} chunk "
+                             f"{init_meta['chunk']} != this run's {args.hidden} / {K}")
+        init_w = dict(np.load(Path(args.init) / 'student.npz'))
+        # The pretrained layers expect the pretraining normalisation.
+        mean = np.asarray(init_meta['obs_mean'], dtype=np.float32)
+        std = np.asarray(init_meta['obs_std'], dtype=np.float32)
+        n_init = int(init_meta['n_members'])
     Xn = (X - mean) / std
     W = np.where(data['precoll'], args.precoll_weight, 1.0).astype(np.float32)
 
@@ -222,7 +239,22 @@ def main():
         Xt, Yt, Mt, Wt = (to_t(Xn[idx]), to_t(data['Y'][idx]),
                           to_t(data['M'][idx]), to_t(W[idx]))
         net = make_net()
-        opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        lins = [m for m in net if isinstance(m, nn.Linear)]
+        if init_w is not None:
+            src = e % n_init
+            with torch.no_grad():
+                for l, lin in enumerate(lins):
+                    lin.weight.copy_(to_t(init_w[f'W{src}_{l}'].T))
+                    lin.bias.copy_(to_t(init_w[f'b{src}_{l}']))
+            if args.train_layers > 0:
+                for lin in lins[:len(lins) - args.train_layers]:
+                    for p in lin.parameters():
+                        p.requires_grad_(False)
+        params = [p for p in net.parameters() if p.requires_grad]
+        if e == 0:
+            print(f'training {sum(p.numel() for p in params)} of '
+                  f'{sum(p.numel() for p in net.parameters())} parameters per member')
+        opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
         best, best_state = float('inf'), None
         for epoch in range(args.epochs):
             net.train()

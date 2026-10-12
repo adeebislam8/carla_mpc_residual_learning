@@ -8,7 +8,8 @@
 # SEEDS: a seed fixes the whole route/traffic sequence (CarlaMPCEnv's per-
 # episode RNG), and benchmark_mpcc.py evaluates on seeds 1-5.  Recording on
 # those seeds would train the student on the exact evaluation routes, so
-# training data uses 101+ (round 0), 201+ (DAgger), 301+ (Town02 adaptation).
+# training data uses 101+ (round 0), 201+ (DAgger), 301+ (few-shot
+# town adaptation, e.g. TOWN=Town03 SEEDS="301 302 303 304").
 #
 # STUDENT=<dir>: DAgger round -- the student drives (under the authority gate)
 # instead of the nominal MPCC; use a fresh seed range and REC/LAB names, e.g.
