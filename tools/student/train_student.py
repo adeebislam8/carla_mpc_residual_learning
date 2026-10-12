@@ -61,6 +61,7 @@ def load_datasets(paths):
 
 # obs v2 index of (speed - target_speed), see carlaEnv._get_observation_v2.
 OBS_V2_SPEED_ERR = 13
+DEAD_STD = 1e9
 SPEED_BIN_EDGES = np.arange(0.0, 21.0, 1.0)     # 1 m/s bins, last open-ended
 
 
@@ -144,6 +145,13 @@ def main():
     ap.add_argument('--train-layers', type=int, default=0,
                     help='with --init: train only the last N linear layers, freeze the '
                          'rest (0 = train all)')
+    ap.add_argument('--dead-std', type=float, default=1e-3,
+                    help='features with a training std at or below this are ignored (input '
+                         'held at 0).  In Town01 the corridor is constant (-6, +2) and '
+                         'obstacle slots 3-5 are never filled; with the old 1e-3 floor a '
+                         'Town03 value became thousands of std and saturated the net')
+    ap.add_argument('--obs-clip', type=float, default=5.0,
+                    help='clip normalised inputs to +-this (0 = off)')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='auto')
     # Policy contract: the env flags this student is valid under.  Written to
@@ -200,7 +208,14 @@ def main():
         mean = np.asarray(init_meta['obs_mean'], dtype=np.float32)
         std = np.asarray(init_meta['obs_std'], dtype=np.float32)
         n_init = int(init_meta['n_members'])
+    dead = std <= args.dead_std
+    if dead.any() and not args.init:
+        print(f'ignoring {dead.sum()} near-constant features: {np.where(dead)[0].tolist()}')
+    # A huge std holds the normalised input at ~0 at run time too.
+    std = np.where(dead, DEAD_STD, std).astype(np.float32)
     Xn = (X - mean) / std
+    if args.obs_clip > 0:
+        Xn = np.clip(Xn, -args.obs_clip, args.obs_clip)
     W = np.where(data['precoll'], args.precoll_weight, 1.0).astype(np.float32)
 
     def to_t(a, dtype=torch.float32):
@@ -323,6 +338,7 @@ def main():
         n_members=args.members, n_layers=n_layers, hidden=args.hidden, chunk=K,
         residual_max=cfg['residual_max'], window=cfg['window'],
         obs_version=cfg['obs_version'], obs_mean=mean.tolist(), obs_std=std.tolist(),
+        obs_clip=args.obs_clip,
         n_params_total=n_params, n_params_per_member=n_params // args.members,
         train_episodes=int(len(train_eps)), val_episodes=int(n_val),
         train_frames=int(is_train_pool.sum()), val_frames=int(is_val.sum()),

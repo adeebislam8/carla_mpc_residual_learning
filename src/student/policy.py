@@ -38,6 +38,8 @@ class StudentEnsemble:
         self.K = int(meta['chunk'])
         self.mean = np.asarray(meta['obs_mean'], dtype=np.float64)
         self.std = np.asarray(meta['obs_std'], dtype=np.float64)
+        # Older students (before 2026-10-12) have no clip.
+        self.obs_clip = float(meta.get('obs_clip') or 0.0)
         self.layers = [[(weights[f'W{e}_{l}'], weights[f'b{e}_{l}'])
                         for l in range(self.n_layers)]
                        for e in range(self.n_members)]
@@ -53,6 +55,8 @@ class StudentEnsemble:
     def forward(self, obs):
         """obs (D,) or (N, D) -> (mean, std) each (..., K, 2), in [-1, 1]."""
         x = (np.asarray(obs, dtype=np.float64) - self.mean) / self.std
+        if self.obs_clip > 0:
+            x = np.clip(x, -self.obs_clip, self.obs_clip)
         outs = []
         for member in self.layers:
             h = x
