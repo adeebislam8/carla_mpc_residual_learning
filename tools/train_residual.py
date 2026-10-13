@@ -210,7 +210,7 @@ def main():
     ap.add_argument('--residual-window', type=float, default=None, metavar='M',
                     help='residual acts only with an obstacle 0 < ds < M ahead; '
                          'training also skips the agent past closed-window steps')
-    ap.add_argument('--obs-version', default='v1', choices=['v1', 'v2'],
+    ap.add_argument('--obs-version', default='v1', choices=['v1', 'v2', 'v3'],
                     help="'v2' drops route-position features (see carlaEnv)")
     ap.add_argument('--reward-mode', default='shaped', choices=['shaped', 'outcome'],
                     help="'outcome' = collision / success / action penalty only, "

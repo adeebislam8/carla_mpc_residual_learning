@@ -50,22 +50,25 @@ from student.labels import (plan_speed, residual_target, teacher_action,  # noqa
 OBS_V2_DIM = 68
 OBS_V2_OBSTACLE0 = 44
 OBS_V2_PER_OBS = 4
+# v3 = v2 + static-object slots (augment_static.py), same leading 68 columns.
+OBS_V3_DIM = 68 + 24
+OBS_DIMS = {OBS_V2_DIM: 'v2', OBS_V3_DIM: 'v3'}
 
 
 def window_active(obs, window):
     """(N,) bool: any present obstacle slot with 0 < ds < window."""
-    slots = obs[:, OBS_V2_OBSTACLE0:].reshape(len(obs), -1, OBS_V2_PER_OBS)
+    slots = obs[:, OBS_V2_OBSTACLE0:OBS_V2_DIM].reshape(len(obs), -1, OBS_V2_PER_OBS)
     present, ds = slots[..., 0] > 0.5, slots[..., 1]
     return np.any(present & (ds > 0.0) & (ds < window), axis=1)
 
 
 def episode_samples(rec_dir, label_path, args):
     recs = [json.loads(l) for l in open(rec_dir / 'meta.jsonl') if l.strip()]
-    obs = np.load(rec_dir / 'obs.npy')
+    obs = np.load(rec_dir / args.obs_file)
     summary = json.load(open(rec_dir / 'summary.json'))
-    if obs.shape != (len(recs), OBS_V2_DIM):
-        raise ValueError(f'{rec_dir.name}: obs {obs.shape} for {len(recs)} records; '
-                         f'need obs_version v2 ({OBS_V2_DIM} dims)')
+    if obs.ndim != 2 or len(obs) != len(recs) or obs.shape[1] not in OBS_DIMS:
+        raise ValueError(f'{rec_dir.name}/{args.obs_file}: shape {obs.shape} for '
+                         f'{len(recs)} records; need {sorted(OBS_DIMS)} columns')
     lab = np.load(label_path)
     by_step = {r['step']: i for i, r in enumerate(recs)}
 
@@ -124,6 +127,9 @@ def main():
     ap.add_argument('--tau', type=float, default=1.0,
                     help='time constant of the speed -> throttle label, s')
     ap.add_argument('--precoll-frames', type=int, default=40)
+    ap.add_argument('--obs-file', default='obs.npy',
+                    help="per-episode observation file: obs.npy (v2) or obs_v3.npy "
+                         "(augment_static.py)")
     ap.add_argument('--throttle-label', default='relative', choices=['relative', 'absolute'],
                     help="'relative' (default): MPCC throttle + D(v_orion) - "
                          "D(v_realised), immune to the model's calibration offset; "
@@ -134,10 +140,13 @@ def main():
     for root in args.labels:
         for p in Path(root).expanduser().glob('*.npz'):
             label_files[p.stem] = p
-    parts, names, outcomes, missing = [], [], [], 0
+    parts, names, outcomes, missing, no_obs = [], [], [], 0, 0
     for root in args.rec:
         for ep in sorted(Path(root).expanduser().iterdir()):
             if not (ep / 'meta.jsonl').exists():
+                continue
+            if not (ep / args.obs_file).exists():
+                no_obs += 1
                 continue
             if ep.name not in label_files:
                 missing += 1
@@ -154,7 +163,8 @@ def main():
         sys.exit('no labelled episodes found')
     data = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
     config = dict(chunk=args.chunk, residual_max=args.residual_max,
-                  window=args.window, tau=args.tau, obs_version='v2',
+                  window=args.window, tau=args.tau,
+                  obs_version=OBS_DIMS[data['X'].shape[1]],
                   throttle_label=args.throttle_label,
                   precoll_frames=args.precoll_frames)
     out = Path(args.out).expanduser()
@@ -164,6 +174,8 @@ def main():
 
     a0 = data['Y'][:, 0]
     act = data['active']
+    if no_obs:
+        print(f'  ({no_obs} episodes have no {args.obs_file} -- skipped)')
     print(f'{len(names)} episodes ({missing} recorded but unlabelled, skipped), '
           f'{len(a0)} frames -> {out}')
     print(f'  outcomes: ' + ', '.join(f'{o} {outcomes.count(o)}' for o in sorted(set(outcomes))))

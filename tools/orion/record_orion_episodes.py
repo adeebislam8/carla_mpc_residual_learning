@@ -273,7 +273,7 @@ def main():
     ap.add_argument('--episodes', type=int, default=10, help='per seed')
     ap.add_argument('--stride', type=int, default=1,
                     help='save every Nth tick (1 = 20 Hz, what ORION ran at)')
-    ap.add_argument('--obs-version', default='v2', choices=['v1', 'v2'])
+    ap.add_argument('--obs-version', default='v2', choices=['v1', 'v2', 'v3'])
     # controller flags, as in benchmark_mpcc.py
     ap.add_argument('--qc', type=float, default=0.5)
     ap.add_argument('--gate-depth', type=float, default=0.98)

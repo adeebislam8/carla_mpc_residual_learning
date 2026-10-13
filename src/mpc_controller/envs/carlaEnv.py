@@ -20,6 +20,7 @@ from global_planner.src.frenet_world_converter_python import FrenetConverter
 from global_planner.src.global_path_publisher_python import PathPlanner
 from mpc_controller.src.mpc_controller_python import MPCController
 from mpc_controller.src.residual_authority import ResidualAuthority
+from mpc_controller.src.static_map import StaticMap, FEATURE_DIM as STATIC_FEATURE_DIM
 
 
 
@@ -126,8 +127,10 @@ class CarlaMPCEnv(gym.Env):
         obs_version: 'v1' = the original 116-dim observation (absolute s,
             remaining distance, step count, a never-updated 60-dim MPC
             prediction).  'v2' = route-position-free, with relative obstacle
-            positions and speeds -- see _get_observation_v2().  Policies are
-            tied to the version they were trained with.
+            positions and speeds -- see _get_observation_v2().  'v3' = v2 +
+            the nearest static objects (poles, fences, walls, ...) from the
+            map, see static_map.py.  Policies are tied to the version they
+            were trained with.
         """
         super().__init__()
         random.seed(seed)
@@ -182,11 +185,13 @@ class CarlaMPCEnv(gym.Env):
         self.current_step = 0
         self.lookahead_distance = lookahead_distance
         self.num_obstacles = num_obstacles
-        if obs_version not in ('v1', 'v2'):
-            raise ValueError(f"obs_version must be 'v1' or 'v2', got {obs_version!r}")
+        if obs_version not in ('v1', 'v2', 'v3'):
+            raise ValueError(f"obs_version must be 'v1', 'v2' or 'v3', got {obs_version!r}")
         self.obs_version = obs_version
         if obs_version == 'v2':
             state_dim = self._obs_v2_dim(num_obstacles)
+        elif obs_version == 'v3':
+            state_dim = self._obs_v2_dim(num_obstacles) + STATIC_FEATURE_DIM
         self.state_dim = state_dim
         
         # MPC parameters
@@ -1413,6 +1418,20 @@ class CarlaMPCEnv(gym.Env):
     _OBS_V2_PER_OBS = 4    # present, ds, d, relative speed
     _OBS_V2_FAR_DS = 30.0  # ds written into empty slots (detection lookahead)
 
+    # One table per town, shared by every env in the process.
+    _static_maps = {}
+
+    def _static_features(self):
+        """obs v3 tail: nearest static objects in the ego frame (static_map.py)."""
+        town = self.current_town
+        if town not in CarlaMPCEnv._static_maps:
+            CarlaMPCEnv._static_maps[town] = StaticMap.for_town(town, self.world, self.map)
+        if self.vehicle is None:
+            return StaticMap.empty_features()
+        tf = self.vehicle.get_transform()
+        return CarlaMPCEnv._static_maps[town].features(
+            tf.location.x, tf.location.y, np.deg2rad(tf.rotation.yaw))
+
     @classmethod
     def _obs_v2_dim(cls, num_obstacles):
         return (cls._OBS_V2_EGO + cls._OBS_V2_CORRIDOR + cls._OBS_V2_NOMINAL
@@ -1422,6 +1441,8 @@ class CarlaMPCEnv(gym.Env):
     def _get_observation(self) -> np.ndarray:
         if self.obs_version == 'v2':
             obs = self._get_observation_v2()
+        elif self.obs_version == 'v3':
+            obs = np.concatenate([self._get_observation_v2(), self._static_features()])
         else:
             obs = self._get_observation_v1()
         obs = obs.astype(np.float64)

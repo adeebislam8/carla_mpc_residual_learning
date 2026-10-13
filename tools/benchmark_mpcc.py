@@ -806,7 +806,7 @@ def main():
     ap.add_argument('--residual-window', type=float, default=None, metavar='M',
                     help='residual acts only with an obstacle 0 < ds < M ahead; '
                          'must match training')
-    ap.add_argument('--obs-version', default='v1', choices=['v1', 'v2'],
+    ap.add_argument('--obs-version', default='v1', choices=['v1', 'v2', 'v3'],
                     help='observation layout; must match training')
     ap.add_argument('--allow-config-mismatch', action='store_true',
                     help='evaluate even if flags differ from train_config.json '
