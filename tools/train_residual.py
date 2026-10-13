@@ -179,6 +179,7 @@ def build_env(args, seed, for_eval=False):
         reward_mode=args.reward_mode,
         steer_feedback_fix=args.steer_fix,
         use_perception=args.perception,
+        spawn_check=args.spawn_check,
     )
 
 
@@ -222,6 +223,9 @@ def main():
     ap.add_argument('--perception', action='store_true',
                     help='vehicle positions from the 3-camera YOLO pipeline instead of '
                          'ground truth (carlaEnv use_perception); must match evaluation')
+    ap.add_argument('--spawn-check', action='store_true',
+                    help='reject scenarios whose route does not start at the car (planner snapped '
+                         'to another road); off = every pre-2026-10-13 result')
     ap.add_argument('--steer-fix', action='store_true',
                     help="give the MPCC its true steering state (carlaEnv steer_feedback_fix, "
                          "2026-10-13); off = the original, sign-flipped feedback")

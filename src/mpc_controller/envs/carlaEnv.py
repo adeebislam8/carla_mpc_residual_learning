@@ -88,6 +88,7 @@ class CarlaMPCEnv(gym.Env):
         render_mode: Optional[str] = None,
         steer_norm_deg: float = 45.0,
         steer_feedback_fix: bool = False,
+        spawn_check: bool = False,
         qc: float = None,
         a_long_obs: float = None,
         b_lat_obs: float = None,
@@ -282,6 +283,14 @@ class CarlaMPCEnv(gym.Env):
         # before collisions vs 0.03 normally (round-0 recordings, 2026-10-13).
         # Default off so every pre-2026-10-13 result reproduces.
         self.steer_feedback_fix = steer_feedback_fix
+        # Reject scenarios whose planned route does not start at the car.
+        # The planner snaps the spawn to the nearest map waypoint, which on
+        # Town03-style stacked roads can be another road 20+ m away; the car
+        # then never reaches its route and 'stalls' at step ~508 having never
+        # moved (b0fix Town03: most stalls, max|n| 17-27 m).  Rejection only
+        # replaces broken scenarios -- candidates are pre-drawn, so every
+        # valid episode is unchanged.  Default off: pre-2026-10-13 results.
+        self.spawn_check = spawn_check
         self.qc = qc          # lateral tracking weight; None = model default (5e-2)
         self.a_long_obs = a_long_obs
         self.b_lat_obs = b_lat_obs
@@ -1428,6 +1437,9 @@ class CarlaMPCEnv(gym.Env):
     _OBS_V2_PER_OBS = 4    # present, ds, d, relative speed
     _OBS_V2_FAR_DS = 30.0  # ds written into empty slots (detection lookahead)
 
+    _SPAWN_MAX_D = 3.0    # m from the route centreline at spawn (spawn_check)
+    _SPAWN_MAX_S = 15.0   # m along the route at spawn
+
     # One table per town, shared by every env in the process.
     _static_maps = {}
 
@@ -1937,6 +1949,16 @@ class CarlaMPCEnv(gym.Env):
                         self._destroy_actors()
                         #self.vehicle.destroy()
                         continue
+
+                    if self.spawn_check:
+                        s0, d0, _ = self.frenet_converter.world_to_frenet(
+                            spawn_point.location.x, spawn_point.location.y,
+                            np.deg2rad(spawn_point.rotation.yaw), s_hint=0.0)
+                        if abs(d0) > self._SPAWN_MAX_D or s0 > self._SPAWN_MAX_S:
+                            print(f"spawn check: car {d0:+.1f} m off / {s0:.1f} m along "
+                                  f"its route -- rejected")
+                            self._destroy_actors()
+                            continue
 
                     # Reject over-long routes.  Checked on the ACTUAL path
                     # length, which on a grid map is well above the

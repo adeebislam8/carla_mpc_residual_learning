@@ -175,6 +175,7 @@ def run(args):
             seed=seed,
             steer_norm_deg=args.steer_norm_deg,
             steer_feedback_fix=args.steer_fix,
+            spawn_check=args.spawn_check,
             qc=args.qc,
             a_long_obs=args.a_long,
             b_lat_obs=args.b_lat,
@@ -221,6 +222,7 @@ def run(args):
         'target_speed': args.target_speed,
         'steer_norm_deg': args.steer_norm_deg,
         'steer_feedback_fix': args.steer_fix,
+        'spawn_check': args.spawn_check,
         'model': args.model,
         'algo': args.algo if args.model else None,
         'residual_mode': args.residual_mode,
@@ -732,6 +734,9 @@ def main():
     ap.add_argument('--host', default='localhost')
     ap.add_argument('--port', type=int, default=2000)
     ap.add_argument('--out-dir', default='results')
+    ap.add_argument('--spawn-check', action='store_true',
+                    help='reject scenarios whose route does not start at the car (planner snapped '
+                         'to another road); off = every pre-2026-10-13 result')
     ap.add_argument('--steer-fix', action='store_true',
                     help="feed the MPCC its steering state with the env's negation undone "
                          "(carlaEnv steer_feedback_fix); off = every pre-2026-10-13 result")

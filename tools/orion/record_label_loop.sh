@@ -55,7 +55,7 @@ LAB="$D/labels_${TOWN,,}"
 ORION_ROOT=${ORION_ROOT:-$HOME/Documents/nett/Orion}
 # STEER_FIX=1: record with the fixed MPCC steering feedback (--steer-fix).
 STEER_FIX=${STEER_FIX:-0}
-CONTROLLER="--route-max 150 --qc 0.5 --gate-depth 0.98"
+CONTROLLER="--route-max 150 --qc 0.5 --gate-depth 0.98 --spawn-check"
 [ "$STEER_FIX" = "1" ] && CONTROLLER="$CONTROLLER --steer-fix"
 # PERCEPTION=1: vehicle slots from the 3-camera YOLO pipeline (--perception).
 PERCEPTION=${PERCEPTION:-0}
