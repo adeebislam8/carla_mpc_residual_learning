@@ -45,10 +45,10 @@ sys.path.insert(0, os.path.join(
 # script stays importable without the training dependencies.
 _POLICY_CONTRACT = ('residual_mode', 'residual_max', 'authority_horizon',
                     'residual_window', 'obs_version', 'qc', 'gate_depth',
-                    'route_max', 'target_speed', 'steer_fix')
+                    'route_max', 'target_speed', 'steer_fix', 'perception')
 # Contract keys added later: a train_config.json without them was trained
 # under this value.
-_CONTRACT_DEFAULTS = {'steer_fix': False}
+_CONTRACT_DEFAULTS = {'steer_fix': False, 'perception': False}
 
 
 def _check_policy_contract(args):

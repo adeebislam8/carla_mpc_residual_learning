@@ -103,14 +103,16 @@ def episode_samples(rec_dir, label_path, args):
 
     keep = valid                       # first chunk step must be labelled
     outcome = summary.get('outcome')
-    steer_fix = bool(summary.get('flags', {}).get('steer_fix', False))
+    flags = summary.get('flags', {})
+    # Which nominal stack recorded this episode; a dataset must not mix them.
+    stack = (bool(flags.get('steer_fix', False)), bool(flags.get('perception', False)))
     precoll = np.zeros(n, dtype=bool)
     if outcome == 'collision':
         precoll[max(0, n - args.precoll_frames):] = True
     return dict(X=obs[keep].astype(np.float32), Y=Y[keep], M=M[keep],
                 active=window_active(obs, args.window)[keep],
                 precoll=precoll[keep],
-                step=np.array([r['step'] for r in recs])[keep]), (outcome, steer_fix)
+                step=np.array([r['step'] for r in recs])[keep]), (outcome, stack)
 
 
 def main():
@@ -142,7 +144,7 @@ def main():
         for p in Path(root).expanduser().glob('*.npz'):
             label_files[p.stem] = p
     parts, names, outcomes, missing, no_obs = [], [], [], 0, 0
-    steer_fix = set()
+    stacks = set()
     for root in args.rec:
         for ep in sorted(Path(root).expanduser().iterdir()):
             if not (ep / 'meta.jsonl').exists():
@@ -153,8 +155,8 @@ def main():
             if ep.name not in label_files:
                 missing += 1
                 continue
-            d, (outcome, fix) = episode_samples(ep, label_files[ep.name], args)
-            steer_fix.add(fix)
+            d, (outcome, stack) = episode_samples(ep, label_files[ep.name], args)
+            stacks.add(stack)
             if len(d['X']) == 0:
                 continue
             d['ep'] = np.full(len(d['X']), len(names), dtype=np.int32)
@@ -164,15 +166,17 @@ def main():
 
     if not parts:
         sys.exit('no labelled episodes found')
-    if len(steer_fix) > 1:
-        sys.exit('episodes recorded with AND without --steer-fix -- different nominal '
-                 'MPCCs; build them into separate datasets')
+    if len(stacks) > 1:
+        sys.exit(f'episodes recorded under different nominal stacks (steer_fix, perception) '
+                 f'{sorted(stacks)} -- build them into separate datasets')
+    steer_fix, perception = stacks.pop()
     data = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
     config = dict(chunk=args.chunk, residual_max=args.residual_max,
                   window=args.window, tau=args.tau,
                   obs_version=OBS_DIMS[data['X'].shape[1]],
                   throttle_label=args.throttle_label,
-                  precoll_frames=args.precoll_frames, steer_fix=steer_fix.pop())
+                  precoll_frames=args.precoll_frames, steer_fix=steer_fix,
+                  perception=perception)
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, **data, episodes=np.array(names),

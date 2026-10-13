@@ -297,6 +297,9 @@ def main():
     ap.add_argument('--green-lights', action=argparse.BooleanOptionalAction, default=True,
                     help='freeze all traffic lights green (default; --no-green-lights '
                          'reproduces recordings before 2026-10-13)')
+    ap.add_argument('--perception', action='store_true',
+                    help='vehicle positions from the 3-camera YOLO pipeline instead of '
+                         'ground truth (carlaEnv use_perception); must match evaluation')
     ap.add_argument('--steer-fix', action='store_true',
                     help="give the MPCC its true steering state (carlaEnv steer_feedback_fix, "
                          "2026-10-13); off = the original, sign-flipped feedback")
@@ -334,9 +337,11 @@ def main():
                     authority_horizon=args.authority_horizon,
                     residual_window=args.residual_window, obs_version=args.obs_version,
                     qc=args.qc, gate_depth=args.gate_depth, route_max=args.route_max,
-                    target_speed=args.target_speed, steer_fix=args.steer_fix)
+                    target_speed=args.target_speed, steer_fix=args.steer_fix,
+                    perception=args.perception)
         bad = {k: (contract.get(k, False), v) for k, v in mine.items()
-               if (k in contract or k == 'steer_fix') and contract.get(k, False) != v}
+               if (k in contract or k in ('steer_fix', 'perception'))
+               and contract.get(k, False) != v}
         if bad:
             raise SystemExit(f'student {args.student} was trained under different '
                              f'flags (trained, given): {bad}')
@@ -357,7 +362,8 @@ def main():
             residual_mode=args.residual_mode, residual_max=args.residual_max,
             authority_horizon=args.authority_horizon,
             residual_window_m=args.residual_window,
-            steer_feedback_fix=args.steer_fix)
+            steer_feedback_fix=args.steer_fix,
+            use_perception=args.perception)
         if policy is not None:
             policy.attach(env)
         try:
