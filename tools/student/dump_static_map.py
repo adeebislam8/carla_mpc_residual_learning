@@ -45,6 +45,9 @@ def main():
         sm.save(path)
         counts = collections.Counter(sm.label.tolist())
         print(f'{town}: {len(sm.cx)} objects -> {path}')
+        dropped = getattr(sm, 'dropped', {})
+        print(f'   dropped {sum(dropped.values())} boxes covering a lane centre: '
+              + (', '.join(f'{k} {v}' for k, v in dropped.most_common()) or 'none'))
         print('   ' + ', '.join(f'{k} {v}' for k, v in counts.most_common()))
         print(f'   footprint half-size median {np.median(np.maximum(sm.ex, sm.ey)):.2f} m, '
               f'max {np.max(np.maximum(sm.ex, sm.ey)):.1f} m')

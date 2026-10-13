@@ -21,6 +21,7 @@ frame: per slot (present, forward, lateral).  Empty slots are
 (0, FAR_FWD, 0), like the v2 obstacle slots.
 """
 
+import collections
 import os
 
 import numpy as np
@@ -34,6 +35,8 @@ FAR_FWD = 30.0
 # Objects whose bottom is this far above the local road are overhead
 # (traffic-light arms, signs on gantries, bridges) -- not collidable.
 OVERHEAD_M = 2.5
+# Lane-centre spacing used to find boxes that cover the road.
+LANE_SAMPLE_M = 1.0
 
 # carla.CityObjectLabel names; road surfaces, sidewalks and terrain are
 # excluded (always near, not obstacles), as are bridges (overhead).
@@ -79,7 +82,34 @@ class StaticMap:
         if not rows:
             raise RuntimeError('get_level_bbs returned no static objects')
         cx, cy, ex, ey, yaw, label = zip(*rows)
-        return cls(cx, cy, ex, ey, yaw, label)
+        sm = cls(cx, cy, ex, ey, yaw, label)
+        # Some level boxes are merged geometry spanning the map (Town01 has
+        # one 3 km across), so every pose is "inside" them.  Nothing real
+        # stands on a driving-lane centreline: drop any box covering one.
+        lanes = [w for w in carla_map.generate_waypoints(LANE_SAMPLE_M)
+                 if w.lane_type == carla.LaneType.Driving]
+        pts = np.array([[w.transform.location.x, w.transform.location.y] for w in lanes])
+        return sm.without_boxes_covering(pts)
+
+    def contains(self, i, px, py):
+        """bool mask: which of the points lie inside box i's footprint."""
+        dx, dy = px - self.cx[i], py - self.cy[i]
+        lx = self.c[i] * dx + self.s[i] * dy
+        ly = -self.s[i] * dx + self.c[i] * dy
+        return (np.abs(lx) <= self.ex[i]) & (np.abs(ly) <= self.ey[i])
+
+    def without_boxes_covering(self, pts):
+        """Copy without the boxes that contain any of pts (N, 2)."""
+        keep = np.ones(len(self.cx), bool)
+        for i in range(len(self.cx)):
+            near = np.hypot(pts[:, 0] - self.cx[i], pts[:, 1] - self.cy[i]) <= self.reach[i]
+            if near.any() and self.contains(i, pts[near, 0], pts[near, 1]).any():
+                keep[i] = False
+        self.dropped = collections.Counter(self.label[~keep].tolist())
+        out = StaticMap(self.cx[keep], self.cy[keep], self.ex[keep], self.ey[keep],
+                        self.yaw[keep], self.label[keep])
+        out.dropped = self.dropped
+        return out
 
     def save(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)

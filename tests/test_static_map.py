@@ -71,3 +71,15 @@ def test_roundtrip_save_load(tmp_path):
     sm.save(p)
     sm2 = StaticMap.load(p)
     assert np.allclose(sm.features(0, 0, 0), sm2.features(0, 0, 0))
+
+
+def test_drop_boxes_covering_lane_points():
+    # A 3 km "map-sized" box and a pole beside the lane; lane centre along y=0.
+    sm = StaticMap([0.0, 10.0], [0.0, 3.0], [1500.0, 0.2], [1500.0, 0.2], [0.0, 0.0],
+                   ['Vegetation', 'Poles'])
+    lane = np.stack([np.arange(0, 50, 1.0), np.zeros(50)], axis=1)
+    kept = sm.without_boxes_covering(lane)
+    assert list(kept.label) == ['Poles']
+    assert kept.dropped == {'Vegetation': 1}
+    s = slots(kept.features(0.0, 0.0, 0.0))
+    assert s[0, 0] == 1.0 and np.isclose(s[0, 2], 2.8)
