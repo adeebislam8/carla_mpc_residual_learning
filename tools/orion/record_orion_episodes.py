@@ -182,6 +182,21 @@ def _vec(v):
     return [float(v.x), float(v.y), float(v.z)]
 
 
+def freeze_lights_green(world):
+    """Hold every traffic light green.  Nothing in this env obeys lights --
+    the MPCC and the NPC controller both ignore them, and the stall rule ends
+    an episode after 25 s below 1 m/s -- but ORION was trained (Bench2Drive)
+    to stop at red, so a visible red light became a 'brake' label for a rule
+    our task does not have."""
+    import carla
+    n = 0
+    for tl in world.get_actors().filter('traffic.traffic_light'):
+        tl.set_state(carla.TrafficLightState.Green)
+        tl.freeze(True)
+        n += 1
+    return n
+
+
 def record_episode(env, ep_dir, args, policy=None):
     """policy: None = nominal MPCC (round 0); a StudentPolicy = DAgger round,
     the student drives under the authority gate and ORION later labels the
@@ -193,6 +208,8 @@ def record_episode(env, ep_dir, args, policy=None):
             setattr(env, name, lambda *a, **k: None)
 
     obs, _ = env.reset()
+    if args.green_lights:
+        freeze_lights_green(env.world)
     rig = OrionRig(env.world, env.vehicle)
     ep_dir.mkdir(parents=True, exist_ok=True)
     for spec in ORION_SENSORS:
@@ -277,6 +294,9 @@ def main():
     # controller flags, as in benchmark_mpcc.py
     ap.add_argument('--qc', type=float, default=0.5)
     ap.add_argument('--gate-depth', type=float, default=0.98)
+    ap.add_argument('--green-lights', action=argparse.BooleanOptionalAction, default=True,
+                    help='freeze all traffic lights green (default; --no-green-lights '
+                         'reproduces recordings before 2026-10-13)')
     ap.add_argument('--steer-fix', action='store_true',
                     help="give the MPCC its true steering state (carlaEnv steer_feedback_fix, "
                          "2026-10-13); off = the original, sign-flipped feedback")
