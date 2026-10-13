@@ -48,7 +48,8 @@ def load_datasets(paths):
         cfg = json.loads(str(d['config']))
         if config is None:
             config = cfg
-        elif any(cfg[k] != config[k] for k in ('chunk', 'residual_max', 'window', 'obs_version')):
+        elif (any(cfg[k] != config[k] for k in ('chunk', 'residual_max', 'window', 'obs_version'))
+              or cfg.get('steer_fix', False) != config.get('steer_fix', False)):
             raise SystemExit(f'{p}: dataset config {cfg} differs from {config}')
         part = {k: d[k] for k in ('X', 'Y', 'M', 'active', 'precoll', 'ep')}
         part['ep'] = part['ep'] + ep_offset
@@ -357,7 +358,8 @@ def main():
                     authority_horizon=args.authority_horizon,
                     residual_window=window, obs_version=cfg['obs_version'],
                     qc=args.qc, gate_depth=args.gate_depth, route_max=args.route_max,
-                    target_speed=args.target_speed)
+                    target_speed=args.target_speed,
+                    steer_fix=bool(cfg.get('steer_fix', False)))
     with open(out / 'train_config.json', 'w') as f:
         json.dump(contract, f, indent=2)
 

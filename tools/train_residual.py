@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.join(
 # evaluate under different ones.
 POLICY_CONTRACT = ('residual_mode', 'residual_max', 'authority_horizon',
                    'residual_window', 'obs_version', 'qc', 'gate_depth',
-                   'route_max', 'target_speed')
+                   'route_max', 'target_speed', 'steer_fix')
 
 
 def make_skip_wrapper():
@@ -177,6 +177,7 @@ def build_env(args, seed, for_eval=False):
         residual_window_m=args.residual_window,
         obs_version=args.obs_version,
         reward_mode=args.reward_mode,
+        steer_feedback_fix=args.steer_fix,
     )
 
 
@@ -217,6 +218,9 @@ def main():
                          "the control arm against reward-shaping criticism")
     ap.add_argument('--qc', type=float, default=0.5)
     ap.add_argument('--gate-depth', type=float, default=0.98)
+    ap.add_argument('--steer-fix', action='store_true',
+                    help="give the MPCC its true steering state (carlaEnv steer_feedback_fix, "
+                         "2026-10-13); off = the original, sign-flipped feedback")
     ap.add_argument('--a-long', type=float, default=None)
     ap.add_argument('--b-lat', type=float, default=None)
     ap.add_argument('--apex-gain', type=float, default=None)

@@ -53,7 +53,10 @@ D=${D:-$HOME/Documents/nett/orion_data}
 REC="$D/rec_${TOWN,,}"
 LAB="$D/labels_${TOWN,,}"
 ORION_ROOT=${ORION_ROOT:-$HOME/Documents/nett/Orion}
+# STEER_FIX=1: record with the fixed MPCC steering feedback (--steer-fix).
+STEER_FIX=${STEER_FIX:-0}
 CONTROLLER="--route-max 150 --qc 0.5 --gate-depth 0.98"
+[ "$STEER_FIX" = "1" ] && CONTROLLER="$CONTROLLER --steer-fix"
 MIN_FREE_GB=${MIN_FREE_GB:-8}
 : "${CARLA_ROOT:?set CARLA_ROOT}"
 # The conda binary, not the shell function, so this also works under nohup.

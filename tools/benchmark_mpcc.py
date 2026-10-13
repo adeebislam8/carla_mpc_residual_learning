@@ -45,7 +45,10 @@ sys.path.insert(0, os.path.join(
 # script stays importable without the training dependencies.
 _POLICY_CONTRACT = ('residual_mode', 'residual_max', 'authority_horizon',
                     'residual_window', 'obs_version', 'qc', 'gate_depth',
-                    'route_max', 'target_speed')
+                    'route_max', 'target_speed', 'steer_fix')
+# Contract keys added later: a train_config.json without them was trained
+# under this value.
+_CONTRACT_DEFAULTS = {'steer_fix': False}
 
 
 def _check_policy_contract(args):
@@ -68,9 +71,12 @@ def _check_policy_contract(args):
         trained = json.load(f)
     mismatches = []
     for key in _POLICY_CONTRACT:
-        if key in trained and getattr(args, key, None) != trained[key]:
+        if key not in trained and key not in _CONTRACT_DEFAULTS:
+            continue
+        want = trained.get(key, _CONTRACT_DEFAULTS.get(key))
+        if getattr(args, key, None) != want:
             mismatches.append(f"    --{key.replace('_', '-')}: trained "
-                              f"{trained[key]!r}, evaluating {getattr(args, key, None)!r}")
+                              f"{want!r}, evaluating {getattr(args, key, None)!r}")
     if mismatches:
         msg = "policy contract mismatch with " + path + ":\n" + "\n".join(mismatches)
         if args.allow_config_mismatch:

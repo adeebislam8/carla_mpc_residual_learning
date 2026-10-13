@@ -277,6 +277,9 @@ def main():
     # controller flags, as in benchmark_mpcc.py
     ap.add_argument('--qc', type=float, default=0.5)
     ap.add_argument('--gate-depth', type=float, default=0.98)
+    ap.add_argument('--steer-fix', action='store_true',
+                    help="give the MPCC its true steering state (carlaEnv steer_feedback_fix, "
+                         "2026-10-13); off = the original, sign-flipped feedback")
     ap.add_argument('--route-min', type=float, default=50.0)
     ap.add_argument('--route-max', type=float, default=150.0)
     ap.add_argument('--target-speed', type=float, default=15.0)
@@ -311,9 +314,9 @@ def main():
                     authority_horizon=args.authority_horizon,
                     residual_window=args.residual_window, obs_version=args.obs_version,
                     qc=args.qc, gate_depth=args.gate_depth, route_max=args.route_max,
-                    target_speed=args.target_speed)
-        bad = {k: (contract[k], v) for k, v in mine.items()
-               if k in contract and contract[k] != v}
+                    target_speed=args.target_speed, steer_fix=args.steer_fix)
+        bad = {k: (contract.get(k, False), v) for k, v in mine.items()
+               if (k in contract or k == 'steer_fix') and contract.get(k, False) != v}
         if bad:
             raise SystemExit(f'student {args.student} was trained under different '
                              f'flags (trained, given): {bad}')
@@ -333,7 +336,8 @@ def main():
             npc_max=args.npc_max, obs_version=args.obs_version,
             residual_mode=args.residual_mode, residual_max=args.residual_max,
             authority_horizon=args.authority_horizon,
-            residual_window_m=args.residual_window)
+            residual_window_m=args.residual_window,
+            steer_feedback_fix=args.steer_fix)
         if policy is not None:
             policy.attach(env)
         try:
