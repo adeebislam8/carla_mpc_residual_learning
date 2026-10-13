@@ -87,6 +87,7 @@ class CarlaMPCEnv(gym.Env):
         discrete_actions: bool = False,
         render_mode: Optional[str] = None,
         steer_norm_deg: float = 45.0,
+        steer_feedback_fix: bool = False,
         qc: float = None,
         a_long_obs: float = None,
         b_lat_obs: float = None,
@@ -272,6 +273,15 @@ class CarlaMPCEnv(gym.Env):
         # Steering feedforward gain: CARLA applies steer over 70 deg, so
         # normalising by 45 gives 1.556x.  Smaller => more gain.
         self.steer_norm_deg = steer_norm_deg
+        # The MPCC publishes steering = delta / 45deg and this env applies
+        # control.steer = -steering, but current_steering reads control.steer
+        # back WITHOUT undoing that negation -- so the MPCC's initial delta was
+        # the mirror of what it commanded.  Harmless for small angles (the
+        # 0.5 rad/step rate limit undoes it in one step), but at large angles
+        # it alternates sign every step: measured |dsteer| 0.51/step in the 2 s
+        # before collisions vs 0.03 normally (round-0 recordings, 2026-10-13).
+        # Default off so every pre-2026-10-13 result reproduces.
+        self.steer_feedback_fix = steer_feedback_fix
         self.qc = qc          # lateral tracking weight; None = model default (5e-2)
         self.a_long_obs = a_long_obs
         self.b_lat_obs = b_lat_obs
@@ -2002,7 +2012,8 @@ class CarlaMPCEnv(gym.Env):
                 v=self.current_speed,
                 obstacles=self.selected_obstacles,
                 D=self.current_throttle,
-                delta=self.current_steering,
+                delta=(-self.current_steering if self.steer_feedback_fix
+                       else self.current_steering),
                 road_widths=self._road_widths,  # None is okay, MPC will use defaults
                 road_width_s=self._road_width_s,
             )
