@@ -176,6 +176,8 @@ def run(args):
             steer_norm_deg=args.steer_norm_deg,
             steer_feedback_fix=args.steer_fix,
             spawn_check=args.spawn_check,
+            traffic_fix=args.traffic_fix,
+            scenario=args.scenario,
             qc=args.qc,
             a_long_obs=args.a_long,
             b_lat_obs=args.b_lat,
@@ -223,6 +225,8 @@ def run(args):
         'steer_norm_deg': args.steer_norm_deg,
         'steer_feedback_fix': args.steer_fix,
         'spawn_check': args.spawn_check,
+        'traffic_fix': args.traffic_fix,
+        'scenario': args.scenario,
         'model': args.model,
         'algo': args.algo if args.model else None,
         'residual_mode': args.residual_mode,
@@ -320,6 +324,13 @@ def _run_seed(env, args, seed, episodes, model=None, obs_norm=None):
             **({f'student_{k}': v for k, v in model.episode.items()}
                if hasattr(model, 'episode') else {}),
             'nominal_infeasible': info.get('nominal_infeasible'),
+            'npc_spawned': info.get('npc_spawned'),
+            'scenario': info.get('scenario'),
+            'scenario_variant': info.get('scenario_variant'),
+            'scenario_spawned': info.get('scenario_spawned'),
+            'scenario_triggered': info.get('scenario_triggered'),
+            'scenario_passed': info.get('scenario_passed'),
+            'scenario_hit': info.get('scenario_hit'),
         }
         # Reward-term breakdown (_reward_term_metrics() in carlaEnv.py).
         # Prefix-whitelisted rather than named one by one -- the term set
@@ -734,6 +745,13 @@ def main():
     ap.add_argument('--host', default='localhost')
     ap.add_argument('--port', type=int, default=2000)
     ap.add_argument('--out-dir', default='results')
+    ap.add_argument('--scenario', default='none',
+                    choices=['none', 'hard_brake', 'stopped', 'stopped_oncoming', 'cut_in'],
+                    help='one scripted hard event per episode (scenarios.py); replaces the '
+                         'random in-lane NPCs')
+    ap.add_argument('--traffic-fix', action='store_true',
+                    help='spawn NPCs relative to the ego\'s real start (carlaEnv traffic_fix); '
+                         'off = the stale-position bug, i.e. mostly empty roads')
     ap.add_argument('--spawn-check', action='store_true',
                     help='reject scenarios whose route does not start at the car (planner snapped '
                          'to another road); off = every pre-2026-10-13 result')

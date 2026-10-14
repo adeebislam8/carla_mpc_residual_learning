@@ -21,6 +21,7 @@ from global_planner.src.global_path_publisher_python import PathPlanner
 from mpc_controller.src.mpc_controller_python import MPCController
 from mpc_controller.src.residual_authority import ResidualAuthority
 from mpc_controller.src.static_map import StaticMap, FEATURE_DIM as STATIC_FEATURE_DIM
+from mpc_controller.src.scenarios import SCENARIOS, make_scenario
 
 
 
@@ -89,6 +90,8 @@ class CarlaMPCEnv(gym.Env):
         steer_norm_deg: float = 45.0,
         steer_feedback_fix: bool = False,
         spawn_check: bool = False,
+        traffic_fix: bool = False,
+        scenario: str = 'none',
         qc: float = None,
         a_long_obs: float = None,
         b_lat_obs: float = None,
@@ -291,6 +294,18 @@ class CarlaMPCEnv(gym.Env):
         # replaces broken scenarios -- candidates are pre-drawn, so every
         # valid episode is unchanged.  Default off: pre-2026-10-13 results.
         self.spawn_check = spawn_check
+        # reset() spawned the NPCs while current_s still held the PREVIOUS
+        # episode's final position, so NPCs had to be >= 20 m ahead of a stale
+        # s yet inside the first half of the new route -- after the first
+        # episode of a seed most failed ('Could not spawn NPC after 50
+        # attempts') and the fixed slow car was placed off the stale s too.
+        # traffic_fix puts current_s at the ego's real spawn s first.
+        # Default off: every pre-2026-10-15 result.
+        self.traffic_fix = traffic_fix
+        if scenario not in SCENARIOS:
+            raise ValueError(f'scenario must be one of {SCENARIOS}, got {scenario!r}')
+        self.scenario_name = scenario
+        self._scenario = None
         self.qc = qc          # lateral tracking weight; None = model default (5e-2)
         self.a_long_obs = a_long_obs
         self.b_lat_obs = b_lat_obs
@@ -885,6 +900,7 @@ class CarlaMPCEnv(gym.Env):
         try:
             other = getattr(event, 'other_actor', None)
             info['other'] = getattr(other, 'type_id', 'unknown') or 'unknown'
+            info['other_id'] = getattr(other, 'id', None)
             info['other_is_vehicle'] = info['other'].startswith('vehicle.')
 
             # Impulse in world frame -> ego frame, to tell front/rear/side apart.
@@ -1184,22 +1200,30 @@ class CarlaMPCEnv(gym.Env):
         s, d, alpha = self.frenet_converter.world_to_frenet(
             x, y, yaw, s_hint=npc_data.get("s"))
 
+        # Scenario NPCs (scenarios.py) may track a lateral offset and/or drive
+        # against the route; ordinary NPCs have neither key and behave as before.
+        d_target = npc_data.get("d_target", 0.0)
+        direction = npc_data.get("direction", 1)
+
         # Lookahead along Frenet path
         lookahead = 6.0
-        s_ref = s + lookahead
+        s_ref = s + direction * lookahead
         if s_ref > self.path_length:
             s_ref -= self.path_length
 
         x_ref, y_ref, yaw_ref = self.frenet_converter.frenet_to_world(s_ref, 0.0, 0.0)
+        if direction < 0:
+            yaw_ref += np.pi
 
         # Heading error
         heading_error = (yaw_ref - yaw + np.pi) % (2*np.pi) - np.pi
 
-        # Lateral correction from Frenet d
+        # Lateral correction from Frenet d (driving backwards along the route
+        # flips which way a steer moves d)
         k_d = 0.6
         k_yaw = 1.2
 
-        steer = k_yaw * heading_error + k_d * (-d)
+        steer = k_yaw * heading_error + direction * k_d * (d_target - d)
         steer = np.clip(steer, -1.0, 1.0)
 
         # Speed control
@@ -1210,12 +1234,16 @@ class CarlaMPCEnv(gym.Env):
         speed_error = target_speed - speed
         control = carla.VehicleControl()
 
-        if speed_error > 0:
+        if target_speed <= 0.0 and npc_data.get("hold"):
+            control.throttle = 0.0
+            control.brake = 1.0           # parked / stopped scenario car
+        elif speed_error > 0:
             control.throttle = np.clip(0.5 * speed_error, 0.0, 0.75)
             control.brake = 0.0
         else:
             control.throttle = 0.0
-            control.brake = np.clip(-0.5 * speed_error, 0.0, 0.5)
+            control.brake = (1.0 if npc_data.get("hard_brake")
+                             else np.clip(-0.5 * speed_error, 0.0, 0.5))
 
         control.steer = steer
         npc.apply_control(control)
@@ -1393,7 +1421,8 @@ class CarlaMPCEnv(gym.Env):
                         'type': 'npc',
                         # NPCs follow the route forward, so speed magnitude
                         # is their speed along the path.
-                        'v': math.sqrt(vel.x ** 2 + vel.y ** 2),
+                        'v': math.sqrt(vel.x ** 2 + vel.y ** 2)
+                             * (1.0 if npc_data.get("direction", 1) > 0 else -1.0),
                     })
             except:
                 pass
@@ -1736,6 +1765,8 @@ class CarlaMPCEnv(gym.Env):
             npc = npc_data.get("actor")
             if npc is None or not npc.is_alive:
                 continue
+            if npc_data.get("direction", 1) < 0 or npc_data.get("blocks") is False:
+                continue      # oncoming / passing-lane stream: not an overtake
             npc_id = npc.id
             npc_s = npc_data.get("s", -999)
             if npc_s < self.current_s - 50.0:      # respawned behind us
@@ -1972,7 +2003,22 @@ class CarlaMPCEnv(gym.Env):
                     self._initialize_mpc()
                     # self._visualize_path_and_goal(goal_point)
 
-                    self.racing_npcs = self._spawn_frenet_racers(num_cars=_npc_count)
+                    if self.traffic_fix or self.scenario_name != 'none':
+                        s0, _, _ = self.frenet_converter.world_to_frenet(
+                            spawn_point.location.x, spawn_point.location.y,
+                            np.deg2rad(spawn_point.rotation.yaw), s_hint=0.0)
+                        self.current_s = float(s0)
+                    self._scenario = make_scenario(
+                        self.scenario_name, self,
+                        self.seed * 7919 + self.episode_count * 31 + 1)
+                    if self._scenario is None:
+                        self.racing_npcs = self._spawn_frenet_racers(num_cars=_npc_count)
+                    else:
+                        # Scenario actors replace the random in-lane NPCs:
+                        # NPCs have no collision avoidance, so a cruising
+                        # scenario car would rear-end them.
+                        self.racing_npcs = self._scenario.spawn()
+                    self._npc_spawned = len(self.racing_npcs)
 
                     break
             else:
@@ -2016,10 +2062,13 @@ class CarlaMPCEnv(gym.Env):
             self.current_step += 1
             self.prev_s = self.current_s
 
+            if self._scenario is not None:
+                self._scenario.update()
             for npc_data in self.racing_npcs:
                 if npc_data["actor"] is not None and npc_data["actor"].is_alive:
                     self._frenet_follow_controller(npc_data, self.mpc_dt)
-                    self._respawn_if_finished(npc_data)
+                    if not npc_data.get("scenario"):
+                        self._respawn_if_finished(npc_data)
             
             # Run MPC to get base control
             self._update_vehicle_state()
@@ -2143,6 +2192,9 @@ class CarlaMPCEnv(gym.Env):
             info['residual_active'] = bool(self.residual_active)
             info.update(self._authority_metrics())
             info.update(self._reward_term_metrics())
+            info['npc_spawned'] = getattr(self, '_npc_spawned', None)
+            if self._scenario is not None:
+                info.update(self._scenario.metrics())
 
             # Per-step misbehaviour trace -- buffered every step (cheap: a
             # list of small dicts, freed at the next reset()), but only
