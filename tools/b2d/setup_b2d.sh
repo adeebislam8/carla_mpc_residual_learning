@@ -61,9 +61,21 @@ fi
 # carla 0.9.15 has a cp310 wheel.  Leaderboard/scenario_runner pins are for
 # py3.7 (numpy 1.18, opencv 4.2); unpinned modern versions are used instead,
 # except py_trees, whose 0.8 API the scenario runner needs.
+# The source env may get some packages from ~/.local, which Bench2Drive runs
+# hide (PYTHONNOUSERSITE=1) -- so everything our agent imports is listed here.
+#   ours:        gymnasium scipy matplotlib casadi opencv (+ acados_template below)
+#   Bench2Drive: py-trees networkx shapely psutil xmlschema ephem tabulate six
+#                simple-watchdog-timer dictor requests pexpect transforms3d,
+#                setuptools<81 (pkg_resources), simplejson (optional)
+#   B2D_YOLO=1:  ultralytics (pulls PyTorch, ~2.5 GB) for 'perception': true
 PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install \
   "carla==0.9.15" "py-trees==0.8.3" networkx shapely psutil xmlschema ephem \
-  tabulate six simple-watchdog-timer dictor requests pexpect transforms3d
+  tabulate six simple-watchdog-timer dictor requests pexpect transforms3d \
+  gymnasium scipy matplotlib "casadi==3.7.2" opencv-python-headless \
+  "setuptools<81" simplejson
+if [ "${B2D_YOLO:-0}" = "1" ]; then
+  PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install ultralytics
+fi
 # acados_template is an editable/local install in the source env (the acados
 # submodule), which a conda clone does not always carry over: find where the
 # source env imports it from and install that directory into b2d too, and copy
@@ -83,6 +95,17 @@ if ! PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -c "import acados_template" 2
     cp -n "$SRC_PREFIX"/etc/conda/activate.d/* "$B2D_PREFIX/etc/conda/activate.d/" 2>/dev/null || true
   fi
 fi
-PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -c \
-  "import carla, py_trees, acados_template; print('b2d env OK, carla', carla.__file__)"
+# Import the whole agent stack exactly as the leaderboard will see it, so a
+# missing module shows up here rather than one per failed run.
+PYTHONNOUSERSITE=1 \
+PYTHONPATH="$CARLA15/PythonAPI:$CARLA15/PythonAPI/carla:$B2D/leaderboard:$B2D/scenario_runner:$REPO/src" \
+  "$CONDA" run -n b2d python -c "
+import carla, py_trees, networkx, shapely, acados_template, casadi, gymnasium, scipy
+from agents.navigation.global_route_planner import GlobalRoutePlanner
+from leaderboard.autoagents.autonomous_agent import AutonomousAgent
+from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
+from mpc_controller.envs.carlaEnv import CarlaMPCEnv
+from student.policy import StudentPolicy
+print('b2d env OK: carla', carla.__file__, '| casadi', casadi.__version__)
+"
 echo "== done.  Next: ./tools/b2d/run_b2d.sh smoke"
