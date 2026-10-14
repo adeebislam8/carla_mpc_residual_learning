@@ -49,6 +49,12 @@ else
   echo "== Bench2Drive already at $B2D"
 fi
 
+# Python 3.10 compatibility: Bench2Drive targets py3.7.  Element.getchildren()
+# was removed in 3.9; list(elem) is the identical drop-in.  Idempotent.
+grep -rl 'getchildren()' --include='*.py' "$B2D/leaderboard" "$B2D/scenario_runner" \
+  | xargs -r sed -i -E 's/([A-Za-z_][A-Za-z0-9_.]*)\.getchildren\(\)/list(\1)/g'
+echo "== py3.10 patch: $(grep -rl 'getchildren()' --include='*.py' "$B2D/leaderboard" "$B2D/scenario_runner" | wc -l) files still use getchildren (want 0)"
+
 if ! "$CONDA" env list | grep -q '^b2d '; then
   "$CONDA" create -y --name b2d --clone "$SRC_ENV"
 fi
