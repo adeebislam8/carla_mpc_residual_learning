@@ -6,6 +6,8 @@
 #   TOWNS="Town04 Town05" SEEDS="1 2" ./tools/probe_scenarios.sh
 #   CASES="s1 s3" ./tools/probe_scenarios.sh           # a subset
 #   TAG=watch CASES=s3 EPISODES=2 EXTRA="--render" ./tools/probe_scenarios.sh   # watch it
+#   TAG=check EPISODES=3 EXTRA="--scenario-trace results/traces" ./tools/probe_scenarios.sh
+#       # per-episode CSV + PNG of ego and scenario cars, to check the geometry
 #
 # Cases (src/mpc_controller/src/scenarios.py):
 #   s0  normal       default random NPCs (now actually spawned: --traffic-fix)

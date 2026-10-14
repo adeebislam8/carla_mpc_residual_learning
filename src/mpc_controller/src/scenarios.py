@@ -63,6 +63,7 @@ class Scenario:
         self.triggered = False
         self.passed = False
         self.event_s = None
+        self.trace = []           # per step: ego + every actor, for plotting
 
     # ── helpers ────────────────────────────────────────────────────────
 
@@ -124,6 +125,16 @@ class Scenario:
     def update(self):
         """Called every step before the NPC controllers."""
         env = self.env
+        row = dict(step=env.current_step, ego_s=float(env.current_s),
+                   ego_d=float(env.current_d), ego_v=float(env.current_speed),
+                   triggered=bool(self.triggered))
+        for i, a in enumerate(self.actors):
+            act = a.get('actor')
+            v = act.get_velocity() if act is not None else None
+            row[f'a{i}_s'] = float(a.get('s', np.nan))
+            row[f'a{i}_d'] = float(a.get('d', a.get('d_target', np.nan)))
+            row[f'a{i}_v'] = float(np.hypot(v.x, v.y)) if v is not None else np.nan
+        self.trace.append(row)
         blocking = [a for a in self.actors if a.get('blocks', True)]
         if blocking and not self.passed:
             if env.current_s > max(a['s'] for a in blocking) + 5.0:

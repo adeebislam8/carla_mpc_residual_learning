@@ -1250,6 +1250,7 @@ class CarlaMPCEnv(gym.Env):
 
         # Update s (for looping)
         npc_data["s"] = s
+        npc_data["d"] = d
 
     def _respawn_if_finished(self, npc_data):
         """

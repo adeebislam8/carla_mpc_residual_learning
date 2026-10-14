@@ -88,6 +88,67 @@ def _check_policy_contract(args):
         print(f"  policy contract matches {path}")
 
 
+def _write_scenario_trace(scn, rec, stem):
+    """<stem>.csv (every step: ego + scenario cars) and <stem>.png: lateral
+    offset d against route position s (a top-down view, straightened), and
+    speeds against time.  Checks scenario geometry without watching CARLA."""
+    import csv
+    os.makedirs(os.path.dirname(stem), exist_ok=True)
+    keys = sorted({k for row in scn.trace for k in row})
+    with open(stem + '.csv', 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(scn.trace)
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return stem + '.csv'
+    tr = scn.trace
+    n_act = len(scn.actors)
+    t = [r['step'] * 0.05 for r in tr]
+    trig = next((r['step'] * 0.05 for r in tr if r['triggered']), None)
+    fig, (ax1, ax3, ax2) = plt.subplots(3, 1, figsize=(10, 10))
+    ax1.plot([r['ego_s'] for r in tr], [r['ego_d'] for r in tr], 'k-', lw=2, label='ego')
+    for i in range(n_act):
+        ss = [r.get(f'a{i}_s') for r in tr]
+        dd = [r.get(f'a{i}_d') for r in tr]
+        ax1.plot(ss, dd, '-', lw=1, label=f'car {i}')
+        ax1.plot(ss[0], dd[0], 'o', color=ax1.lines[-1].get_color())
+    end = rec.get('outcome')
+    ax1.plot(tr[-1]['ego_s'], tr[-1]['ego_d'], 'rx' if end == 'collision' else 'g*', ms=12)
+    ax1.invert_yaxis()          # route-left (negative d, the passing lane) on top
+    ax1.set_xlabel('route position s [m]')
+    ax1.set_ylabel('lateral d [m]  (up = left)')
+    ax1.set_title(f"{scn.name} / {scn.variant}: {end}  (o = start, x = crash, * = end)")
+    ax1.legend(fontsize=7, ncol=4)
+    ax1.grid(alpha=0.3)
+    # s against time: where two lines cross, the cars are side by side.
+    ax3.plot(t, [r['ego_s'] for r in tr], 'k-', lw=2, label='ego')
+    for i in range(n_act):
+        ax3.plot(t, [r.get(f'a{i}_s') for r in tr], '-', lw=1, label=f'car {i}')
+    if trig is not None:
+        ax3.axvline(trig, color='r', ls='--', label='trigger')
+    ax3.set_xlabel('time [s]')
+    ax3.set_ylabel('route position s [m]')
+    ax3.legend(fontsize=7, ncol=4)
+    ax3.grid(alpha=0.3)
+    ax2.plot(t, [r['ego_v'] for r in tr], 'k-', lw=2, label='ego')
+    for i in range(n_act):
+        ax2.plot(t, [r.get(f'a{i}_v') for r in tr], '-', lw=1, label=f'car {i}')
+    if trig is not None:
+        ax2.axvline(trig, color='r', ls='--', label='trigger')
+    ax2.set_xlabel('time [s]')
+    ax2.set_ylabel('speed [m/s]')
+    ax2.legend(fontsize=7, ncol=4)
+    ax2.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(stem + '.png', dpi=90)
+    plt.close(fig)
+    return stem + '.png'
+
+
 def run(args):
     """Drive `episodes` episodes for each seed and collect per-episode records."""
     # Diagnostics default ON here.  run_mpc_python.sh sets CARLA_MPC_DIAG but the
@@ -358,6 +419,11 @@ def _run_seed(env, args, seed, episodes, model=None, obs_norm=None):
                 w.writeheader()
                 w.writerows(trace)
             rec['trace_file'] = trace_path
+
+        scn = getattr(env, '_scenario', None)
+        if args.scenario_trace and scn is not None and scn.trace:
+            rec['scenario_trace'] = _write_scenario_trace(
+                scn, rec, os.path.join(args.scenario_trace, f"{args.label}_s{seed}_e{ep:03d}"))
 
         episodes.append(rec)
         # Inline progress: episodes done / total for this seed, a coarse bar, and
@@ -749,6 +815,9 @@ def main():
                     choices=['none', 'hard_brake', 'stopped', 'stopped_oncoming', 'cut_in'],
                     help='one scripted hard event per episode (scenarios.py); replaces the '
                          'random in-lane NPCs')
+    ap.add_argument('--scenario-trace', default=None, metavar='DIR',
+                    help='write a per-episode CSV + PNG of the ego and scenario cars '
+                         '(s, d, speed) to DIR')
     ap.add_argument('--traffic-fix', action='store_true',
                     help='spawn NPCs relative to the ego\'s real start (carlaEnv traffic_fix); '
                          'off = the stale-position bug, i.e. mostly empty roads')
