@@ -6,6 +6,7 @@
 #   TOWNS="Town04 Town05" SEEDS="1 2" ./tools/probe_scenarios.sh
 #   CASES="s1 s3" ./tools/probe_scenarios.sh           # a subset
 #   TAG=watch CASES=s3 EPISODES=2 EXTRA="--render" ./tools/probe_scenarios.sh   # watch it
+#   MPCC2=1 ./tools/probe_scenarios.sh                 # improved MPCC (follow, prediction)
 #   TAG=check EPISODES=3 EXTRA="--scenario-trace results/traces" ./tools/probe_scenarios.sh
 #       # per-episode CSV + PNG of ego and scenario cars, to check the geometry
 #
@@ -37,6 +38,17 @@ BASE="--seeds $SEEDS --episodes $EPISODES --route-min 100 --route-max 150 \
 --qc 0.5 --gate-depth 0.98 --steer-fix --spawn-check --traffic-fix"
 [ "$PERCEPTION" = "1" ] && BASE="$BASE --perception"
 EXTRA=${EXTRA:-}
+# STALL_KICK=clear: no anti-stall lunge into stopped obstacles (carlaEnv stall_kick).
+STALL_KICK=${STALL_KICK:-always}
+BASE="$BASE --stall-kick $STALL_KICK"
+[ "$STALL_KICK" != "always" ] && TAG="${TAG}k${STALL_KICK}"
+# MPCC2=1: the improved nominal controller -- no stall lunge, following
+# distance, constant-velocity obstacle prediction (tag 'm2').
+MPCC2=${MPCC2:-0}
+if [ "$MPCC2" = "1" ]; then
+  BASE="$BASE --stall-kick clear --follow --predict-obstacles"
+  TAG="${TAG}m2"
+fi
 
 case_flags() {
   case "$1" in

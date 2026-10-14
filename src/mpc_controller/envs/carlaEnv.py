@@ -93,6 +93,9 @@ class CarlaMPCEnv(gym.Env):
         traffic_fix: bool = False,
         scenario: str = 'none',
         external_world=None,
+        stall_kick: str = 'always',
+        follow: bool = False,
+        predict_obstacles: bool = False,
         qc: float = None,
         a_long_obs: float = None,
         b_lat_obs: float = None,
@@ -313,6 +316,26 @@ class CarlaMPCEnv(gym.Env):
         # traffic_fix puts current_s at the ego's real spawn s first.
         # Default off: every pre-2026-10-15 result.
         self.traffic_fix = traffic_fix
+        # Anti-stall kick: below 0.3 m/s a BRAKE command from the MPCC was
+        # replaced by FULL throttle -- also when the car had stopped behind a
+        # stopped car / for a pedestrian, so it lunged into them (probe s3: braked
+        # 14 -> 0.2 m/s, then hit the pile-up at low speed).
+        #   'always' -- that behaviour (every pre-2026-10-15 result)
+        #   'clear'  -- kick only if no obstacle is in the ego's path within
+        #               STALL_KICK_CLEAR_M and no stop line is active
+        #   'off'    -- never
+        if stall_kick not in ('always', 'clear', 'off'):
+            raise ValueError(f"stall_kick must be always/clear/off, got {stall_kick!r}")
+        self.stall_kick = stall_kick
+        # follow: cap speed so we can always stop a safe gap behind the
+        # nearest obstacle in our lane (MPCController.lead).  predict_obstacles:
+        # the CBF sees each obstacle at its constant-velocity position at every
+        # stage instead of frozen.  Both make a per-stage speed cap matter, so
+        # either turns on a binding speed slack (MPCController.v_slack).
+        # Default off: every pre-2026-10-15 result.
+        self.follow = follow
+        self.predict_obstacles = predict_obstacles
+        self.selected_obstacle_vel = np.zeros((num_obstacles, 2))
         if scenario not in SCENARIOS:
             raise ValueError(f'scenario must be one of {SCENARIOS}, got {scenario!r}')
         self.scenario_name = scenario
@@ -889,9 +912,11 @@ class CarlaMPCEnv(gym.Env):
                                   'v': v_obs})
 
         obstacles.sort(key=lambda o: o['distance'])
+        self.selected_obstacle_vel = np.zeros((self.num_obstacles, 2))
         for i, obs in enumerate(obstacles[:self.num_obstacles]):
             self.selected_obstacles[i] = [obs['s'], obs['d']]
             self.selected_obstacle_vs[i] = obs['v']
+            self.selected_obstacle_vel[i] = (obs['v'], 0.0)   # tracker: along-path only
 
     def _on_collision(self, event):
         """
@@ -1342,6 +1367,8 @@ class CarlaMPCEnv(gym.Env):
         self.mpc_controller.r3_cap = self.r3_cap
         self.mpc_controller.alat_slack = self.alat_slack
         self.mpc_controller.n_overtake = self.n_overtake
+        if self.follow or self.predict_obstacles or getattr(self, '_binding_v_slack', False):
+            self.mpc_controller.v_slack = self.V_SLACK_BINDING
         try:
             wheels = self.vehicle.get_physics_control().wheels
             real = max(w.max_steer_angle for w in wheels)
@@ -1376,6 +1403,7 @@ class CarlaMPCEnv(gym.Env):
         Bench2Drive agent (tools/b2d/mpcc_b2d_agent.py), which drives the same
         controller inside the leaderboard's own world loop.  Call after
         _update_vehicle_state() and _detect_obstacles()."""
+        self.mpc_controller.lead = self._lead_in_lane() if self.follow else None
         # _t_mpc_start = time.perf_counter()
         mpc_throttle, mpc_steering = self.mpc_controller.solve(
             s=self.current_s,
@@ -1388,6 +1416,7 @@ class CarlaMPCEnv(gym.Env):
                    else self.current_steering),
             road_widths=self._road_widths,  # None is okay, MPC will use defaults
             road_width_s=self._road_width_s,
+            obstacle_vel=(self.selected_obstacle_vel if self.predict_obstacles else None),
         )
         # _t_mpc_end = time.perf_counter()
         # self._last_mpc_time_ms = (_t_mpc_end - _t_mpc_start) * 1000
@@ -1436,10 +1465,54 @@ class CarlaMPCEnv(gym.Env):
         final_throttle = np.clip(mpc_throttle + alpha * du[0], -1.0, 1.0)
         final_steering = np.clip(mpc_steering + alpha * du[1], -1.0, 1.0)
 
-        if final_throttle < 0 and self.current_speed < 0.3:
+        if final_throttle < 0 and self.current_speed < 0.3 and self._stall_kick_allowed():
             final_throttle = 1.0  # Prevent Stalling
 
         return mpc_throttle, mpc_steering, final_throttle, final_steering
+
+    V_SLACK_BINDING = (1e1, 1e2)   # vs the original near-free (1e-3, 5e-1)
+    FOLLOW_LANE_M = 2.0            # |d_obs - d_ego| counted as "in our lane"
+    FOLLOW_PREDICT_S = 1.5         # ... now, or at this many seconds ahead
+    FOLLOW_MIN_GAP = 6.0           # centre-to-centre stop gap, m
+    FOLLOW_HEADWAY = 1.0           # + this many seconds of the lead's speed
+
+    def _lead_in_lane(self):
+        """(s_lead, v_lead, gap) of the nearest obstacle ahead that is in our
+        lane now or will be within FOLLOW_PREDICT_S (a pedestrian stepping in,
+        a car cutting in); None if the lane ahead is clear."""
+        best = None
+        for (s_obs, d_obs), (vs, vd) in zip(self.selected_obstacles,
+                                            self.selected_obstacle_vel):
+            if s_obs <= -50.0 or s_obs - self.current_s <= 0.0:
+                continue
+            d_fut = d_obs + vd * self.FOLLOW_PREDICT_S
+            if min(abs(d_obs - self.current_d), abs(d_fut - self.current_d)) \
+                    >= self.FOLLOW_LANE_M:
+                continue
+            if best is None or s_obs < best[0]:
+                gap = self.FOLLOW_MIN_GAP + self.FOLLOW_HEADWAY * max(vs, 0.0)
+                best = (float(s_obs), float(vs), gap)
+        return best
+
+    STALL_KICK_CLEAR_M = 12.0
+    STALL_KICK_LANE_M = 2.5
+
+    def _stall_kick_allowed(self):
+        """Whether the anti-stall full-throttle kick may fire (see stall_kick)."""
+        if self.stall_kick == 'off':
+            return False
+        if getattr(self.mpc_controller, 'stop_s', None) is not None:
+            return False                       # holding a stop line: never
+        if self.stall_kick == 'always':
+            return True
+        for s_obs, d_obs in self.selected_obstacles:
+            if s_obs <= -50.0:
+                continue
+            ds = s_obs - self.current_s
+            if 0.0 < ds < self.STALL_KICK_CLEAR_M and \
+                    abs(d_obs - self.current_d) < self.STALL_KICK_LANE_M:
+                return False                   # something is in our path: stay stopped
+        return True
 
     def _update_vehicle_state(self):
         """Update vehicle state from CARLA"""
@@ -1501,11 +1574,16 @@ class CarlaMPCEnv(gym.Env):
                 ds = s_obs - self.current_s
                 if ds > -5.0 and ds < MAX_OBS_LOOKAHEAD:
                     vel = npc.get_velocity()
+                    # Frenet velocity by finite difference along the actor's
+                    # world velocity -- sign-convention free (d is +right).
+                    s2, d2, _ = self.frenet_converter.world_to_frenet(
+                        loc.x + 0.5 * vel.x, loc.y + 0.5 * vel.y, 0, s_hint=s_obs)
                     obstacles.append({
                         's': s_obs,
                         'd': d_obs,
                         'distance': ds,
                         'type': 'npc',
+                        'vel': ((s2 - s_obs) / 0.5, (d2 - d_obs) / 0.5),
                         # NPCs follow the route forward, so speed magnitude
                         # is their speed along the path.
                         'v': math.sqrt(vel.x ** 2 + vel.y ** 2)
@@ -1515,9 +1593,11 @@ class CarlaMPCEnv(gym.Env):
                 pass
 
         obstacles.sort(key=lambda x: x['distance'])
+        self.selected_obstacle_vel = np.zeros((self.num_obstacles, 2))
         for i, obs in enumerate(obstacles[:self.num_obstacles]):
             self.selected_obstacles[i] = [obs['s'], obs['d']]
             self.selected_obstacle_vs[i] = obs['v']
+            self.selected_obstacle_vel[i] = obs.get('vel', (obs['v'], 0.0))
     
     # ── corridor / residual window helpers ──────────────────────────────
 

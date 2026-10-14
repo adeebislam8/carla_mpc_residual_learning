@@ -16,7 +16,10 @@
 # running while Bench2Drive runs (the leaderboard starts its own 0.9.15 server).
 
 set -euo pipefail
+# NETT: where CARLA 0.9.15 and Bench2Drive go.  SRC_ENV: the conda env with
+# acados + our deps to clone (A5000: residual_mpc; 8 GB machine: mpc_rl).
 NETT=${NETT:-$HOME/Documents/nett}
+SRC_ENV=${SRC_ENV:-residual_mpc}
 CARLA15=$NETT/CARLA_0.9.15
 B2D=$NETT/Bench2Drive
 CONDA=${CONDA:-$(command -v conda || echo "$HOME/anaconda3/bin/conda")}
@@ -24,6 +27,7 @@ CONDA=${CONDA:-$(command -v conda || echo "$HOME/anaconda3/bin/conda")}
 # the TLS handshake on the A5000 (2026-10-15).  Override with URL=... if needed.
 URL=${URL:-https://downloads.carlasim.com/Linux}
 
+mkdir -p "$NETT"
 echo "== free disk: $(df -h "$NETT" | awk 'NR==2{print $4}') (need ~70 GB for download + unpack)"
 
 if [ ! -x "$CARLA15/CarlaUE4.sh" ]; then
@@ -45,7 +49,7 @@ else
 fi
 
 if ! "$CONDA" env list | grep -q '^b2d '; then
-  "$CONDA" create -y --name b2d --clone residual_mpc
+  "$CONDA" create -y --name b2d --clone "$SRC_ENV"
 fi
 # carla 0.9.15 has a cp310 wheel.  Leaderboard/scenario_runner pins are for
 # py3.7 (numpy 1.18, opencv 4.2); unpinned modern versions are used instead,

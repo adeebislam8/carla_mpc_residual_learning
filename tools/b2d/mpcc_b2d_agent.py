@@ -19,17 +19,23 @@ What the leaderboard needs that our env never had, kept here and minimal:
     truth from the world -- 'perception': true in the config swaps in the
     env's 3-camera YOLO pipeline)
   * traffic rules: stop for red/yellow lights at their stop line, and come to
-    a full stop once at each stop sign.  Our env has no traffic lights in
-    play (they are ignored, or frozen green for ORION), so without this every
-    signalised route would be failed on red-light infractions that say nothing
-    about the method.
+    a full stop once at each stop sign.  Stop lines come from the map, light
+    state from the simulator.  They enter the MPCC as a CONSTRAINT -- a
+    per-stage speed cap from the braking envelope (MPCController.stop_s) -- so
+    the OCP plans the stop; a hard brake fires only if it still carries speed
+    into the last 2 m (counted, printed at the end).  Our own env has no
+    traffic lights in play, so without this every signalised route would fail
+    on red-light infractions that say nothing about the method.
 
 Config (JSON, all optional):
   steer_fix (true), qc (0.5), gate_depth (0.98), target_speed (15.0),
   perception (false), traffic_rules (true),
   student (null | dir), student_axes ('steer'), student_chunk_mode ('speculative'),
   support_sigma (null), obs_version ('v2'), residual_max (0.5),
-  authority_horizon (10), residual_window (null), obstacle_radius_m (45.0)
+  authority_horizon (10), residual_window (null), obstacle_radius_m (45.0),
+  stall_kick ('clear': no anti-stall lunge into stopped obstacles),
+  follow (true: speed cap to stop behind the nearest in-lane obstacle),
+  predict_obstacles (true: CBF uses constant-velocity obstacle positions)
 """
 
 import json
@@ -52,7 +58,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 perception=False, traffic_rules=True, student=None,
                 student_axes='steer', student_chunk_mode='speculative',
                 support_sigma=None, obs_version='v2', residual_max=0.5,
-                authority_horizon=10, residual_window=None, obstacle_radius_m=45.0)
+                authority_horizon=10, residual_window=None, obstacle_radius_m=45.0,
+                stall_kick='clear', follow=True, predict_obstacles=True)
 
 # Comfortable stopping deceleration for the rule layer, m/s^2.
 RULE_DECEL = 4.0
@@ -94,6 +101,7 @@ class MPCCAgent(AutonomousAgent):
         self._rule_lights = []       # (s_stop, traffic_light) along the route
         self._rule_signs = []        # (s_stop, stop_sign_actor)
         self.n_steps = 0
+        self.n_rule_overrides = 0
         self.t_control = []
 
     def sensors(self):
@@ -126,7 +134,10 @@ class MPCCAgent(AutonomousAgent):
             use_perception=c['perception'], obs_version=c['obs_version'],
             residual_mode='adaptive', residual_max=c['residual_max'],
             authority_horizon=c['authority_horizon'],
-            residual_window_m=c['residual_window'])
+            residual_window_m=c['residual_window'], stall_kick=c['stall_kick'],
+            follow=c['follow'], predict_obstacles=c['predict_obstacles'])
+        # Stop lines need the speed cap to bind even with follow/predict off.
+        core._binding_v_slack = True
         random.setstate(rng_state)
         core.vehicle = self.hero_actor
         core.map = cmap
@@ -251,21 +262,24 @@ class MPCCAgent(AutonomousAgent):
             self._refresh_obstacles()
         core._detect_obstacles()
 
+        # Traffic rules enter the MPCC as a constraint: the stop line caps
+        # every stage's speed by the braking envelope (MPCController.stop_s),
+        # so the OCP plans the stop itself.
+        stop_ds = self._rule_stop_target() if self.cfg['traffic_rules'] else None
+        core.mpc_controller.stop_s = (None if stop_ds is None
+                                      else core.current_s + stop_ds)
+        core.mpc_controller.stop_margin = STOP_LINE_MARGIN_M
+
         action = np.zeros(2)
         if self.policy is not None:
             action = self.policy.predict(core._get_observation())[0]
         _, _, thr, steer = core._compute_final_action(action)
 
-        stop_ds = self._rule_stop_target() if self.cfg['traffic_rules'] else None
-        if stop_ds is not None:
-            # Rule layer overrides the longitudinal command only (and the
-            # env's anti-stall kick, which would otherwise drive off the line).
-            room = max(stop_ds - STOP_LINE_MARGIN_M, 0.05)
-            need = core.current_speed ** 2 / (2 * room)
-            if need > 0.6 * RULE_DECEL or room < 1.0:
-                thr = -float(np.clip(need / 8.0, 0.3, 1.0)) if core.current_speed > 0.2 else -1.0
-            else:
-                thr = min(thr, 0.3)
+        # Last resort only: the soft OCP still carrying speed into the line.
+        if stop_ds is not None and stop_ds - STOP_LINE_MARGIN_M < 2.0 \
+                and core.current_speed > 1.0:
+            thr = -1.0
+            self.n_rule_overrides += 1
 
         control = carla.VehicleControl()
         if thr >= 0:
@@ -283,6 +297,8 @@ class MPCCAgent(AutonomousAgent):
                 print(f'[MPCCAgent] {n} steps, control time median '
                       f'{1000 * np.median(self.t_control):.1f} ms, p95 '
                       f'{1000 * np.percentile(self.t_control, 95):.1f} ms', flush=True)
+            print(f'[MPCCAgent] rule-layer brake overrides: {self.n_rule_overrides} '
+                  f'(stops the MPCC failed to plan)', flush=True)
             if self.policy is not None:
                 print(f'[MPCCAgent] student counters {self.policy.total}', flush=True)
             try:

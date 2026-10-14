@@ -239,6 +239,9 @@ def run(args):
             spawn_check=args.spawn_check,
             traffic_fix=args.traffic_fix,
             scenario=args.scenario,
+            stall_kick=args.stall_kick,
+            follow=args.follow,
+            predict_obstacles=args.predict_obstacles,
             qc=args.qc,
             a_long_obs=args.a_long,
             b_lat_obs=args.b_lat,
@@ -288,6 +291,9 @@ def run(args):
         'spawn_check': args.spawn_check,
         'traffic_fix': args.traffic_fix,
         'scenario': args.scenario,
+        'stall_kick': args.stall_kick,
+        'follow': args.follow,
+        'predict_obstacles': args.predict_obstacles,
         'model': args.model,
         'algo': args.algo if args.model else None,
         'residual_mode': args.residual_mode,
@@ -818,6 +824,13 @@ def main():
     ap.add_argument('--scenario-trace', default=None, metavar='DIR',
                     help='write a per-episode CSV + PNG of the ego and scenario cars '
                          '(s, d, speed) to DIR')
+    ap.add_argument('--follow', action='store_true',
+                    help='following-distance speed cap behind the nearest obstacle in our lane')
+    ap.add_argument('--predict-obstacles', action='store_true',
+                    help='CBF uses constant-velocity obstacle positions per stage')
+    ap.add_argument('--stall-kick', default='always', choices=['always', 'clear', 'off'],
+                    help="anti-stall full-throttle kick below 0.3 m/s: 'always' (legacy, also "
+                         "lunges into stopped obstacles), 'clear' (only with nothing in our path), 'off'")
     ap.add_argument('--traffic-fix', action='store_true',
                     help='spawn NPCs relative to the ego\'s real start (carlaEnv traffic_fix); '
                          'off = the stale-position bug, i.e. mostly empty roads')

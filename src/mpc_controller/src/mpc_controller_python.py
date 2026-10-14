@@ -105,6 +105,17 @@ class MPCController:
         # Set either to None to disable.
         self.curvature_speed_limit = False   # OFF: not in the 65% baseline
         self.recover_speed_cap = None     # OFF: not in the 65% baseline (6.0 to enable)
+        # Stop line as a constraint: when set (route arc length of a red light /
+        # stop sign line), every stage's speed is capped by the braking envelope
+        # v <= sqrt(2 * stop_decel * (stop_s - stop_margin - s_pred)), so the OCP
+        # itself plans the stop.  None = no stop line (every existing run).
+        self.stop_s = None
+        self.stop_decel = 3.0
+        self.stop_margin = 1.5
+        # Following distance (set per step by the env when follow is on):
+        # (s_lead, v_lead, gap) of the nearest obstacle in our lane, or None.
+        self.lead = None
+        self.follow_decel = 3.0
         self.recover_margin = 0.5         # m OUTSIDE the corridor before it fires
         #
         # NOTE: this used to trigger on abs(n) > 2.5, which collided exactly with
@@ -138,6 +149,9 @@ class MPCController:
         # historical (1e-3, 1e-3), which makes alat_max decorative -- see the
         # comment in acados_settings_mpcc.py.  Set by the env from --alat-slack.
         self.alat_slack = None
+        # (L1, L2) slack weight on the speed constraint; None = original
+        # near-free (1e-3, 5e-1).  Needed for stop_s / lead caps to bind.
+        self.v_slack = None
         # Lateral overtake target in the cost. None keeps -2.5. Set by the env
         # from --n-overtake; 0.0 disables the lateral pull.
         self.n_overtake = None
@@ -166,6 +180,7 @@ class MPCController:
             lookahead=self.lookahead,
             r3_cap=self.r3_cap,
             alat_slack=self.alat_slack,
+            v_slack=self.v_slack,
             n_overtake=self.n_overtake,
         )
         
@@ -182,7 +197,8 @@ class MPCController:
         delta: float = 0.0,
         road_widths: Optional[np.ndarray] = None,
         target_lane_d: Optional[float] = None,
-        road_width_s = None
+        road_width_s = None,
+        obstacle_vel: Optional[np.ndarray] = None,
     ) -> Tuple[float, float]:
         """
         Args:
@@ -251,8 +267,22 @@ class MPCController:
                 
                 self.acados_solver.set(i, "x", x_warmstart)
         
-        # 5. Set obstacle parameters
-        self.acados_solver.set(0, "p", obstacles.flatten())
+        # 5. Set obstacle parameters.  obstacle_vel (N, 2) [ds/dt, dd/dt]:
+        # constant-velocity prediction, so stage i sees each obstacle where it
+        # will be at t_i instead of frozen at its current position for the
+        # whole horizon (oncoming cars, cut-ins, crossing pedestrians).
+        # None = frozen obstacles, as every run before 2026-10-15.
+        dt_stage = self.Tf / self.N
+        valid_mask = obstacles[:, 0] > -50
+
+        def obstacles_at(k):
+            if obstacle_vel is None:
+                return obstacles
+            o = np.array(obstacles, dtype=float, copy=True)
+            o[valid_mask] += np.asarray(obstacle_vel, dtype=float)[valid_mask] * (dt_stage * k)
+            return o
+
+        self.acados_solver.set(0, "p", obstacles_at(0).flatten())
         
         # 6. Count valid obstacles (those with s > -50)
         valid_obs_count = np.sum(obstacles[:, 0] > -50)
@@ -327,7 +357,20 @@ class MPCController:
                                 or d > n_max_adaptive + self.recover_margin)
                 if off_corridor:
                     v_stage_max = min(v_stage_max, self.recover_speed_cap)
-            v_stage_max = max(v_stage_max, 1.0)   # never demand a full stop
+            if self.stop_s is not None:
+                room = max(self.stop_s - self.stop_margin - s_pred, 0.0)
+                v_stage_max = min(v_stage_max, float(np.sqrt(2.0 * self.stop_decel * room)))
+            if self.lead is not None:
+                # Following distance: the lead (in our lane) moves on at
+                # constant speed; we may only be as fast as still lets us
+                # stop gap metres behind where it will be at this stage.
+                s_lead, v_lead, gap = self.lead
+                v_lead = max(float(v_lead), 0.0)
+                room = s_lead + v_lead * dt_stage * i - gap - s_pred
+                v_stage_max = min(v_stage_max, float(np.sqrt(
+                    v_lead ** 2 + 2.0 * self.follow_decel * max(room, 0.0))))
+            if self.stop_s is None and self.lead is None:
+                v_stage_max = max(v_stage_max, 1.0)   # never demand a full stop
 
             lh_constraints = np.array([
                 self.constraint.along_min,
@@ -370,7 +413,7 @@ class MPCController:
             self.acados_solver.constraints_set(i, "uh", uh_constraints)
 
             # Set obstacle parameters for this timestep
-            self.acados_solver.set(i, "p", obstacles.flatten())
+            self.acados_solver.set(i, "p", obstacles_at(i).flatten())
 
             if i == 1:  # keep one representative stage for the diagnostics
                 diag_lh, diag_uh = lh_constraints, uh_constraints

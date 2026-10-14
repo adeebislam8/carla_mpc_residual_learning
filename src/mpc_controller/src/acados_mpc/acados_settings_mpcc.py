@@ -17,7 +17,7 @@ RAD2DEG = 180.0/math.pi
 def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
                     a_long_obs=None, b_lat_obs=None, apex_gain=None,
                     gate_depth=None, lookahead=None, r3_cap=None,
-                    alat_slack=None, n_overtake=None):
+                    alat_slack=None, n_overtake=None, v_slack=None):
     # create render arguments
     ocp = AcadosOcp()
     dt = Tf/N
@@ -208,6 +208,14 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
     if alat_slack is not None:
         slack_L1_cost[1] = 2e0
         slack_L2_cost[1] = float(alat_slack)
+    # Speed (con_h row 3, idxsh position 3) costs (1e-3, 5e-1) to violate --
+    # effectively free, so a per-stage speed cap (stop line, following
+    # distance, curvature limit) is outweighed by the progress reward.
+    # v_slack = (L1, L2) makes such caps binding; None keeps the original.
+    if v_slack is not None:
+        slack_L1_cost[3] = float(v_slack[0])
+        slack_L2_cost[3] = float(v_slack[1])
+    print(f"  slack      v=({slack_L1_cost[3]:g}, {slack_L2_cost[3]:g})")
     print(f"  slack      a_lat=({slack_L1_cost[1]:g}, {slack_L2_cost[1]:g})"
           f"  n=({slack_L1_cost[2]:g}, {slack_L2_cost[2]:g})  [L1, L2]")
 
