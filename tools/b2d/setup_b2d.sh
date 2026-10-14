@@ -16,6 +16,7 @@
 # running while Bench2Drive runs (the leaderboard starts its own 0.9.15 server).
 
 set -euo pipefail
+REPO=$(cd "$(dirname "$0")/../.." && pwd)    # before any cd below
 # NETT: where CARLA 0.9.15 and Bench2Drive go.  SRC_ENV: the conda env with
 # acados + our deps to clone (A5000: residual_mpc; 8 GB machine: mpc_rl).
 NETT=${NETT:-$HOME/Documents/nett}
@@ -57,6 +58,25 @@ fi
 PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install \
   "carla==0.9.15" "py-trees==0.8.3" networkx shapely psutil xmlschema ephem \
   tabulate six simple-watchdog-timer dictor requests pexpect transforms3d
+# acados_template is an editable/local install in the source env (the acados
+# submodule), which a conda clone does not always carry over: find where the
+# source env imports it from and install that directory into b2d too, and copy
+# the source env's activate.d (ACADOS_SOURCE_DIR / LD_LIBRARY_PATH).
+if ! PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -c "import acados_template" 2>/dev/null; then
+  SRC_PKG=$REPO/src/mpc_controller/src/acados/interfaces/acados_template   # the submodule
+  if [ ! -f "$SRC_PKG/setup.py" ] && [ ! -f "$SRC_PKG/pyproject.toml" ]; then
+    SRC_PKG=$("$CONDA" run -n "$SRC_ENV" python -c \
+      "import acados_template, os; print(os.path.dirname(os.path.dirname(acados_template.__file__)))" | tail -1)
+  fi
+  echo "== installing acados_template from $SRC_PKG into b2d"
+  PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install -e "$SRC_PKG"
+  SRC_PREFIX=$("$CONDA" run -n "$SRC_ENV" python -c "import sys; print(sys.prefix)" | tail -1)
+  B2D_PREFIX=$("$CONDA" run -n b2d python -c "import sys; print(sys.prefix)" | tail -1)
+  if [ -d "$SRC_PREFIX/etc/conda/activate.d" ]; then
+    mkdir -p "$B2D_PREFIX/etc/conda/activate.d"
+    cp -n "$SRC_PREFIX"/etc/conda/activate.d/* "$B2D_PREFIX/etc/conda/activate.d/" 2>/dev/null || true
+  fi
+fi
 PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -c \
   "import carla, py_trees, acados_template; print('b2d env OK, carla', carla.__file__)"
 echo "== done.  Next: ./tools/b2d/run_b2d.sh smoke"
