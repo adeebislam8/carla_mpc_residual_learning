@@ -152,12 +152,19 @@ class Scenario:
 class HardBrake(Scenario):
     name = 'hard_brake'
     CRUISE = 8.0
-    TRIGGER_GAP = 12.0
+    # The MPCC follows a slower lead at ~15-17 m (probe 2026-10-15), so a
+    # 12 m trigger never fired; 20 m catches the following phase.
+    TRIGGER_GAP = 20.0
+    # Brake only while the ego FOLLOWS in the same lane: from rest the lead
+    # was slow to speed up and the ego overtook it, so a gap-only trigger
+    # fired with the ego alongside (probe 2026-10-15) and tested nothing.
+    SAME_LANE_D = 1.5
+    LEAD_START_M = 30.0
     HOLD_S = 3.0
 
     def spawn(self):
         env = self.env
-        s = env.current_s + 20.0
+        s = env.current_s + self.LEAD_START_M
         if s > env.path_length - env.goal_margin_m - EVENT_END_MARGIN_M:
             return []
         lead = self._spawn(s, 0.0, self.CRUISE, hard_brake=True)
@@ -176,7 +183,9 @@ class HardBrake(Scenario):
             return
         v = lead['actor'].get_velocity()
         speed = float(np.hypot(v.x, v.y))
-        if not self.triggered and 0.0 < self._ego_ds(lead) < self.TRIGGER_GAP and speed > 5.0:
+        following = abs(env.current_d - lead.get('d', 0.0)) < self.SAME_LANE_D
+        if (not self.triggered and following and speed > 5.0
+                and 4.0 < self._ego_ds(lead) < self.TRIGGER_GAP):
             self.triggered = True
             lead['target_speed'] = 0.0
             lead['hold'] = True
@@ -192,7 +201,7 @@ class Stopped(Scenario):
     name = 'stopped'
 
     def _place_blockage(self, variant, lo=0.35, hi=0.55):
-        s = self._event_s(lo, hi)
+        s = getattr(self, '_forced_s', None) or self._event_s(lo, hi)
         if s is None:
             return False
         self.event_s = s
@@ -218,9 +227,20 @@ class StoppedOncoming(Stopped):
     GAP = (25.0, 45.0)
     SPEED = (6.0, 9.0)
 
+    MAX_TRIES = 10
+
     def spawn(self):
         # Blockage earlier on the route than in 'stopped', so the oncoming
-        # stream has room beyond it.
+        # stream has room beyond it -- and only where there IS a lane to pass
+        # in: a blockage with no left lane was an unwinnable test (probe e001
+        # 'accident_no_left_lane' swerved into a kerb).
+        for _ in range(self.MAX_TRIES):
+            s_try = self._event_s(0.2, 0.45)
+            if s_try is not None and self._side_lane_d(s_try, 'left') is not None:
+                break
+        else:
+            s_try = None
+        self._forced_s = s_try
         if not self._place_blockage('accident', 0.25, 0.4):
             return []
         side = self._side_lane_d(self.event_s, 'left')
@@ -285,7 +305,9 @@ class StoppedOncoming(Stopped):
 
 class CutIn(Scenario):
     name = 'cut_in'
-    TRIGGER_DS = 15.0
+    # The MPCC sees the parked car at 30 m and starts swinging wide at ~28 m;
+    # a 15 m trigger let it pull out BEHIND the ego (probe 2026-10-15).
+    TRIGGER_DS = 28.0
     SPEED = 5.0
 
     def spawn(self):
