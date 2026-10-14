@@ -55,10 +55,19 @@ export LEADERBOARD_ROOT=$B2D/leaderboard
 export IS_BENCH2DRIVE=True
 export PYTHONNOUSERSITE=1
 echo "== $SET: $(grep -c '<route ' "$ROUTES") routes, agent config $CONFIG -> $OUT"
-$PY "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py" \
-  --routes="$ROUTES" --repetitions=1 --track=SENSORS \
-  --checkpoint="$OUT/eval.json" \
-  --agent="$REPO/tools/b2d/mpcc_b2d_agent.py" --agent-config="$CONFIG" \
-  --debug=0 --resume=True --port=$PORT --traffic-manager-port=$TM_PORT \
-  --gpu-rank=$GPU_RANK 2>&1 | tee -a "$OUT/run.log"
+# The command goes in a script that 'conda run' executes: passed directly,
+# conda parses the evaluator's own flags (--debug=0) as its options.
+cat > "$OUT/eval_cmd.sh" <<EOS
+cd "$B2D"
+export PYTHONPATH="$PYTHONPATH" SCENARIO_RUNNER_ROOT="$SCENARIO_RUNNER_ROOT" \\
+       LEADERBOARD_ROOT="$LEADERBOARD_ROOT" IS_BENCH2DRIVE=True PYTHONNOUSERSITE=1 \\
+       CARLA_ROOT="$CARLA_ROOT"
+exec python "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py" \\
+  --routes="$ROUTES" --repetitions=1 --track=SENSORS \\
+  --checkpoint="$OUT/eval.json" \\
+  --agent="$REPO/tools/b2d/mpcc_b2d_agent.py" --agent-config="$CONFIG" \\
+  --debug=0 --resume=True --port=$PORT --traffic-manager-port=$TM_PORT \\
+  --gpu-rank=$GPU_RANK
+EOS
+"$CONDA" run --no-capture-output -n b2d bash "$OUT/eval_cmd.sh" 2>&1 | tee -a "$OUT/run.log"
 echo "== done.  Score: ./tools/b2d/run_b2d.sh score $SET"
