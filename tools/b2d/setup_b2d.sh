@@ -20,16 +20,18 @@ NETT=${NETT:-$HOME/Documents/nett}
 CARLA15=$NETT/CARLA_0.9.15
 B2D=$NETT/Bench2Drive
 CONDA=${CONDA:-$(command -v conda || echo "$HOME/anaconda3/bin/conda")}
-URL=https://carla-releases.s3.us-east-005.backblazeb2.com/Linux
+# downloads.carlasim.com: the backblaze mirror Bench2Drive's README uses failed
+# the TLS handshake on the A5000 (2026-10-15).  Override with URL=... if needed.
+URL=${URL:-https://downloads.carlasim.com/Linux}
 
 echo "== free disk: $(df -h "$NETT" | awk 'NR==2{print $4}') (need ~70 GB for download + unpack)"
 
 if [ ! -x "$CARLA15/CarlaUE4.sh" ]; then
   mkdir -p "$CARLA15" && cd "$CARLA15"
-  [ -f CARLA_0.9.15.tar.gz ] || wget -c "$URL/CARLA_0.9.15.tar.gz"
+  wget -c "$URL/CARLA_0.9.15.tar.gz"     # resumes; no-op when complete
   tar -xzf CARLA_0.9.15.tar.gz
   mkdir -p Import && cd Import
-  [ -f AdditionalMaps_0.9.15.tar.gz ] || wget -c "$URL/AdditionalMaps_0.9.15.tar.gz"
+  wget -c "$URL/AdditionalMaps_0.9.15.tar.gz"
   cd .. && bash ImportAssets.sh
   echo "== CARLA 0.9.15 ready (you may delete the two .tar.gz files)"
 else
