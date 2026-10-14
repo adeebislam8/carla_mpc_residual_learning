@@ -61,7 +61,7 @@ cat > "$OUT/eval_cmd.sh" <<EOS
 cd "$B2D"
 export PYTHONPATH="$PYTHONPATH" SCENARIO_RUNNER_ROOT="$SCENARIO_RUNNER_ROOT" \\
        LEADERBOARD_ROOT="$LEADERBOARD_ROOT" IS_BENCH2DRIVE=True PYTHONNOUSERSITE=1 \\
-       CARLA_ROOT="$CARLA_ROOT"
+       CARLA_ROOT="$CARLA_ROOT" B2D_TRACE_DIR="$OUT/traces"
 exec python "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py" \\
   --routes="$ROUTES" --repetitions=1 --track=SENSORS \\
   --checkpoint="$OUT/eval.json" \\

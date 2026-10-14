@@ -103,6 +103,9 @@ class MPCCAgent(AutonomousAgent):
         self.n_steps = 0
         self.n_rule_overrides = 0
         self.t_control = []
+        # Per-step trace -> <B2D_TRACE_DIR>/route_<n>.csv + .png (run_b2d.sh sets it)
+        self.trace = []
+        self.trace_dir = os.environ.get('B2D_TRACE_DIR')
 
     def sensors(self):
         # Ground-truth obstacles come from the world; the speedometer keeps the
@@ -288,9 +291,69 @@ class MPCCAgent(AutonomousAgent):
             control.throttle, control.brake = 0.0, float(-thr)
         control.steer = float(-steer)            # env convention (carlaEnv.step)
         self.t_control.append(time.perf_counter() - t0)
+        if self.trace_dir:
+            lead = core.mpc_controller.lead
+            self.trace.append(dict(
+                t=round(timestamp, 2), s=round(core.current_s, 2), d=round(core.current_d, 2),
+                v=round(core.current_speed, 2), thr=round(float(thr), 3),
+                steer=round(float(steer), 3),
+                stop_ds=None if stop_ds is None else round(stop_ds, 1),
+                lead_ds=None if lead is None else round(lead[0] - core.current_s, 1),
+                lead_v=None if lead is None else round(lead[1], 1),
+                n_obs=int((core.selected_obstacles[:, 0] > -50).sum()),
+                alpha=round(float(core.last_authority_info.get('alpha', 1.0)), 2)))
         return control
 
+    def _write_trace(self):
+        import csv
+        os.makedirs(self.trace_dir, exist_ok=True)
+        stem = os.path.join(self.trace_dir, f'route_{int(time.time())}')
+        try:
+            from srunner.scenariomanager.carla_data_provider import CarlaDataProvider as C
+            stem = os.path.join(self.trace_dir, f"route_{C.get_map().name.split('/')[-1]}_"
+                                                f"{int(time.time())}")
+        except Exception:
+            pass
+        with open(stem + '.csv', 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(self.trace[0]))
+            w.writeheader()
+            w.writerows(self.trace)
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            tr = self.trace
+            t = [r['t'] for r in tr]
+            fig, ax = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+            ax[0].plot(t, [r['s'] for r in tr], 'k-', label='route s')
+            ax[0].set_ylabel('s [m]')
+            ax[1].plot(t, [r['v'] for r in tr], 'k-', label='speed')
+            ax[1].plot(t, [r['lead_ds'] if r['lead_ds'] is not None else float('nan') for r in tr],
+                       'r.', ms=2, label='lead gap [m]')
+            ax[1].plot(t, [r['stop_ds'] if r['stop_ds'] is not None else float('nan') for r in tr],
+                       'b.', ms=2, label='stop line [m]')
+            ax[1].set_ylim(-1, 30)
+            ax[1].legend(fontsize=7)
+            ax[1].set_ylabel('speed [m/s] / gaps')
+            ax[2].plot(t, [r['d'] for r in tr], 'g-', label='lateral d (+right)')
+            ax[2].plot(t, [r['thr'] for r in tr], 'm-', lw=0.7, label='throttle(+)/brake(-)')
+            ax[2].legend(fontsize=7)
+            ax[2].set_xlabel('game time [s]')
+            for a in ax:
+                a.grid(alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(stem + '.png', dpi=80)
+            plt.close(fig)
+        except Exception as e:
+            print(f'[MPCCAgent] trace plot failed: {e}', flush=True)
+        print(f'[MPCCAgent] trace -> {stem}.csv', flush=True)
+
     def destroy(self):
+        if self.trace_dir and self.trace:
+            try:
+                self._write_trace()
+            except Exception as e:
+                print(f'[MPCCAgent] trace write failed: {e}', flush=True)
         if self.core is not None:
             n = len(self.t_control)
             if n:
