@@ -1,0 +1,14 @@
+{
+  "steer_fix": true,
+  "qc": 0.5,
+  "gate_depth": 0.98,
+  "target_speed": 15.0,
+  "perception": false,
+  "traffic_rules": true,
+  "student": "models/student_CHANGE_ME",
+  "student_axes": "steer",
+  "obs_version": "v2",
+  "residual_max": 0.5,
+  "authority_horizon": 10,
+  "residual_window": null
+}

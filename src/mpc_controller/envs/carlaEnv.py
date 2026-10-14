@@ -92,6 +92,7 @@ class CarlaMPCEnv(gym.Env):
         spawn_check: bool = False,
         traffic_fix: bool = False,
         scenario: str = 'none',
+        external_world=None,
         qc: float = None,
         a_long_obs: float = None,
         b_lat_obs: float = None,
@@ -154,8 +155,15 @@ class CarlaMPCEnv(gym.Env):
         self.host = host
         self.port = port
         self.timeout = timeout
-        self.client = carla.Client(host, port)
-        self.client.set_timeout(timeout)
+        # external_world: attach to a world someone else runs (the Bench2Drive
+        # leaderboard) -- no client of our own, no load_world, no change to its
+        # synchronous settings or traffic manager.  The caller sets .vehicle and
+        # the route, then drives _update_vehicle_state / _detect_obstacles /
+        # _compute_final_action itself (tools/b2d/mpcc_b2d_agent.py).
+        self._external_world = external_world is not None
+        self.client = None if self._external_world else carla.Client(host, port)
+        if self.client is not None:
+            self.client.set_timeout(timeout)
 
         # Only reload the world if it is not already the town we want.
         #
@@ -168,10 +176,13 @@ class CarlaMPCEnv(gym.Env):
         # "Disable because of resource".  Each call also costs several seconds
         # and gives the respawn path another chance to strand actors.
         try:
-            current = self.client.get_world().get_map().name.split('/')[-1]
+            current = (external_world if self._external_world
+                       else self.client.get_world()).get_map().name.split('/')[-1]
         except Exception:
             current = None
-        if current == towns[0]:
+        if self._external_world:
+            self.world = external_world
+        elif current == towns[0]:
             self.world = self.client.get_world()
             print(f"  {towns[0]} already loaded, reusing it")
         else:
@@ -372,7 +383,8 @@ class CarlaMPCEnv(gym.Env):
         self.record_episode = 0
         
         # Set up CARLA world
-        self._setup_world()
+        if not self._external_world:
+            self._setup_world()
         
     def _setup_world(self):
         """Configure CARLA world for synchronous mode"""
@@ -668,7 +680,10 @@ class CarlaMPCEnv(gym.Env):
         # reproducible nor necessarily clear enough to debug the pipeline
         # against.  Pinned here so perception runs are deterministic; a
         # weather sweep is a reasonable later ablation, not needed yet.
-        self.world.set_weather(carla.WeatherParameters.ClearNoon)
+        # Never on a world we do not own: Bench2Drive's weather is part of the
+        # route definition.
+        if not getattr(self, '_external_world', False):
+            self.world.set_weather(carla.WeatherParameters.ClearNoon)
 
         self._perception_cameras = {}
         self._perception_tracks = []
@@ -1355,6 +1370,77 @@ class CarlaMPCEnv(gym.Env):
             horizon_steps=self.authority_horizon,
         )
     
+    def _compute_final_action(self, action):
+        """MPCC solve + gated residual for the current state -> (mpc_throttle,
+        mpc_steering, final_throttle, final_steering).  Shared by step() and the
+        Bench2Drive agent (tools/b2d/mpcc_b2d_agent.py), which drives the same
+        controller inside the leaderboard's own world loop.  Call after
+        _update_vehicle_state() and _detect_obstacles()."""
+        # _t_mpc_start = time.perf_counter()
+        mpc_throttle, mpc_steering = self.mpc_controller.solve(
+            s=self.current_s,
+            d=self.current_d,
+            alpha=self.current_alpha,
+            v=self.current_speed,
+            obstacles=self.selected_obstacles,
+            D=self.current_throttle,
+            delta=(-self.current_steering if self.steer_feedback_fix
+                   else self.current_steering),
+            road_widths=self._road_widths,  # None is okay, MPC will use defaults
+            road_width_s=self._road_width_s,
+        )
+        # _t_mpc_end = time.perf_counter()
+        # self._last_mpc_time_ms = (_t_mpc_end - _t_mpc_start) * 1000
+
+        # print("="*20)
+        # print(f"MPC Throttle: {mpc_throttle}\nMPC Steering: {mpc_steering}")
+        # print("="*20)
+
+        # Apply residual from RL under the adaptive authority.  The
+        # residual proposal is scaled by alpha = g_support * alpha_safe,
+        # where alpha_safe is the largest scale for which the *final*
+        # action still satisfies the modelled CBF and actuator constraints
+        # (project spec Sections 6-7).  'fixed' keeps the old law for B2.
+        du = np.array([action[0], action[1]], dtype=float) * self.residual_max
+
+        # Outside the obstacle window the residual is switched off, so the
+        # final action is exactly the nominal one.  Applied in evaluation
+        # as well as training: the policy is only ever asked to act where
+        # it was trained to.
+        self.residual_active = self._residual_window_active()
+        if not self.residual_active:
+            du = np.zeros(2)
+
+        if self.residual_mode == 'adaptive':
+            alpha, self.last_authority_info = self.residual_authority.compute(
+                s=self.current_s,
+                n=self.current_d,
+                heading=self.current_alpha,
+                v=self.current_speed,
+                u_nom=(mpc_throttle, mpc_steering),
+                du=du,
+                obstacles=self.selected_obstacles,
+                support_gate=self.support_gate,
+                corridor=self._corridor_at(self.current_s),
+            )
+        else:
+            alpha = 1.0
+            self.last_authority_info = {
+                'alpha_safe': 1.0, 'alpha': 1.0, 'nominal_infeasible': False,
+                'saturated': True, 'margin_at_alpha': np.inf,
+                'support_gate': 1.0,
+            }
+
+        self.authority_history.append(alpha)
+
+        final_throttle = np.clip(mpc_throttle + alpha * du[0], -1.0, 1.0)
+        final_steering = np.clip(mpc_steering + alpha * du[1], -1.0, 1.0)
+
+        if final_throttle < 0 and self.current_speed < 0.3:
+            final_throttle = 1.0  # Prevent Stalling
+
+        return mpc_throttle, mpc_steering, final_throttle, final_steering
+
     def _update_vehicle_state(self):
         """Update vehicle state from CARLA"""
         transform = self.vehicle.get_transform()
@@ -2076,68 +2162,8 @@ class CarlaMPCEnv(gym.Env):
             self._detect_obstacles()
             # self._debug_road_boundaries(every_n_steps=50)
 
-            # _t_mpc_start = time.perf_counter()
-            mpc_throttle, mpc_steering = self.mpc_controller.solve(
-                s=self.current_s,
-                d=self.current_d,
-                alpha=self.current_alpha,
-                v=self.current_speed,
-                obstacles=self.selected_obstacles,
-                D=self.current_throttle,
-                delta=(-self.current_steering if self.steer_feedback_fix
-                       else self.current_steering),
-                road_widths=self._road_widths,  # None is okay, MPC will use defaults
-                road_width_s=self._road_width_s,
-            )
-            # _t_mpc_end = time.perf_counter()
-            # self._last_mpc_time_ms = (_t_mpc_end - _t_mpc_start) * 1000
-
-            # print("="*20)
-            # print(f"MPC Throttle: {mpc_throttle}\nMPC Steering: {mpc_steering}")
-            # print("="*20)
-
-            # Apply residual from RL under the adaptive authority.  The
-            # residual proposal is scaled by alpha = g_support * alpha_safe,
-            # where alpha_safe is the largest scale for which the *final*
-            # action still satisfies the modelled CBF and actuator constraints
-            # (project spec Sections 6-7).  'fixed' keeps the old law for B2.
-            du = np.array([action[0], action[1]], dtype=float) * self.residual_max
-
-            # Outside the obstacle window the residual is switched off, so the
-            # final action is exactly the nominal one.  Applied in evaluation
-            # as well as training: the policy is only ever asked to act where
-            # it was trained to.
-            self.residual_active = self._residual_window_active()
-            if not self.residual_active:
-                du = np.zeros(2)
-
-            if self.residual_mode == 'adaptive':
-                alpha, self.last_authority_info = self.residual_authority.compute(
-                    s=self.current_s,
-                    n=self.current_d,
-                    heading=self.current_alpha,
-                    v=self.current_speed,
-                    u_nom=(mpc_throttle, mpc_steering),
-                    du=du,
-                    obstacles=self.selected_obstacles,
-                    support_gate=self.support_gate,
-                    corridor=self._corridor_at(self.current_s),
-                )
-            else:
-                alpha = 1.0
-                self.last_authority_info = {
-                    'alpha_safe': 1.0, 'alpha': 1.0, 'nominal_infeasible': False,
-                    'saturated': True, 'margin_at_alpha': np.inf,
-                    'support_gate': 1.0,
-                }
-
-            self.authority_history.append(alpha)
-
-            final_throttle = np.clip(mpc_throttle + alpha * du[0], -1.0, 1.0)
-            final_steering = np.clip(mpc_steering + alpha * du[1], -1.0, 1.0)
-
-            if final_throttle < 0 and self.current_speed < 0.3:
-                final_throttle = 1.0  # Prevent Stalling
+            mpc_throttle, mpc_steering, final_throttle, final_steering = \
+                self._compute_final_action(action)
             
             # print(f"Throttle: {final_throttle} \n Steering: {final_steering}")
             
