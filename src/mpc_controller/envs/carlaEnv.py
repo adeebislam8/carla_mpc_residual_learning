@@ -1475,6 +1475,7 @@ class CarlaMPCEnv(gym.Env):
     FOLLOW_PREDICT_S = 1.5         # ... now, or at this many seconds ahead
     FOLLOW_MIN_GAP = 6.0           # centre-to-centre stop gap, m
     FOLLOW_HEADWAY = 1.0           # + this many seconds of the lead's speed
+    FOLLOW_STATIC_V = 0.5          # slower leads are stationary obstacles: no cap
 
     def _lead_in_lane(self):
         """(s_lead, v_lead, gap) of the nearest obstacle ahead that is in our
@@ -1488,6 +1489,14 @@ class CarlaMPCEnv(gym.Env):
             d_fut = d_obs + vd * self.FOLLOW_PREDICT_S
             if min(abs(d_obs - self.current_d), abs(d_fut - self.current_d)) \
                     >= self.FOLLOW_LANE_M:
+                continue
+            # A stationary obstacle (parked car, pile-up, cones) is to be
+            # passed, not followed: capping speed to stop behind it froze the
+            # car there (the MPCC must keep moving to steer around).  The CBF
+            # and the overtake gate handle it, as before follow existed.
+            # (Both components: a pedestrian CROSSING has ~0 along-route speed
+            # but is anything but stationary.)
+            if abs(vs) < self.FOLLOW_STATIC_V and abs(vd) < self.FOLLOW_STATIC_V:
                 continue
             if best is None or s_obs < best[0]:
                 gap = self.FOLLOW_MIN_GAP + self.FOLLOW_HEADWAY * max(vs, 0.0)

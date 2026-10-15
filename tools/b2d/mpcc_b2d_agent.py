@@ -90,9 +90,15 @@ class MPCCAgent(AutonomousAgent):
     def setup(self, path_to_conf_file):
         self.track = Track.SENSORS
         self.cfg = dict(DEFAULTS)
-        if path_to_conf_file and os.path.isfile(path_to_conf_file):
+        if path_to_conf_file:
+            # Fail loudly: a relative path resolved from the Bench2Drive dir
+            # once silently fell back to the defaults (the 'nofollow' smoke
+            # run was really the default config).
+            if not os.path.isfile(path_to_conf_file):
+                raise FileNotFoundError(f'agent config {path_to_conf_file!r} not found')
             with open(path_to_conf_file) as f:
                 self.cfg.update(json.load(f))
+        print(f'[MPCCAgent] config {path_to_conf_file}: {self.cfg}', flush=True)
         self.core = None
         self.policy = None
         self._actors = {}            # actor id -> npc dict (keeps Frenet hints)

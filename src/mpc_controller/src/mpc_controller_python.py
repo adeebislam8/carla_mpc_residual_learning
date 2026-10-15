@@ -357,8 +357,15 @@ class MPCController:
                                 or d > n_max_adaptive + self.recover_margin)
                 if off_corridor:
                     v_stage_max = min(v_stage_max, self.recover_speed_cap)
+            # Where the car will be at this stage, for the stop / following
+            # caps: at its CURRENT speed.  s_pred above assumes target_speed
+            # (15 m/s) whatever the car is doing, which put the predicted car
+            # ~15 m ahead of reality over the horizon and made it stop that
+            # much too early (Bench2Drive smoke, 2026-10-15: stuck 12-20 m
+            # behind every obstacle).
+            s_cap = s + max(v, 0.0) * dt_stage * i
             if self.stop_s is not None:
-                room = max(self.stop_s - self.stop_margin - s_pred, 0.0)
+                room = max(self.stop_s - self.stop_margin - s_cap, 0.0)
                 v_stage_max = min(v_stage_max, float(np.sqrt(2.0 * self.stop_decel * room)))
             if self.lead is not None:
                 # Following distance: the lead (in our lane) moves on at
@@ -366,7 +373,7 @@ class MPCController:
                 # stop gap metres behind where it will be at this stage.
                 s_lead, v_lead, gap = self.lead
                 v_lead = max(float(v_lead), 0.0)
-                room = s_lead + v_lead * dt_stage * i - gap - s_pred
+                room = s_lead + v_lead * dt_stage * i - gap - s_cap
                 v_stage_max = min(v_stage_max, float(np.sqrt(
                     v_lead ** 2 + 2.0 * self.follow_decel * max(room, 0.0))))
             if self.stop_s is None and self.lead is None:
