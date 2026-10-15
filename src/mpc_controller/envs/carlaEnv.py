@@ -1521,18 +1521,29 @@ class CarlaMPCEnv(gym.Env):
     GATE_LANE_M = 2.0     # obstacle |d| from the route centreline counted as our lane
     GATE_PASS_V = 5.0     # along-route speed below which an in-lane car is passed
 
+    GATE_WINDOW = (-8.0, 25.0)   # = the OCP gate's (GATE_BACK, GATE_FRONT)
+
     def _gate_on(self):
-        """Overtake pull for the obstacle the OCP's gate looks at (slot 0, the
-        nearest by distance): 1 to pass it, 0 to stay in lane."""
+        """Overtake pull: 1 if ANY obstacle in the gate window is in our lane and
+        stationary/slow (to be passed), else 0 (stay in lane, follow traffic).
+
+        Any, not just slot 0: a construction zone is cones along the lane edge
+        plus a warning sign in the lane; keyed on the nearest object (an edge
+        cone, |d| > 2 m) the pull stayed off and the car drove into the sign
+        (Bench2Drive ConstructionObstacle, 2026-10-15)."""
         if self.gate_mode == 'always':
             return 1.0
-        s_obs, d_obs = self.selected_obstacles[0]
-        if s_obs <= -50.0:
-            return 0.0
-        vs, vd = self.selected_obstacle_vel[0]
-        in_lane = abs(d_obs) < self.GATE_LANE_M
-        to_pass = -self.FOLLOW_STATIC_V < vs < self.GATE_PASS_V
-        return 1.0 if (in_lane and to_pass) else 0.0
+        for (s_obs, d_obs), (vs, vd) in zip(self.selected_obstacles,
+                                            self.selected_obstacle_vel):
+            if s_obs <= -50.0:
+                continue
+            ds = s_obs - self.current_s
+            if not (self.GATE_WINDOW[0] < ds < self.GATE_WINDOW[1]):
+                continue
+            if abs(d_obs) < self.GATE_LANE_M and \
+                    -self.FOLLOW_STATIC_V < vs < self.GATE_PASS_V:
+                return 1.0
+        return 0.0
 
     STALL_KICK_CLEAR_M = 12.0
     STALL_KICK_LANE_M = 2.5

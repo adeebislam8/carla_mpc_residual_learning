@@ -96,8 +96,11 @@ class MPCCAgent(AutonomousAgent):
         # Bench2Drive's evaluator passes '<config>+<route save name>' (its own
         # agents split it to name per-route outputs) -- keep the file part.
         self.route_name = None
+        # (It APPENDS one per route to the same string -- 'cfg+r1+r2+...' --
+        # so the file is the first segment and this route is the last.)
         if path_to_conf_file and '+' in path_to_conf_file:
-            path_to_conf_file, self.route_name = path_to_conf_file.split('+', 1)
+            parts = path_to_conf_file.split('+')
+            path_to_conf_file, self.route_name = parts[0], parts[-1]
         if path_to_conf_file:
             # Fail loudly: a relative path resolved from the Bench2Drive dir
             # once silently fell back to the defaults (the 'nofollow' smoke
