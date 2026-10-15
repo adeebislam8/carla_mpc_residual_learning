@@ -116,6 +116,10 @@ class MPCController:
         # (s_lead, v_lead, gap) of the nearest obstacle in our lane, or None.
         self.lead = None
         self.follow_decel = 3.0
+        # Overtake pull on/off (OCP parameter 13, see bicycle_model_mpcc_cbf).
+        # 1.0 = original: pull toward the passing lane for any obstacle in the
+        # gate window.  The env lowers it for traffic that should be followed.
+        self.gate_on = 1.0
         self.recover_margin = 0.5         # m OUTSIDE the corridor before it fires
         #
         # NOTE: this used to trigger on abs(n) > 2.5, which collided exactly with
@@ -282,7 +286,7 @@ class MPCController:
             o[valid_mask] += np.asarray(obstacle_vel, dtype=float)[valid_mask] * (dt_stage * k)
             return o
 
-        self.acados_solver.set(0, "p", obstacles_at(0).flatten())
+        self.acados_solver.set(0, "p", np.append(obstacles_at(0).flatten(), self.gate_on))
         
         # 6. Count valid obstacles (those with s > -50)
         valid_obs_count = np.sum(obstacles[:, 0] > -50)
@@ -420,7 +424,7 @@ class MPCController:
             self.acados_solver.constraints_set(i, "uh", uh_constraints)
 
             # Set obstacle parameters for this timestep
-            self.acados_solver.set(i, "p", obstacles_at(i).flatten())
+            self.acados_solver.set(i, "p", np.append(obstacles_at(i).flatten(), self.gate_on))
 
             if i == 1:  # keep one representative stage for the diagnostics
                 diag_lh, diag_uh = lh_constraints, uh_constraints
@@ -721,7 +725,7 @@ class MPCController:
         # ACADOS uses the spline coefficients as parameters
         # We just need to update them in the solver at each stage
         for i in range(self.N + 1):
-            self.acados_solver.set(i, "p", np.zeros(12))  # reset params first
+            self.acados_solver.set(i, "p", np.append(np.zeros(12), 1.0))  # reset params first
         
         # Update the kapparef in the model so dynamics use new path
         self.model.kapparef_s = kappa_spline

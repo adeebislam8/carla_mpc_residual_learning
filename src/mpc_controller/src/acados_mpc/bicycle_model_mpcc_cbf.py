@@ -148,12 +148,19 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
 
     """ spline coeffients and knots """
 
+    # 13th parameter: gate_on in [0, 1] scales the overtake pull.  The gate
+    # only sees the nearest obstacle's POSITION, so a car cruising ahead in
+    # traffic pulled the ego toward the passing lane exactly like a parked
+    # car (Bench2Drive: ~1.4 m left of centre most of a route, outside-lane
+    # infractions, side-swipes).  The env sets it per step; 1 = original.
+    gate_on = MX.sym("gate_on")
     p = vertcat(s_obs1, n_obs1, 
                 s_obs2, n_obs2,
                 s_obs3, n_obs3,
                 s_obs4, n_obs4,
                 s_obs5, n_obs5,
-                s_obs6, n_obs6)
+                s_obs6, n_obs6,
+                gate_on)
 
     """---------------------"""
 
@@ -367,8 +374,8 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
     # of room instead of left into 4.8 m.  carlaEnv detects obstacles out to
     # MAX_OBS_LOOKAHEAD = 30 m; the gate should not ignore half of that.
     GATE_BACK, GATE_FRONT = -8.0, 25.0
-    overtake_gate = 0.5 * (tanh(k_gate * (ds1 - GATE_BACK))
-                           - tanh(k_gate * (ds1 - GATE_FRONT)))
+    overtake_gate = gate_on * 0.5 * (tanh(k_gate * (ds1 - GATE_BACK))
+                                     - tanh(k_gate * (ds1 - GATE_FRONT)))
 
     # The gate only *permits* leaving the lane: it weakens the centreline pull
     # from qc to 0.2*qc, but the attractor stays at n = 0.  With a 1.5 s horizon

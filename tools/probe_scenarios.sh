@@ -43,10 +43,11 @@ STALL_KICK=${STALL_KICK:-always}
 BASE="$BASE --stall-kick $STALL_KICK"
 [ "$STALL_KICK" != "always" ] && TAG="${TAG}k${STALL_KICK}"
 # MPCC2=1: the improved nominal controller -- no stall lunge, following
-# distance, constant-velocity obstacle prediction (tag 'm2').
+# distance, constant-velocity obstacle prediction, overtake only slow/stopped
+# cars in our lane (tag 'm2').
 MPCC2=${MPCC2:-0}
 if [ "$MPCC2" = "1" ]; then
-  BASE="$BASE --stall-kick clear --follow --predict-obstacles"
+  BASE="$BASE --stall-kick clear --follow --predict-obstacles --gate-mode pass_slow"
   TAG="${TAG}m2"
 fi
 

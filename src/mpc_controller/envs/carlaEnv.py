@@ -96,6 +96,7 @@ class CarlaMPCEnv(gym.Env):
         stall_kick: str = 'always',
         follow: bool = False,
         predict_obstacles: bool = False,
+        gate_mode: str = 'always',
         qc: float = None,
         a_long_obs: float = None,
         b_lat_obs: float = None,
@@ -335,6 +336,14 @@ class CarlaMPCEnv(gym.Env):
         # Default off: every pre-2026-10-15 result.
         self.follow = follow
         self.predict_obstacles = predict_obstacles
+        # gate_mode: when the MPCC's overtake pull is on.  'always' = original
+        # (any obstacle in the gate window pulls toward the passing lane);
+        # 'pass_slow' = only for an obstacle IN OUR LANE that is stationary or
+        # slower than GATE_PASS_V -- normal traffic is followed, oncoming and
+        # adjacent-lane cars never pull us toward them.
+        if gate_mode not in ('always', 'pass_slow'):
+            raise ValueError(f"gate_mode must be always/pass_slow, got {gate_mode!r}")
+        self.gate_mode = gate_mode
         self.selected_obstacle_vel = np.zeros((num_obstacles, 2))
         if scenario not in SCENARIOS:
             raise ValueError(f'scenario must be one of {SCENARIOS}, got {scenario!r}')
@@ -1404,6 +1413,7 @@ class CarlaMPCEnv(gym.Env):
         controller inside the leaderboard's own world loop.  Call after
         _update_vehicle_state() and _detect_obstacles()."""
         self.mpc_controller.lead = self._lead_in_lane() if self.follow else None
+        self.mpc_controller.gate_on = self._gate_on()
         # _t_mpc_start = time.perf_counter()
         mpc_throttle, mpc_steering = self.mpc_controller.solve(
             s=self.current_s,
@@ -1498,10 +1508,31 @@ class CarlaMPCEnv(gym.Env):
             # but is anything but stationary.)
             if abs(vs) < self.FOLLOW_STATIC_V and abs(vd) < self.FOLLOW_STATIC_V:
                 continue
+            # Oncoming (drives against the route): a head-on threat for the
+            # CBF, not a car to follow -- following it meant stopping dead,
+            # half in the opposite lane (Bench2Drive ParkedObstacle trace).
+            if vs < -self.FOLLOW_STATIC_V:
+                continue
             if best is None or s_obs < best[0]:
                 gap = self.FOLLOW_MIN_GAP + self.FOLLOW_HEADWAY * max(vs, 0.0)
                 best = (float(s_obs), float(vs), gap)
         return best
+
+    GATE_LANE_M = 2.0     # obstacle |d| from the route centreline counted as our lane
+    GATE_PASS_V = 5.0     # along-route speed below which an in-lane car is passed
+
+    def _gate_on(self):
+        """Overtake pull for the obstacle the OCP's gate looks at (slot 0, the
+        nearest by distance): 1 to pass it, 0 to stay in lane."""
+        if self.gate_mode == 'always':
+            return 1.0
+        s_obs, d_obs = self.selected_obstacles[0]
+        if s_obs <= -50.0:
+            return 0.0
+        vs, vd = self.selected_obstacle_vel[0]
+        in_lane = abs(d_obs) < self.GATE_LANE_M
+        to_pass = -self.FOLLOW_STATIC_V < vs < self.GATE_PASS_V
+        return 1.0 if (in_lane and to_pass) else 0.0
 
     STALL_KICK_CLEAR_M = 12.0
     STALL_KICK_LANE_M = 2.5

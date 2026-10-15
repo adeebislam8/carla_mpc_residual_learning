@@ -35,7 +35,8 @@ Config (JSON, all optional):
   authority_horizon (10), residual_window (null), obstacle_radius_m (45.0),
   stall_kick ('clear': no anti-stall lunge into stopped obstacles),
   follow (true: speed cap to stop behind the nearest in-lane obstacle),
-  predict_obstacles (true: CBF uses constant-velocity obstacle positions)
+  predict_obstacles (true: CBF uses constant-velocity obstacle positions),
+  gate_mode ('pass_slow': overtake only stationary/slow cars in our lane)
 """
 
 import json
@@ -59,7 +60,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 student_axes='steer', student_chunk_mode='speculative',
                 support_sigma=None, obs_version='v2', residual_max=0.5,
                 authority_horizon=10, residual_window=None, obstacle_radius_m=45.0,
-                stall_kick='clear', follow=True, predict_obstacles=True)
+                stall_kick='clear', follow=True, predict_obstacles=True,
+                gate_mode='pass_slow')
 
 # Comfortable stopping deceleration for the rule layer, m/s^2.
 RULE_DECEL = 4.0
@@ -150,7 +152,8 @@ class MPCCAgent(AutonomousAgent):
             residual_mode='adaptive', residual_max=c['residual_max'],
             authority_horizon=c['authority_horizon'],
             residual_window_m=c['residual_window'], stall_kick=c['stall_kick'],
-            follow=c['follow'], predict_obstacles=c['predict_obstacles'])
+            follow=c['follow'], predict_obstacles=c['predict_obstacles'],
+            gate_mode=c['gate_mode'])
         # Stop lines need the speed cap to bind even with follow/predict off.
         core._binding_v_slack = True
         random.setstate(rng_state)

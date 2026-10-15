@@ -128,7 +128,7 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
     ocp.constraints.ubu = np.array([model.dthrottle_max, model.ddelta_max, model.dtheta_max])
     ocp.constraints.idxbu = np.array([0, 1, 2])
 
-    obstacle_params = np.array([0, 0]*6)
+    obstacle_params = np.array([0, 0]*6 + [1])     # + gate_on (1 = original behaviour)
     ocp.parameter_values = obstacle_params
     # spline_params = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
     # ocp.parameter_values = np.concatenate((obstacle_params, spline_params))

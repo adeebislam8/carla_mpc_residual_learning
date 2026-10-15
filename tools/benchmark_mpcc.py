@@ -242,6 +242,7 @@ def run(args):
             stall_kick=args.stall_kick,
             follow=args.follow,
             predict_obstacles=args.predict_obstacles,
+            gate_mode=args.gate_mode,
             qc=args.qc,
             a_long_obs=args.a_long,
             b_lat_obs=args.b_lat,
@@ -294,6 +295,7 @@ def run(args):
         'stall_kick': args.stall_kick,
         'follow': args.follow,
         'predict_obstacles': args.predict_obstacles,
+        'gate_mode': args.gate_mode,
         'model': args.model,
         'algo': args.algo if args.model else None,
         'residual_mode': args.residual_mode,
@@ -828,6 +830,9 @@ def main():
                     help='following-distance speed cap behind the nearest obstacle in our lane')
     ap.add_argument('--predict-obstacles', action='store_true',
                     help='CBF uses constant-velocity obstacle positions per stage')
+    ap.add_argument('--gate-mode', default='always', choices=['always', 'pass_slow'],
+                    help="overtake pull: 'always' (original: any obstacle ahead) or 'pass_slow' "
+                         "(only stationary/slow cars in our lane; follow normal traffic)")
     ap.add_argument('--stall-kick', default='always', choices=['always', 'clear', 'off'],
                     help="anti-stall full-throttle kick below 0.3 m/s: 'always' (legacy, also "
                          "lunges into stopped obstacles), 'clear' (only with nothing in our path), 'off'")
