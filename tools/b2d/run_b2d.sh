@@ -69,5 +69,30 @@ exec python "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py" \\
   --debug=0 --resume=True --port=$PORT --traffic-manager-port=$TM_PORT \\
   --gpu-rank=$GPU_RANK
 EOS
-"$CONDA" run --no-capture-output -n b2d bash "$OUT/eval_cmd.sh" 2>&1 | tee -a "$OUT/run.log"
+# CARLA crashes on the large maps (segfault while loading Town12/13 is
+# common); Bench2Drive's own scripts restart until every route has a result.
+# The evaluator resumes from eval.json, so each retry continues where the last
+# stopped; a route that keeps crashing is eventually recorded as failed.
+MAX_TRY=${MAX_TRY:-60}      # restarts; also stops after 2 restarts without progress
+LAST=-1; STALL=0
+progress() {
+  python3 -c "
+import json, sys
+try:
+    p = json.load(open('$OUT/eval.json'))['_checkpoint'].get('progress') or [0, 1]
+except Exception:
+    p = [0, 1]
+print(p[0], p[1])"
+}
+for TRY in $(seq 1 "$MAX_TRY"); do
+  "$CONDA" run --no-capture-output -n b2d bash "$OUT/eval_cmd.sh" 2>&1 | tee -a "$OUT/run.log"
+  read DONE TOTAL < <(progress)
+  echo "== attempt $TRY: $DONE / $TOTAL routes recorded"
+  [ "$DONE" -ge "$TOTAL" ] && [ "$TOTAL" -gt 1 ] && break
+  if [ "$DONE" -le "$LAST" ]; then STALL=$((STALL + 1)); else STALL=0; fi
+  LAST=$DONE
+  [ "$STALL" -ge 2 ] && { echo "== no progress in 2 restarts -- stopping; check run.log"; break; }
+  echo "== restarting (CARLA crash?) in 15 s ..."
+  pkill -9 -f CarlaUE4 2>/dev/null; sleep 15
+done
 echo "== done.  Score: ./tools/b2d/run_b2d.sh score $SET"
