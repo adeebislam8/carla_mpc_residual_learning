@@ -26,7 +26,6 @@ OUT=$REPO/results/b2d/${TAG}_${SET}
 CONDA=${CONDA:-$(command -v conda || echo "$HOME/anaconda3/bin/conda")}
 PY="$CONDA run --no-capture-output -n b2d python"
 
-mkdir -p "$OUT" "$REPO/tools/b2d/routes"
 ROUTES=$REPO/tools/b2d/routes/${SET}.xml
 
 if [ "$SET" = "score" ]; then
@@ -39,6 +38,7 @@ if [ "$SET" = "score" ]; then
   exit 0
 fi
 
+mkdir -p "$OUT" "$REPO/tools/b2d/routes"     # not for 'score' (made empty *_score dirs)
 case "$SET" in
   smoke) [ -f "$ROUTES" ] || python3 "$REPO/tools/b2d/make_subset.py" --b2d "$B2D" \
            --ability Overtaking --per-type 1 --out "$ROUTES" ;;

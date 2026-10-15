@@ -90,6 +90,12 @@ class MPCCAgent(AutonomousAgent):
     def setup(self, path_to_conf_file):
         self.track = Track.SENSORS
         self.cfg = dict(DEFAULTS)
+        self.core, self.policy, self.trace, self.trace_dir = None, None, [], None
+        # Bench2Drive's evaluator passes '<config>+<route save name>' (its own
+        # agents split it to name per-route outputs) -- keep the file part.
+        self.route_name = None
+        if path_to_conf_file and '+' in path_to_conf_file:
+            path_to_conf_file, self.route_name = path_to_conf_file.split('+', 1)
         if path_to_conf_file:
             # Fail loudly: a relative path resolved from the Bench2Drive dir
             # once silently fell back to the defaults (the 'nofollow' smoke
@@ -313,13 +319,9 @@ class MPCCAgent(AutonomousAgent):
     def _write_trace(self):
         import csv
         os.makedirs(self.trace_dir, exist_ok=True)
-        stem = os.path.join(self.trace_dir, f'route_{int(time.time())}')
-        try:
-            from srunner.scenariomanager.carla_data_provider import CarlaDataProvider as C
-            stem = os.path.join(self.trace_dir, f"route_{C.get_map().name.split('/')[-1]}_"
-                                                f"{int(time.time())}")
-        except Exception:
-            pass
+        # e.g. RouteScenario_1773_rep0_Town12_ParkedObstacle_1_25_... -> route, town, type
+        name = self.route_name or f'route_{int(time.time())}'
+        stem = os.path.join(self.trace_dir, '_'.join(name.split('_')[:5]))
         with open(stem + '.csv', 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(self.trace[0]))
             w.writeheader()
@@ -355,12 +357,13 @@ class MPCCAgent(AutonomousAgent):
         print(f'[MPCCAgent] trace -> {stem}.csv', flush=True)
 
     def destroy(self):
-        if self.trace_dir and self.trace:
+        # Also runs when setup() failed half-way: nothing may be assumed set.
+        if getattr(self, 'trace_dir', None) and getattr(self, 'trace', None):
             try:
                 self._write_trace()
             except Exception as e:
                 print(f'[MPCCAgent] trace write failed: {e}', flush=True)
-        if self.core is not None:
+        if getattr(self, 'core', None) is not None:
             n = len(self.t_control)
             if n:
                 print(f'[MPCCAgent] {n} steps, control time median '
