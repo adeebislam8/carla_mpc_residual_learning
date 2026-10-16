@@ -1524,6 +1524,7 @@ class CarlaMPCEnv(gym.Env):
     RULE_JUNCTION_M = 8.0       # ... and not within this of a junction
     RULE_QUEUE_M = 25.0         # ... nor this far upstream of a stop line (a queue)
     RULE_YIELD_T = 4.0          # yield to crossing traffic entering our path within
+    RULE_QUEUE_GAP_M = 15.0     # another stopped car this close ahead of it = a queue
 
     def _in_junction(self, s, margin=0.0):
         if self._route_junction is None or self._road_width_s is None:
@@ -1545,6 +1546,18 @@ class CarlaMPCEnv(gym.Env):
         for s_stop in self._stop_lines_s:
             if 0.0 <= s_stop - s_obs <= self.RULE_QUEUE_M:
                 return False                # queued at a light / stop sign
+        # Another stationary vehicle just ahead of it in the same lane: this is
+        # stopped TRAFFIC, not a parked car (Bench2Drive HardBreakRoute: a
+        # column brakes together; after 3 s the rule tried to pass it and hit
+        # it -- rulesdbg, 2026-10-17).
+        d_obs = self.selected_obstacles[i][1]
+        for j, ((s_j, d_j), (vs_j, vd_j)) in enumerate(zip(self.selected_obstacles,
+                                                           self.selected_obstacle_vel)):
+            if j == i or s_j <= -50.0:
+                continue
+            if (0.0 < s_j - s_obs <= self.RULE_QUEUE_GAP_M and abs(d_j - d_obs) < 2.0
+                    and abs(vs_j) < self.FOLLOW_STATIC_V):
+                return False
         return True
 
     def _lead_in_lane(self):
