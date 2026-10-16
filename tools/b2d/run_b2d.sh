@@ -45,7 +45,11 @@ case "$SET" in
   ot_eb) [ -f "$ROUTES" ] || python3 "$REPO/tools/b2d/make_subset.py" --b2d "$B2D" \
            --ability Overtaking Emergency_Brake --out "$ROUTES" ;;
   full)  ROUTES=$B2D/leaderboard/data/bench2drive220.xml ;;
-  *)     echo "unknown set $SET"; exit 1 ;;
+  *)     # any other name: the routes of the scenario types in TYPES, e.g.
+         #   TYPES="HardBreakRoute" TAG=dbg ./tools/b2d/run_b2d.sh hb
+         [ -n "${TYPES:-}" ] || { echo "unknown set $SET (set TYPES=... for a custom set)"; exit 1; }
+         [ -f "$ROUTES" ] || python3 "$REPO/tools/b2d/make_subset.py" --b2d "$B2D" \
+           --types $TYPES --out "$ROUTES" ;;
 esac
 
 cd "$B2D"

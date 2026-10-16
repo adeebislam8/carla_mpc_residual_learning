@@ -327,8 +327,19 @@ class MPCCAgent(AutonomousAgent):
         self.t_control.append(time.perf_counter() - t0)
         if self.trace_dir:
             lead = core.mpc_controller.lead
+            loc = self.hero_actor.get_location()
+            # Nearest obstacle in world coordinates: lets a collision in
+            # eval.json (which has x, y) be matched to the step and object.
+            near = min(((a['actor'].get_location().distance(loc), a['actor'])
+                        for a in self._actors.values() if a.get('actor') is not None),
+                       default=(None, None), key=lambda p: p[0])
             self.trace.append(dict(
-                t=round(timestamp, 2), s=round(core.current_s, 2), d=round(core.current_d, 2),
+                t=round(timestamp, 2), x=round(loc.x, 2), y=round(loc.y, 2),
+                near_m=None if near[0] is None else round(near[0], 1),
+                near_type=None if near[1] is None else near[1].type_id,
+                near_id=None if near[1] is None else near[1].id,
+                gate=round(float(core.mpc_controller.gate_on), 2),
+                s=round(core.current_s, 2), d=round(core.current_d, 2),
                 v=round(core.current_speed, 2), thr=round(float(thr), 3),
                 steer=round(float(steer), 3),
                 stop_ds=None if stop_ds is None else round(stop_ds, 1),
