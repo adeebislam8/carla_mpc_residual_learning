@@ -47,8 +47,13 @@ BASE="$BASE --stall-kick $STALL_KICK"
 # cars in our lane (tag 'm2').
 MPCC2=${MPCC2:-0}
 if [ "$MPCC2" = "1" ]; then
-  BASE="$BASE --stall-kick clear --follow --predict-obstacles --gate-mode pass_slow"
+  BASE="$BASE --stall-kick clear --follow --predict-obstacles --gate-mode pass_slow --full-brake --breakaway"
   TAG="${TAG}m2"
+fi
+# RULES=1 (with MPCC2=1): + the hand-coded decision layer (separate arm, tag "r").
+if [ "${RULES:-0}" = "1" ]; then
+  BASE="$BASE --behavior-rules"
+  TAG="${TAG}r"
 fi
 
 case_flags() {

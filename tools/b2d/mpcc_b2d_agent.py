@@ -36,7 +36,9 @@ Config (JSON, all optional):
   stall_kick ('clear': no anti-stall lunge into stopped obstacles),
   follow (true: speed cap to stop behind the nearest in-lane obstacle),
   predict_obstacles (true: CBF uses constant-velocity obstacle positions),
-  gate_mode ('pass_slow': overtake only stationary/slow cars in our lane)
+  gate_mode ('pass_slow': overtake only stationary/slow cars in our lane),
+  full_brake (true: D down to -1), breakaway (true: >= 0.45 throttle from rest
+  on a clear path), behavior_rules (false: the hand-coded decision-layer arm)
 """
 
 import json
@@ -61,7 +63,13 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 support_sigma=None, obs_version='v2', residual_max=0.5,
                 authority_horizon=10, residual_window=None, obstacle_radius_m=45.0,
                 stall_kick='clear', follow=True, predict_obstacles=True,
-                gate_mode='pass_slow')
+                gate_mode='pass_slow', full_brake=True, breakaway=True,
+                behavior_rules=False)
+
+# Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
+# puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
+# made the MPCC 'overtake' it into the opposite lane at 13 m/s (ot_eb traces).
+DRIVABLE_PROPS = ('dirtdebris',)
 
 # Comfortable stopping deceleration for the rule layer, m/s^2.
 RULE_DECEL = 4.0
@@ -156,7 +164,8 @@ class MPCCAgent(AutonomousAgent):
             authority_horizon=c['authority_horizon'],
             residual_window_m=c['residual_window'], stall_kick=c['stall_kick'],
             follow=c['follow'], predict_obstacles=c['predict_obstacles'],
-            gate_mode=c['gate_mode'])
+            gate_mode=c['gate_mode'], full_brake=c['full_brake'],
+            breakaway=c['breakaway'], behavior_rules=c['behavior_rules'])
         # Stop lines need the speed cap to bind even with follow/predict off.
         core._binding_v_slack = True
         random.setstate(rng_state)
@@ -182,6 +191,8 @@ class MPCCAgent(AutonomousAgent):
             hint = s
         core._road_widths = np.array(widths)
         core._road_width_s = np.array(ws)
+        core._route_junction = np.array([bool(wp.is_junction) if wp is not None else False
+                                         for wp in wps])
         core.racing_npcs = []
         core.current_s = 0.0
         core._ego_s_hint = 0.0
@@ -198,6 +209,9 @@ class MPCCAgent(AutonomousAgent):
             self.policy.attach(core)
         if c['traffic_rules']:
             self._index_traffic_rules(world)
+            # Stop-line context for the behavior_rules arm (queued traffic).
+            core._stop_lines_s = sorted([s for s, _ in self._rule_lights] +
+                                        [s for s, _ in self._rule_signs])
 
     def _index_traffic_rules(self, world):
         """Stop lines of every traffic light / stop sign that lie on our route."""
@@ -231,6 +245,8 @@ class MPCCAgent(AutonomousAgent):
                     t.startswith('vehicle.') or t.startswith('walker.pedestrian')
                     or t.startswith('static.prop')):
                 continue
+            if any(k in t for k in DRIVABLE_PROPS):
+                continue        # decals you drive over (ControlLoss debris)
             loc = a.get_location()
             if loc.distance(ego) > r:
                 continue

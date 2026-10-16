@@ -97,6 +97,9 @@ class CarlaMPCEnv(gym.Env):
         follow: bool = False,
         predict_obstacles: bool = False,
         gate_mode: str = 'always',
+        full_brake: bool = False,
+        breakaway: bool = False,
+        behavior_rules: bool = False,
         qc: float = None,
         a_long_obs: float = None,
         b_lat_obs: float = None,
@@ -344,6 +347,23 @@ class CarlaMPCEnv(gym.Env):
         if gate_mode not in ('always', 'pass_slow'):
             raise ValueError(f"gate_mode must be always/pass_slow, got {gate_mode!r}")
         self.gate_mode = gate_mode
+        # Physics fixes (Bench2Drive ot_eb traces, 2026-10-16), default off:
+        #   full_brake  D may go to -1 (was -0.5: the MPCC could only ever use
+        #               half the brakes -- HardBreakRoute 0/5)
+        #   breakaway   from rest with a clear path the MPCC asked for 0.1-0.18
+        #               throttle forever (its Fxd model thinks that pulls away;
+        #               the car needs ~0.4) -> 'Agent got blocked' x4
+        self.full_brake = full_brake
+        self.breakaway = breakaway
+        # behavior_rules: the hand-coded DECISION layer, a separate arm (not
+        # the baseline): a stationary obstacle is passed only if it has been
+        # stopped >= RULE_STOPPED_S, is outside a junction and not queued before
+        # a stop line -- otherwise it is followed / stopped behind; and crossing
+        # traffic predicted to enter our path within RULE_YIELD_T is yielded to.
+        self.behavior_rules = behavior_rules
+        self.selected_obstacle_stopped = np.full(num_obstacles, np.inf)
+        self._route_junction = None      # bool per road-width sample
+        self._stop_lines_s = []          # route s of stop lines (set by the B2D agent)
         self.selected_obstacle_vel = np.zeros((num_obstacles, 2))
         if scenario not in SCENARIOS:
             raise ValueError(f'scenario must be one of {SCENARIOS}, got {scenario!r}')
@@ -1063,10 +1083,13 @@ class CarlaMPCEnv(gym.Env):
         
         waypoint_coords = []
         road_widths = []
+        junction = []
         for wp in waypoints:
             waypoint_coords.append([wp.transform.location.x, wp.transform.location.y])
             lw, rw = self.path_planner.get_road_width_at_waypoint(wp)
             road_widths.append([lw, rw])
+            junction.append(bool(wp.is_junction))
+        self._route_junction = np.array(junction)
         
         del waypoints  # Free CARLA Waypoint objects
         gc.collect()
@@ -1398,6 +1421,10 @@ class CarlaMPCEnv(gym.Env):
         # Initialize ACADOS
         self.mpc_controller.initialize_acados(kappa_spline, path_msg=None)
         self.mpc_controller._global_path_length = self.path_length
+        if self.full_brake:
+            # Runtime bound (solve() reads model.throttle_min for every stage);
+            # set before ResidualAuthority copies the actuator limits below.
+            self.mpc_controller.model.throttle_min = -1.0
 
         # Residual authority re-verifies the CBF on the residual-modified
         # action, so it must be built from the same model the OCP compiled.
@@ -1477,6 +1504,11 @@ class CarlaMPCEnv(gym.Env):
 
         if final_throttle < 0 and self.current_speed < 0.3 and self._stall_kick_allowed():
             final_throttle = 1.0  # Prevent Stalling
+        if (self.breakaway and self.current_speed < 0.5
+                and 0.05 < final_throttle < self.BREAKAWAY_THROTTLE
+                and getattr(self.mpc_controller, 'stop_s', None) is None
+                and self._path_clear()):
+            final_throttle = self.BREAKAWAY_THROTTLE   # enough to actually start
 
         return mpc_throttle, mpc_steering, final_throttle, final_steering
 
@@ -1487,26 +1519,58 @@ class CarlaMPCEnv(gym.Env):
     FOLLOW_HEADWAY = 1.0           # + this many seconds of the lead's speed
     FOLLOW_STATIC_V = 0.5          # slower leads are stationary obstacles: no cap
 
+    # ── behavior_rules (the hand-coded decision layer, a separate arm) ────
+    RULE_STOPPED_S = 3.0        # stationary at least this long before we pass it
+    RULE_JUNCTION_M = 8.0       # ... and not within this of a junction
+    RULE_QUEUE_M = 25.0         # ... nor this far upstream of a stop line (a queue)
+    RULE_YIELD_T = 4.0          # yield to crossing traffic entering our path within
+
+    def _in_junction(self, s, margin=0.0):
+        if self._route_junction is None or self._road_width_s is None:
+            return False
+        near = np.abs(self._road_width_s - s) <= max(margin, 1.0)
+        return bool(np.any(self._route_junction[near]))
+
+    def _passable(self, i):
+        """Is stationary obstacle i one to drive around?  Baseline: always (the
+        minimal rule).  behavior_rules: only a long-stopped one outside
+        junctions that is not queued before a stop line."""
+        if not self.behavior_rules:
+            return True
+        s_obs = self.selected_obstacles[i][0]
+        if self.selected_obstacle_stopped[i] < self.RULE_STOPPED_S:
+            return False                    # just braked: it will move again
+        if self._in_junction(s_obs, self.RULE_JUNCTION_M):
+            return False                    # never pass inside an intersection
+        for s_stop in self._stop_lines_s:
+            if 0.0 <= s_stop - s_obs <= self.RULE_QUEUE_M:
+                return False                # queued at a light / stop sign
+        return True
+
     def _lead_in_lane(self):
         """(s_lead, v_lead, gap) of the nearest obstacle ahead that is in our
         lane now or will be within FOLLOW_PREDICT_S (a pedestrian stepping in,
         a car cutting in); None if the lane ahead is clear."""
         best = None
-        for (s_obs, d_obs), (vs, vd) in zip(self.selected_obstacles,
-                                            self.selected_obstacle_vel):
+        horizon = self.RULE_YIELD_T if self.behavior_rules else self.FOLLOW_PREDICT_S
+        for i, ((s_obs, d_obs), (vs, vd)) in enumerate(zip(self.selected_obstacles,
+                                                           self.selected_obstacle_vel)):
             if s_obs <= -50.0 or s_obs - self.current_s <= 0.0:
                 continue
-            d_fut = d_obs + vd * self.FOLLOW_PREDICT_S
+            d_fut = d_obs + vd * horizon
+            crossing = (d_obs - self.current_d) * (d_fut - self.current_d) < 0  # passes through
             if min(abs(d_obs - self.current_d), abs(d_fut - self.current_d)) \
-                    >= self.FOLLOW_LANE_M:
+                    >= self.FOLLOW_LANE_M and not (self.behavior_rules and crossing):
                 continue
             # A stationary obstacle (parked car, pile-up, cones) is to be
             # passed, not followed: capping speed to stop behind it froze the
             # car there (the MPCC must keep moving to steer around).  The CBF
             # and the overtake gate handle it, as before follow existed.
             # (Both components: a pedestrian CROSSING has ~0 along-route speed
-            # but is anything but stationary.)
-            if abs(vs) < self.FOLLOW_STATIC_V and abs(vd) < self.FOLLOW_STATIC_V:
+            # but is anything but stationary.)  behavior_rules narrows which
+            # stationary obstacles count as passable (_passable).
+            if abs(vs) < self.FOLLOW_STATIC_V and abs(vd) < self.FOLLOW_STATIC_V \
+                    and self._passable(i):
                 continue
             # Oncoming (drives against the route): a head-on threat for the
             # CBF, not a car to follow -- following it meant stopping dead,
@@ -1515,7 +1579,7 @@ class CarlaMPCEnv(gym.Env):
                 continue
             if best is None or s_obs < best[0]:
                 gap = self.FOLLOW_MIN_GAP + self.FOLLOW_HEADWAY * max(vs, 0.0)
-                best = (float(s_obs), float(vs), gap)
+                best = (float(s_obs), float(max(vs, 0.0)), gap)
         return best
 
     GATE_LANE_M = 2.0     # obstacle |d| from the route centreline counted as our lane
@@ -1533,8 +1597,8 @@ class CarlaMPCEnv(gym.Env):
         (Bench2Drive ConstructionObstacle, 2026-10-15)."""
         if self.gate_mode == 'always':
             return 1.0
-        for (s_obs, d_obs), (vs, vd) in zip(self.selected_obstacles,
-                                            self.selected_obstacle_vel):
+        for i, ((s_obs, d_obs), (vs, vd)) in enumerate(zip(self.selected_obstacles,
+                                                           self.selected_obstacle_vel)):
             if s_obs <= -50.0:
                 continue
             ds = s_obs - self.current_s
@@ -1542,8 +1606,24 @@ class CarlaMPCEnv(gym.Env):
                 continue
             if abs(d_obs) < self.GATE_LANE_M and \
                     -self.FOLLOW_STATIC_V < vs < self.GATE_PASS_V:
+                stationary = abs(vs) < self.FOLLOW_STATIC_V and abs(vd) < self.FOLLOW_STATIC_V
+                if stationary and not self._passable(i):
+                    continue                # queued / just braked / in a junction
                 return 1.0
         return 0.0
+
+    BREAKAWAY_THROTTLE = 0.45
+
+    def _path_clear(self):
+        """No obstacle in our lane within STALL_KICK_CLEAR_M ahead."""
+        for s_obs, d_obs in self.selected_obstacles:
+            if s_obs <= -50.0:
+                continue
+            ds = s_obs - self.current_s
+            if 0.0 < ds < self.STALL_KICK_CLEAR_M and \
+                    abs(d_obs - self.current_d) < self.STALL_KICK_LANE_M:
+                return False
+        return True
 
     STALL_KICK_CLEAR_M = 12.0
     STALL_KICK_LANE_M = 2.5
@@ -1629,11 +1709,19 @@ class CarlaMPCEnv(gym.Env):
                     # world velocity -- sign-convention free (d is +right).
                     s2, d2, _ = self.frenet_converter.world_to_frenet(
                         loc.x + 0.5 * vel.x, loc.y + 0.5 * vel.y, 0, s_hint=s_obs)
+                    # How long this actor has been stationary (behavior_rules):
+                    # never seen moving = parked = inf.
+                    if math.hypot(vel.x, vel.y) > 1.0:
+                        npc_data['last_moving_step'] = self.current_step
+                    lm = npc_data.get('last_moving_step')
+                    stopped_for = (np.inf if lm is None
+                                   else (self.current_step - lm) * self.mpc_dt)
                     obstacles.append({
                         's': s_obs,
                         'd': d_obs,
                         'distance': ds,
                         'type': 'npc',
+                        'stopped_for': stopped_for,
                         'vel': ((s2 - s_obs) / 0.5, (d2 - d_obs) / 0.5),
                         # NPCs follow the route forward, so speed magnitude
                         # is their speed along the path.
@@ -1645,10 +1733,12 @@ class CarlaMPCEnv(gym.Env):
 
         obstacles.sort(key=lambda x: x['distance'])
         self.selected_obstacle_vel = np.zeros((self.num_obstacles, 2))
+        self.selected_obstacle_stopped = np.full(self.num_obstacles, np.inf)
         for i, obs in enumerate(obstacles[:self.num_obstacles]):
             self.selected_obstacles[i] = [obs['s'], obs['d']]
             self.selected_obstacle_vs[i] = obs['v']
             self.selected_obstacle_vel[i] = obs.get('vel', (obs['v'], 0.0))
+            self.selected_obstacle_stopped[i] = obs.get('stopped_for', np.inf)
     
     # ── corridor / residual window helpers ──────────────────────────────
 
