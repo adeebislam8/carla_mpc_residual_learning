@@ -167,7 +167,8 @@ class RoutePlanner:
 # Comfortable stopping deceleration for the rule layer, m/s^2.
 RULE_DECEL = 4.0
 STOP_LINE_MARGIN_M = 1.5
-LIGHT_GREEN_N = 3            # green detections in a row that release a red hold
+LIGHT_GREEN_N = 3            # green detections that release a red hold ...
+LIGHT_GREEN_S = 1.0          # ... spread over this long with no red/yellow between
 LIGHT_PASSED_M = 3.0         # past the held entry by this much: committed, release
 LIGHT_HOLD_MAX_S = 25.0      # no red/yellow seen for this long: release
 LIGHT_REHOLD_S = 8.0         # after a green release, ignore 'red' at that entry this long
@@ -965,17 +966,26 @@ class MPCCAgent(AutonomousAgent):
         hold = self._light_hold
         if hold is not None:
             # RED HOLD: once stopping for a light, keep the stop until the
-            # light is SEEN green (LIGHT_GREEN_N detector runs in a row) --
-            # not merely until it stops being seen red.  A single 'unknown' /
-            # missed frame used to drop the target, the OCP throttled, the car
-            # crept past entry+1 m and the light was forgotten (tsmoke: 3 of 6
-            # red-light infractions).  Released also once past the entry
-            # (already committed) or after LIGHT_HOLD_MAX_S without red/yellow
-            # (light out of view at the line, Town03/07 style).
+            # light is SEEN green -- not merely until it stops being seen red.
+            # A single 'unknown' / missed frame used to drop the target, the
+            # OCP throttled, the car crept past entry+1 m and the light was
+            # forgotten (tsmoke: 3 of 6 red-light infractions).  Green must
+            # last LIGHT_GREEN_S with no red/yellow in between: a 0.1 s false
+            # 'green' burst on a true red released 3-in-a-row (sbase_tlights
+            # 2373, 3869).  'none'/'unknown' neither count nor reset.
+            # Released also once past the entry (already committed) or after
+            # LIGHT_HOLD_MAX_S without red/yellow (light out of view at the
+            # line, Town03/07 style).
             if light in ('red', 'yellow'):
                 hold['t'] = timestamp
-            hold['green'] = hold['green'] + 1 if light == 'green' else 0
-            if hold['green'] >= LIGHT_GREEN_N or s > hold['e'] + LIGHT_PASSED_M \
+                hold['green'], hold['g0'] = 0, None
+            elif light == 'green':
+                hold['green'] += 1
+                if hold['g0'] is None:
+                    hold['g0'] = timestamp
+            green_ok = hold['green'] >= LIGHT_GREEN_N \
+                and timestamp - hold['g0'] >= LIGHT_GREEN_S
+            if green_ok or s > hold['e'] + LIGHT_PASSED_M \
                     or timestamp - hold['t'] > LIGHT_HOLD_MAX_S:
                 self._light_hold = None
                 self.n_light_holds += 1
@@ -994,7 +1004,7 @@ class MPCCAgent(AutonomousAgent):
         fresh = rel is None or rel[0] != e or timestamp - rel[1] > LIGHT_REHOLD_S
         if fresh and (light == 'red' or (light == 'yellow'
                                          and v ** 2 / (2 * max(ds, 0.1)) <= 2 * RULE_DECEL)):
-            self._light_hold = dict(e=e, t=timestamp, green=0)
+            self._light_hold = dict(e=e, t=timestamp, green=0, g0=None)
             return ds
         if timestamp - self._stop_sign_seen_t < 3.0 and e not in self._stop_entries_done:
             if v < 0.1 and ds < 3.0:

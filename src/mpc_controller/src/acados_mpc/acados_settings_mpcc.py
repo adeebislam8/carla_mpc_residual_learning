@@ -267,8 +267,11 @@ def acados_settings(Tf, N, coeffs, knots, path_msg, degree=3, qc=None,
     ocp.solver_options.nlp_solver_tol_ineq = 1e-2
     ocp.solver_options.nlp_solver_tol_comp = 1e-4
 
-    # create solver
-    acados_solver = AcadosOcpSolver(ocp, json_file="acados_ocp.json")
+    # create solver.  The route's curvature spline is compiled into the
+    # solver, so each process needs its own export dir: parallel B2D arms
+    # share a cwd and otherwise load each other's (or a half-built) solver.
+    ocp.code_export_directory = "c_generated_code_%d" % os.getpid()
+    acados_solver = AcadosOcpSolver(ocp, json_file="acados_ocp_%d.json" % os.getpid())
     # acados_solver = AcadosOcpSolver.generate(ocp, json_file="acados_ocp.json")
 
     # acados_integrator = AcadosSimSolver(ocp, json_file="acados_ocp.json")
