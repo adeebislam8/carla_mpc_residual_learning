@@ -64,7 +64,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 authority_horizon=10, residual_window=None, obstacle_radius_m=45.0,
                 stall_kick='clear', follow=True, predict_obstacles=True,
                 gate_mode='pass_slow', full_brake=True, breakaway=True,
-                behavior_rules=False)
+                behavior_rules=False, rules_queue=False)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -165,7 +165,8 @@ class MPCCAgent(AutonomousAgent):
             residual_window_m=c['residual_window'], stall_kick=c['stall_kick'],
             follow=c['follow'], predict_obstacles=c['predict_obstacles'],
             gate_mode=c['gate_mode'], full_brake=c['full_brake'],
-            breakaway=c['breakaway'], behavior_rules=c['behavior_rules'])
+            breakaway=c['breakaway'], behavior_rules=c['behavior_rules'],
+            rules_queue=c['rules_queue'])
         # Stop lines need the speed cap to bind even with follow/predict off.
         core._binding_v_slack = True
         random.setstate(rng_state)

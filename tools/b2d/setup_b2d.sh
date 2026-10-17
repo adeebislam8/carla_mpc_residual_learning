@@ -57,6 +57,12 @@ fi
   | xargs -r sed -i -E 's/([A-Za-z_][A-Za-z0-9_.]*)\.getchildren\(\)/list(\1)/g'
 N_LEFT=$( { grep -rl 'getchildren()' --include='*.py' "$B2D/leaderboard" "$B2D/scenario_runner" || true; } | wc -l)
 echo "== py3.10 patch: $N_LEFT files still use getchildren (want 0)"
+# Parallel arms on ONE GPU: after a crash the evaluator kills every CARLA with
+# '-graphicsadapter=<gpu>', i.e. the other arms' servers too.  Kill by the
+# crashed run's own RPC port instead.  Idempotent.
+sed -i "s/grep '-graphicsadapter=\"+ str(args.gpu_rank) + \"'/grep '-carla-rpc-port=\"+ str(args.port) + \"'/" \
+  "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py"
+echo "== crash-kill patch: $(grep -c "carla-rpc-port=\"+ str(args.port)" "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py") (want 1)"
 
 if ! "$CONDA" env list | grep -q '^b2d '; then
   "$CONDA" create -y --name b2d --clone "$SRC_ENV"

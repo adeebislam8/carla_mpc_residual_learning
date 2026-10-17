@@ -97,6 +97,7 @@ for TRY in $(seq 1 "$MAX_TRY"); do
   LAST=$DONE
   [ "$STALL" -ge 2 ] && { echo "== no progress in 2 restarts -- stopping; check run.log"; break; }
   echo "== restarting (CARLA crash?) in 15 s ..."
-  pkill -9 -f CarlaUE4 2>/dev/null; sleep 15
+  # Only OUR server (by its RPC port): parallel arms run their own CARLA.
+  pkill -9 -f "carla-rpc-port=$PORT" 2>/dev/null; sleep 15
 done
 echo "== done.  Score: ./tools/b2d/run_b2d.sh score $SET"

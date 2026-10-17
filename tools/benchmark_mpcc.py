@@ -246,6 +246,7 @@ def run(args):
             full_brake=args.full_brake,
             breakaway=args.breakaway,
             behavior_rules=args.behavior_rules,
+            rules_queue=args.rules_queue,
             qc=args.qc,
             a_long_obs=args.a_long,
             b_lat_obs=args.b_lat,
@@ -302,6 +303,7 @@ def run(args):
         'full_brake': args.full_brake,
         'breakaway': args.breakaway,
         'behavior_rules': args.behavior_rules,
+        'rules_queue': args.rules_queue,
         'model': args.model,
         'algo': args.algo if args.model else None,
         'residual_mode': args.residual_mode,
@@ -842,6 +844,9 @@ def main():
     ap.add_argument('--behavior-rules', action='store_true',
                     help='hand-coded decision layer arm: pass only long-stopped, non-junction, '
                          'non-queued obstacles; yield to crossing traffic within 4 s')
+    ap.add_argument('--rules-queue', action='store_true',
+                    help='ablation: with --behavior-rules, never pass a stopped car that has '
+                         'another stopped car right ahead (treats accidents as queues)')
     ap.add_argument('--gate-mode', default='always', choices=['always', 'pass_slow'],
                     help="overtake pull: 'always' (original: any obstacle ahead) or 'pass_slow' "
                          "(only stationary/slow cars in our lane; follow normal traffic)")

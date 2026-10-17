@@ -1,0 +1,11 @@
+{
+  "steer_fix": true,
+  "qc": 0.5,
+  "gate_depth": 0.98,
+  "target_speed": 15.0,
+  "perception": false,
+  "traffic_rules": true,
+  "student": null,
+  "behavior_rules": true,
+  "rules_queue": true
+}

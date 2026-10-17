@@ -100,6 +100,7 @@ class CarlaMPCEnv(gym.Env):
         full_brake: bool = False,
         breakaway: bool = False,
         behavior_rules: bool = False,
+        rules_queue: bool = False,
         qc: float = None,
         a_long_obs: float = None,
         b_lat_obs: float = None,
@@ -361,6 +362,13 @@ class CarlaMPCEnv(gym.Env):
         # a stop line -- otherwise it is followed / stopped behind; and crossing
         # traffic predicted to enter our path within RULE_YIELD_T is yielded to.
         self.behavior_rules = behavior_rules
+        # rules_queue: + "a stopped car with another stopped car right ahead is
+        # traffic, never pass it".  An ABLATION, off in the reported rules arm:
+        # it fixes nothing on HardBreakRoute and freezes the car behind every
+        # accident pile-up and construction zone (rules2 ot_eb: Accident 5->1/5,
+        # Construction 2->0/5, overtaking 48.9->33.3%) -- a geometric rule cannot
+        # tell an accident from a traffic jam.
+        self.rules_queue = rules_queue
         self.selected_obstacle_stopped = np.full(num_obstacles, np.inf)
         self._route_junction = None      # bool per road-width sample
         self._stop_lines_s = []          # route s of stop lines (set by the B2D agent)
@@ -1550,6 +1558,8 @@ class CarlaMPCEnv(gym.Env):
         # stopped TRAFFIC, not a parked car (Bench2Drive HardBreakRoute: a
         # column brakes together; after 3 s the rule tried to pass it and hit
         # it -- rulesdbg, 2026-10-17).
+        if not self.rules_queue:
+            return True
         d_obs = self.selected_obstacles[i][1]
         for j, ((s_j, d_j), (vs_j, vd_j)) in enumerate(zip(self.selected_obstacles,
                                                            self.selected_obstacle_vel)):
