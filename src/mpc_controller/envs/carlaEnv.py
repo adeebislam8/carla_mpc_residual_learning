@@ -375,6 +375,12 @@ class CarlaMPCEnv(gym.Env):
         # behind (the student said 'wait, do not pass now').
         self.gate_scale = 1.0
         self.tactical_wait = False
+        # Deadlock creep (set per tick by the Bench2Drive agent): every
+        # stationary obstacle passable, no follow cap, break away from rest.
+        self.creep = False
+        # mpc_reuse: on a clear road the OCP is solved every 2nd tick
+        # (MPCController.solve(reuse_ok=...)).
+        self.mpc_reuse = False
         self.selected_obstacle_stopped = np.full(num_obstacles, np.inf)
         self._route_junction = None      # bool per road-width sample
         self._stop_lines_s = []          # route s of stop lines (set by the B2D agent)
@@ -1453,8 +1459,10 @@ class CarlaMPCEnv(gym.Env):
         Bench2Drive agent (tools/b2d/mpcc_b2d_agent.py), which drives the same
         controller inside the leaderboard's own world loop.  Call after
         _update_vehicle_state() and _detect_obstacles()."""
-        self.mpc_controller.lead = self._lead_in_lane() if self.follow else None
+        self.mpc_controller.lead = (self._lead_in_lane() if self.follow and not self.creep
+                                    else None)
         self.mpc_controller.gate_on = self._gate_on() * float(self.gate_scale)
+        self.mpc_controller.reuse_ok = self.mpc_reuse and self._reuse_ok()
         # _t_mpc_start = time.perf_counter()
         mpc_throttle, mpc_steering = self.mpc_controller.solve(
             s=self.current_s,
@@ -1521,7 +1529,7 @@ class CarlaMPCEnv(gym.Env):
         if (self.breakaway and self.current_speed < 0.5
                 and 0.05 < final_throttle < self.BREAKAWAY_THROTTLE
                 and getattr(self.mpc_controller, 'stop_s', None) is None
-                and self._path_clear()):
+                and (self._path_clear() or self.creep)):
             final_throttle = self.BREAKAWAY_THROTTLE   # enough to actually start
 
         return mpc_throttle, mpc_steering, final_throttle, final_steering
@@ -1550,6 +1558,8 @@ class CarlaMPCEnv(gym.Env):
         """Is stationary obstacle i one to drive around?  Baseline: always (the
         minimal rule).  behavior_rules: only a long-stopped one outside
         junctions that is not queued before a stop line."""
+        if self.creep:
+            return True                     # deadlock escape overrides every rule
         if self.tactical_wait:
             return False                    # the student said: wait behind it
         if not self.behavior_rules:
@@ -1644,6 +1654,23 @@ class CarlaMPCEnv(gym.Env):
         return 0.0
 
     BREAKAWAY_THROTTLE = 0.45
+    REUSE_WINDOW = (-10.0, 40.0)    # no obstacle here (along-route) for mpc_reuse
+    REUSE_MIN_V = 2.0
+
+    def _reuse_ok(self):
+        """Clear road, nothing to react to: the previous OCP solution may be
+        applied one more tick instead of solving (MPCController.solve)."""
+        mc = self.mpc_controller
+        if mc.lead is not None or getattr(mc, 'stop_s', None) is not None or mc.gate_on > 0:
+            return False
+        if self.current_speed < self.REUSE_MIN_V or self.creep:
+            return False
+        if self._in_junction(self.current_s, 10.0):
+            return False
+        for s_obs, _ in self.selected_obstacles:
+            if s_obs > -50.0 and self.REUSE_WINDOW[0] < s_obs - self.current_s < self.REUSE_WINDOW[1]:
+                return False
+        return True
 
     def _path_clear(self):
         """No obstacle in our lane within STALL_KICK_CLEAR_M ahead."""

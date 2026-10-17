@@ -44,6 +44,20 @@ Config (JSON, all optional):
   tactical (null | dir: the go/slow student, src/student/tactical.py),
   scene_radius_m (110: actors kept for the tactical scene)
 
+Efficiency / robustness (sensor-only):
+  light_gate_m (60: run the light/stop-sign detector only within this of the
+    next junction entry on the route; null = every tick)
+  device ('cuda' | 'cpu': where YOLOP / YOLO run -- the CPU-only study)
+  mpc_reuse (false: on a clear road, solve the OCP every 2nd tick and apply
+    the previous solution's next stage in between)
+  creep_after_s (null | s: stopped this long with nothing to wait for (no stop
+    line, no junction ahead) -> creep past the blocker at creep_v m/s, the CBF
+    on, for at most creep_max_s)
+  record_simlingo (false: also record SimLingo's front camera, 1024x512 FOV 110
+    at (-1.5, 0, 2.0), for the SimLingo teacher -- tools/simlingo/)
+Env B2D_DUMP_DIR: every 20th tick, front image + LiDAR + pose -> npz, the
+  offline input of tools/b2d/bench_stack.py (energy / CPU / INT8 study).
+
 privileged (true | false).  true: ground-truth actors and light states from the
 simulator plus the HD map (an ORACLE-perception setting).  false: the
 Bench2Drive SENSORS-track setting the end-to-end models (UniAD, VAD, ORION) are
@@ -94,7 +108,9 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 behavior_rules=False, rules_queue=False,
                 record=False, tactical=None, scene_radius_m=110.0,
                 privileged=True, lidar_mount=[1.3, 0.0, 2.5, 0.0],
-                sparse_route=None, yolop='models/yolop/yolop-640-640.onnx')
+                sparse_route=None, yolop='models/yolop/yolop-640-640.onnx',
+                light_gate_m=60.0, device='cuda', creep_after_s=None,
+                creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -107,6 +123,9 @@ ORION_CAMS = [
     ('CAM_FRONT_RIGHT', 0.27, 0.55, 55.0, 70), ('CAM_BACK', -2.0, 0.0, 180.0, 110),
     ('CAM_BACK_LEFT', -0.32, -0.55, -110.0, 70), ('CAM_BACK_RIGHT', -0.32, 0.55, 110.0, 70)]
 JPEG_QUALITY = 20
+# SimLingo's camera (team_code/config_simlingo.py): id, x, y, z, w, h, fov
+SIMLINGO_CAM = ('SIMLINGO_FRONT', -1.5, 0.0, 2.0, 1024, 512, 110)
+DUMP_EVERY = 20
 GNSS_X = -1.4          # IMU/GNSS mount (ORION's rig); the estimator corrects for it
 
 
@@ -264,6 +283,8 @@ class MPCCAgent(AutonomousAgent):
             self.rec_dir = os.path.join(root, name)
             for cam, *_ in ORION_CAMS:
                 os.makedirs(os.path.join(self.rec_dir, cam), exist_ok=True)
+            if self.cfg['record_simlingo']:
+                os.makedirs(os.path.join(self.rec_dir, SIMLINGO_CAM[0]), exist_ok=True)
             self.rec_meta = open(os.path.join(self.rec_dir, 'meta.jsonl'), 'w')
         self.tactical = None
         if self.cfg['tactical']:
@@ -271,6 +292,12 @@ class MPCCAgent(AutonomousAgent):
             self.tactical = TacticalPolicy(self.cfg['tactical'])
         self._planner = None
         self.n_go = self.n_wait = self.n_slow = 0
+        self.dump_dir = os.environ.get('B2D_DUMP_DIR')
+        if self.dump_dir:
+            os.makedirs(self.dump_dir, exist_ok=True)
+        self.n_light_runs = 0            # ticks the light detector actually ran
+        self._stuck_t, self._creep_t, self._creep_cool = 0.0, 0.0, 0.0
+        self.n_creep_events, self.n_creep_ticks = 0, 0
 
     def sensors(self):
         # Ground-truth obstacles come from the world; the speedometer keeps the
@@ -287,6 +314,11 @@ class MPCCAgent(AutonomousAgent):
                  'roll': 0.0, 'pitch': 0.0, 'yaw': yaw,
                  'width': 1600, 'height': 900, 'fov': fov, 'id': cid}
                 for cid, x, y, yaw, fov in use]
+        if self.cfg.get('record') and self.cfg.get('record_simlingo'):
+            cid, x, y, z, w, h, fov = SIMLINGO_CAM
+            cams.append({'type': 'sensor.camera.rgb', 'x': x, 'y': y, 'z': z,
+                         'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+                         'width': w, 'height': h, 'fov': fov, 'id': cid})
         if sensor_only:
             mx, my, mz, myaw = self.cfg['lidar_mount']
             cams.append({'type': 'sensor.lidar.ray_cast', 'x': mx, 'y': my, 'z': mz,
@@ -388,6 +420,7 @@ class MPCCAgent(AutonomousAgent):
         core.current_s = 0.0
         core._ego_s_hint = 0.0
         core._initialize_mpc()
+        core.mpc_reuse = bool(c['mpc_reuse'])
         if c['perception']:
             core._attach_perception_cameras()
         self.core = core
@@ -399,6 +432,13 @@ class MPCCAgent(AutonomousAgent):
                                         axes=c['student_axes'])
             self.policy.attach(core)
         self._planner = RoutePlanner(self._global_plan_world_coord)
+        if self.rec_dir is not None:
+            # The downsampled plan every agent gets: teachers that run their own
+            # route planner (SimLingo) replay it offline.
+            with open(os.path.join(self.rec_dir, 'route.json'), 'w') as f:
+                json.dump({'nodes': [(tf.location.x, tf.location.y, tf.location.z,
+                                      int(getattr(cm, 'value', cm)))
+                                     for tf, cm in self._global_plan_world_coord]}, f)
         if sensor_only:
             from leaderboard.utils.route_manipulation import _get_latlon_ref
             from perception.ego_state import EgoStateEstimator
@@ -408,14 +448,14 @@ class MPCCAgent(AutonomousAgent):
             self._tl = None
             if c['traffic_rules']:
                 from perception.traffic_lights import TrafficLightDetector
-                self._tl = TrafficLightDetector()
+                self._tl = TrafficLightDetector(device=c['device'])
             self._last_applied = (0.0, 0.0, 0.0)          # throttle, brake, steer
             self._lanes = None
             if c['sparse_route']:
                 from perception.lanes import LanePerception, CameraGeometry
                 fx, fy, fyaw, ffov = ORION_CAMS[0][1:]
                 self._lanes = LanePerception(c['yolop'], camera=CameraGeometry(
-                    W=1600, H=900, fov_deg=ffov, x=fx, y=fy, z=1.60))
+                    W=1600, H=900, fov_deg=ffov, x=fx, y=fy, z=1.60), device=c['device'])
                 core.mpc_controller.n_lane_fn = core.lane_offset
             self._stop_entries_done = set()
             self._stop_sign_seen_t = -1e9
@@ -522,6 +562,7 @@ class MPCCAgent(AutonomousAgent):
             self._init_core()
         core = self.core
         t0 = time.perf_counter()
+        self._ms = {}                    # per-module wall time this tick (trace ms_*)
         self.n_steps += 1
         core.current_step = self.n_steps
 
@@ -542,12 +583,17 @@ class MPCCAgent(AutonomousAgent):
         elif self.cfg['privileged']:
             stop_ds = self._rule_stop_target()
         else:
+            t1 = time.perf_counter()
             stop_ds = self._sensor_stop_target(input_data, timestamp)
+            self._ms['light'] = time.perf_counter() - t1
         core.mpc_controller.stop_s = (None if stop_ds is None
                                       else core.current_s + stop_ds)
         core.mpc_controller.stop_margin = STOP_LINE_MARGIN_M
 
         scene = None
+        if self.tactical is None:
+            core.mpc_controller.v_cap = None     # (a creep may have set it)
+        t1 = time.perf_counter()
         if self.cfg['record'] or self.tactical is not None:
             scene = self._scene(stop_ds)
         if self.tactical is not None:
@@ -559,11 +605,16 @@ class MPCCAgent(AutonomousAgent):
             self.n_go += int(go and blocked)
             self.n_wait += int((not go) and blocked)
             self.n_slow += int(slow)
+            self._ms['tactical'] = time.perf_counter() - t1
+        creeping = self._update_creep(stop_ds)
 
         action = np.zeros(2)
         if self.policy is not None:
             action = self.policy.predict(core._get_observation())[0]
+        t1 = time.perf_counter()
         u_nom_thr, u_nom_steer, thr, steer = core._compute_final_action(action)
+        self._ms['mpc'] = time.perf_counter() - t1
+        self._ms['ocp'] = getattr(core.mpc_controller, 'last_solve_s', 0.0)
 
         # Last resort only: the soft OCP still carrying speed into the line.
         if stop_ds is not None and stop_ds - STOP_LINE_MARGIN_M < 2.0 \
@@ -580,6 +631,7 @@ class MPCCAgent(AutonomousAgent):
         if not self.cfg['privileged']:
             self._last_applied = (control.throttle, control.brake, control.steer)
         self.t_control.append(time.perf_counter() - t0)
+        self._ms['total'] = self.t_control[-1]
         if self.rec_dir is not None:
             self._record(input_data, scene, (u_nom_thr, u_nom_steer), (thr, steer))
         if self.trace_dir:
@@ -604,8 +656,60 @@ class MPCCAgent(AutonomousAgent):
                 lead_v=None if lead is None else round(lead[1], 1),
                 n_obs=int((core.selected_obstacles[:, 0] > -50).sum()),
                 alpha=round(float(core.last_authority_info.get('alpha', 1.0)), 2),
+                creep=int(creeping), stuck_t=round(self._stuck_t, 1),
+                student_net=(None if self.tactical is None
+                             else int(self.tactical.last.get('net', False))),
+                mpc_reused=int(getattr(core.mpc_controller, 'last_reused', False)),
+                **{f'ms_{k}': round(1000.0 * v, 2) for k, v in self._ms.items()},
                 **(self._perception_check() if not self.cfg['privileged'] else {})))
         return control
+
+    STUCK_V, MOVING_V = 0.3, 1.0
+    CREEP_CONTEXT_M = 40.0      # a junction entry this close ahead = a queue / light: wait
+    CREEP_DONE_M = 15.0         # moved this far since the creep began = past the blocker
+    CREEP_COOLDOWN_S = 10.0
+
+    def _update_creep(self, stop_ds, dt=0.05):
+        """Deadlock escape (creep_after_s): stopped for creep_after_s with
+        nothing legitimate to wait for -- no stop line held, no junction entry
+        within CREEP_CONTEXT_M ahead (a queue at a light) -- then for at most
+        creep_max_s: every stationary obstacle counts as passable (gate on,
+        student 'wait' overridden), no follow cap, speed capped at creep_v, and
+        enough throttle to break away from rest.  The CBF stays in the loop.
+        Bench2Drive scores a route that times out (TickRuntime) or is blocked
+        60 s near zero, whatever the reason."""
+        core, c = self.core, self.cfg['creep_after_s']
+        core.creep = False
+        if c is None:
+            return False
+        v = core.current_speed
+        if v < self.STUCK_V:
+            self._stuck_t += dt
+        elif v > self.MOVING_V:
+            self._stuck_t = 0.0
+        self._creep_cool = max(self._creep_cool - dt, 0.0)
+        if self._creep_t > 0.0:                                     # creeping
+            self._creep_t += dt
+            if (self._creep_t > self.cfg['creep_max_s']
+                    or core.current_s - self._creep_s0 > self.CREEP_DONE_M):
+                self._creep_t, self._stuck_t = 0.0, 0.0
+                self._creep_cool = self.CREEP_COOLDOWN_S
+                return False
+        else:
+            waiting = stop_ds is not None or any(
+                -1.0 < e - core.current_s < self.CREEP_CONTEXT_M
+                for e in getattr(core, '_stop_lines_s', []) or [])
+            if self._stuck_t < c or waiting or self._creep_cool > 0.0:
+                return False
+            self._creep_t, self._creep_s0 = dt, core.current_s
+            self.n_creep_events += 1
+        core.creep = True
+        core.gate_scale, core.tactical_wait = 1.0, False
+        cap = self.cfg['creep_v']
+        vc = core.mpc_controller.v_cap
+        core.mpc_controller.v_cap = cap if vc is None else min(vc, cap)
+        self.n_creep_ticks += 1
+        return True
 
     def _write_trace(self):
         import csv
@@ -614,7 +718,9 @@ class MPCCAgent(AutonomousAgent):
         name = self.route_name or f'route_{int(time.time())}'
         stem = os.path.join(self.trace_dir, '_'.join(name.split('_')[:5]))
         with open(stem + '.csv', 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(self.trace[0]))
+            # union of keys in first-seen order (a column may start mid-route)
+            cols = list(dict.fromkeys(k for r in self.trace for k in r))
+            w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             w.writerows(self.trace)
         try:
@@ -651,6 +757,7 @@ class MPCCAgent(AutonomousAgent):
 
     def _sense(self, input_data, timestamp):
         core = self.core
+        t1 = time.perf_counter()
         imu = input_data['IMU'][1]
         gnss = input_data['GPS'][1]
         speed = float(input_data['SPEED'][1]['speed'])
@@ -658,10 +765,30 @@ class MPCCAgent(AutonomousAgent):
             gnss[:2], float(imu[-1]), speed, gyro_z=float(imu[5]))
         thr, brk, steer = self._last_applied
         core._update_vehicle_state_from(x, y, yaw, v, yaw_rate, thr, brk, steer)
+        t2 = time.perf_counter()
+        self._ms['ego'] = t2 - t1
         if self._lanes is not None:
             self._update_lane(input_data['CAM_FRONT'][1][:, :, :3], x, y, yaw)
+            # YOLOP network alone (0 on ticks it is skipped) vs fit + projection
+            self._ms['yolop_net'] = self._lanes.last_net_s
+            self._ms['lane'] = time.perf_counter() - t2
+        t2 = time.perf_counter()
         tracks = self._lidar.update(input_data['LIDAR'][1], (x, y, yaw), timestamp)
         core._set_obstacles_from_tracks(tracks)
+        self._ms['lidar'] = time.perf_counter() - t2
+        if self.dump_dir and self.n_steps % DUMP_EVERY == 0:
+            self._dump_sensors(input_data, x, y, yaw, v, timestamp)
+
+    def _dump_sensors(self, input_data, x, y, yaw, v, t):
+        """Raw on-board inputs for the offline efficiency benchmark
+        (tools/b2d/bench_stack.py): front image as lossless PNG, LiDAR points,
+        estimated pose."""
+        import cv2
+        name = '_'.join((self.route_name or 'route').split('_')[:3])
+        stem = os.path.join(self.dump_dir, f'{name}_{self.n_steps:06d}')
+        cv2.imwrite(stem + '.png', input_data['CAM_FRONT'][1][:, :, :3])
+        np.savez_compressed(stem + '.npz', lidar=np.asarray(input_data['LIDAR'][1], np.float32),
+                            pose=np.array([x, y, yaw, v, t], np.float64))
 
     LANE_JUMP_M = 1.75        # half a lane: a fit further from the tracked lane is rejected
     LANE_REACQUIRE = 10       # consecutive rejected YOLOP frames (~1 s) -> re-anchor to route
@@ -751,6 +878,7 @@ class MPCCAgent(AutonomousAgent):
                if -1.0 < s_l - s_ego < 60.0]
         out['gt_light'] = (str(min(nxt, key=lambda r: r[0])[1].state).split('.')[-1].lower()
                            if nxt else None)
+        out['n_route_lights'] = len(getattr(self, '_diag_lights', []))   # GT index sanity
         # Our lateral offset from the ROUTE's lane centre, estimated vs true.
         # True = offset from the dense lane-centre route (not the nearest map
         # lane: that switches lanes with us when we pass, hiding lane-tracking
@@ -781,7 +909,20 @@ class MPCCAgent(AutonomousAgent):
         core = self.core
         if self._tl is None:
             return None
+        # Lights and stop signs govern junction entries only, and the route
+        # says where those are: outside light_gate_m of the next one, skip the
+        # detector (efficiency; also no false 'lights' from amber construction
+        # lamps on open road).  A stop sign seen in the last 3 s still holds.
+        g = self.cfg['light_gate_m']
+        if g is not None and timestamp - self._stop_sign_seen_t >= 3.0:
+            s = core.current_s
+            if not any(-1.0 < e - s < g for e in self._junction_entries):
+                self._tl.history.clear()
+                self._tl.last = {}
+                return None
         det = self._tl.detect(input_data['CAM_FRONT'][1][:, :, :3])
+        self.n_light_runs += 1
+        self._ms['yolo_net'] = self._tl.last_net_s
         if det['stop_sign']:
             self._stop_sign_seen_t = timestamp
         s, v = core.current_s, core.current_speed
@@ -862,6 +1003,11 @@ class MPCCAgent(AutonomousAgent):
             img = input_data[cam][1][:, :, :3]
             cv2.imwrite(os.path.join(self.rec_dir, cam, f'{step:06d}.jpg'), img,
                         [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        if self.cfg['record_simlingo']:
+            cam = SIMLINGO_CAM[0]
+            # its agent re-encodes with cv2's default JPEG quality (95)
+            cv2.imwrite(os.path.join(self.rec_dir, cam, f'{step:06d}.jpg'),
+                        input_data[cam][1][:, :, :3], [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         imu = input_data['IMU'][1]
         loc = self.hero_actor.get_location()
         (_, cmd), (near, _) = self._planner.run_step(np.array([loc.x, loc.y]))
@@ -912,6 +1058,9 @@ class MPCCAgent(AutonomousAgent):
                       f'{1000 * np.percentile(self.t_control, 95):.1f} ms', flush=True)
             print(f'[MPCCAgent] rule-layer brake overrides: {self.n_rule_overrides} '
                   f'(stops the MPCC failed to plan)', flush=True)
+            if not self.cfg.get('privileged', True):
+                print(f'[MPCCAgent] light detector ran {self.n_light_runs}/{n} ticks; '
+                      f'creep {self.n_creep_events} events, {self.n_creep_ticks} ticks', flush=True)
             if self.policy is not None:
                 print(f'[MPCCAgent] student counters {self.policy.total}', flush=True)
             try:

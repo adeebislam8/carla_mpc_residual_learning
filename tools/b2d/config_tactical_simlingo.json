@@ -1,0 +1,12 @@
+{
+  "privileged": false,
+  "steer_fix": true,
+  "qc": 0.5,
+  "gate_depth": 0.98,
+  "target_speed": 15.0,
+  "perception": false,
+  "traffic_rules": true,
+  "behavior_rules": true,
+  "tactical": "models/tactical_simlingo",
+  "creep_after_s": 12.0
+}

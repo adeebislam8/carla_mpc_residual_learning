@@ -438,24 +438,50 @@ def selftest(teacher, n):
                      command=4, near_xy=[0.0, -0.5 * i - 20.0])
             yield imgs, m
 
-    out = _run_sequence(teacher, frames(), scene_token='selftest')
+    with _energy_meter() as em:
+        out = _run_sequence(teacher, frames(), scene_token='selftest')
     _summary('selftest', out)
+    print('teacher energy (selftest, GPU above idle):', em.report(len(out['steps'])))
     print('first plan (forward, left) m:\n', np.round(out['plan_fl'][0], 2))
     print(_memory_report())
     print('NOTE: synthetic frames -- the plan values mean nothing.  This only '
           'proves the model loads, runs and fits.')
 
 
+def _energy_meter():
+    """src/efficiency/power.py EnergyMeter (NVML GPU joules above idle; needs
+    nvidia-ml-py in this env -- without it only wall/CPU time is recorded)."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
+    from efficiency.power import EnergyMeter
+    return EnergyMeter()
+
+
 def label_episodes(teacher, episodes, out_dir, stride):
+    """Labels + the TEACHER COST for the paper: wall time, GPU energy and peak
+    memory per labelled frame, accumulated over runs in labelling_cost.json."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    for ep in episodes:
-        ep = Path(ep)
-        metas = _load_episode(ep)[::stride]
-        frames = ((_read_frame(ep, m['step']), m) for m in metas)
-        out = _run_sequence(teacher, frames, scene_token=ep.name)
-        np.savez_compressed(out_dir / f'{ep.name}.npz', **out)
-        _summary(ep.name, out)
+    n_frames = 0
+    with _energy_meter() as em:
+        for ep in episodes:
+            ep = Path(ep)
+            metas = _load_episode(ep)[::stride]
+            frames = ((_read_frame(ep, m['step']), m) for m in metas)
+            out = _run_sequence(teacher, frames, scene_token=ep.name)
+            np.savez_compressed(out_dir / f'{ep.name}.npz', **out)
+            n_frames += len(out['steps'])
+            _summary(ep.name, out)
     print(_memory_report())
+    rep = em.report(n_frames)
+    cost_p = out_dir / 'labelling_cost.json'
+    runs = json.load(open(cost_p)) if cost_p.exists() else []
+    runs.append(dict(rep, episodes=len(episodes), stride=stride,
+                     peak_vram_gb=round(torch.cuda.max_memory_reserved() / 2**30, 2)
+                     if torch.cuda.is_available() else None))
+    json.dump(runs, open(cost_p, 'w'), indent=2)
+    tot_f = sum(r['frames'] for r in runs)
+    tot_h = sum(r['wall_s'] for r in runs) / 3600
+    print(f'labelling cost: this run {rep} | all runs {tot_f} frames, {tot_h:.2f} GPU-h -> {cost_p}')
 
 
 def main():

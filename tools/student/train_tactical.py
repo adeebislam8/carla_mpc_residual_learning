@@ -43,10 +43,13 @@ def main():
     ap.add_argument('--weight-decay', type=float, default=1e-4)
     ap.add_argument('--val-frac', type=float, default=0.2)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--cpu', action='store_true', help='train on CPU (the cost study)')
     args = ap.parse_args()
 
+    import time
     import torch
     import torch.nn as nn
+    t_start, cpu_start = time.perf_counter(), time.process_time()
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
@@ -77,7 +80,7 @@ def main():
         p = Y[tr, h][m].mean() if m.any() else 0.5
         pos_w.append(float(np.clip((1 - p) / max(p, 1e-3), 1.0, 20.0)))
     pos_w = torch.tensor(pos_w)
-    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    dev = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
 
     def net():
         layers, din = [], X.shape[1]
@@ -134,6 +137,11 @@ def main():
         metrics[f'{name}_val_auc'] = auc(y, p)
         metrics[f'{name}_val_acc'] = float(((p >= 0.5) == (y > 0.5)).mean()) if m.any() else float('nan')
 
+    # Training cost for the paper (vs teacher labelling / end-to-end training).
+    train_cost = dict(wall_s=round(time.perf_counter() - t_start, 1),
+                      cpu_s=round(time.process_time() - cpu_start, 1), device=dev,
+                      device_name=(torch.cuda.get_device_name(0) if dev == 'cuda' else 'cpu'),
+                      train_frames=int(tr.sum()), members=args.members, epochs=args.epochs)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     weights, n_layers = {}, None
@@ -150,9 +158,11 @@ def main():
                 n_params_total=n_params, n_params_per_member=n_params // args.members,
                 train_episodes=int(len(train_eps)), val_episodes=int(n_val),
                 pos_weight=pos_w.tolist(), metrics=metrics, args=vars(args),
+                train_cost=train_cost,
                 datasets=[str(p) for p in args.data])
     json.dump(meta, open(out / 'tactical_meta.json', 'w'), indent=2)
     print(f'\ntactical student -> {out}  ({n_params} parameters, {n_params // args.members} per member)')
+    print(f'  training cost: {train_cost}')
     for k, v in metrics.items():
         print(f'  {k:22s} {v:.3f}' if isinstance(v, float) else f'  {k:22s} {v}')
 

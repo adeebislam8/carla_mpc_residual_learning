@@ -48,6 +48,8 @@ def main():
     ap.add_argument('--routes', default='leaderboard/data/bench2drive220.xml')
     ap.add_argument('--ability', nargs='*', default=[], choices=sorted(ABILITY))
     ap.add_argument('--types', nargs='*', default=[], help='explicit scenario types')
+    ap.add_argument('--all-types', action='store_true',
+                    help='every scenario type in the routes file (abl44: --all-types --per-type 1)')
     ap.add_argument('--per-type', type=int, default=0,
                     help='keep at most N routes per scenario type (0 = all)')
     ap.add_argument('--out', required=True)
@@ -56,11 +58,12 @@ def main():
     wanted = set(args.types)
     for a in args.ability:
         wanted |= set(ABILITY[a])
-    if not wanted:
-        raise SystemExit('give --ability and/or --types')
-
     tree = ET.parse(os.path.join(os.path.expanduser(args.b2d), args.routes))
     root = tree.getroot()
+    if args.all_types:
+        wanted |= {t for r in root for t in route_types(r)}
+    if not wanted:
+        raise SystemExit('give --ability, --types or --all-types')
     kept, per = [], collections.Counter()
     for route in list(root):
         types = [t for t in route_types(route) if t in wanted]

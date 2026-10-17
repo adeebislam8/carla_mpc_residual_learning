@@ -7,5 +7,6 @@
   "perception": false,
   "traffic_rules": true,
   "behavior_rules": true,
-  "tactical": "models/tactical_r0"
+  "tactical": "models/tactical_r0",
+  "creep_after_s": 12.0
 }

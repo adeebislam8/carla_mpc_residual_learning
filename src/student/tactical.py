@@ -224,6 +224,7 @@ class TacticalPolicy:
     fixing)."""
 
     HOLD_TICKS = 10          # keep a decision >= 0.5 s
+    CONTEXT_M = 60.0         # the network runs only if some actor is this close ahead
 
     def __init__(self, path, go_threshold=0.5, slow_threshold=0.5):
         self.net = TacticalEnsemble.load(path)
@@ -232,22 +233,36 @@ class TacticalPolicy:
         self.go, self.slow, self._held = True, False, 0
         self.last = {}
         self.n_queries = 0
+        self.n_net = 0           # ticks the network actually ran (efficiency)
 
     def reset(self):
         self.frames.clear()
         self.go, self.slow, self._held = True, False, 0
 
+    @classmethod
+    def has_context(cls, scene):
+        """Anything to decide about: an actor ahead within CONTEXT_M (or just
+        behind, in the passing lane).  With an empty road both heads' answers
+        are fixed (go = no blocker to wait for, slow = no hazard), so the
+        network is skipped -- the learned layer runs only when it matters."""
+        return any(-20.0 < a['ds'] < cls.CONTEXT_M for a in scene['actors'])
+
     def step(self, scene):
-        self.frames.append(frame_features(scene))
+        self.frames.append(frame_features(scene))       # history stays complete
+        self.n_queries += 1
+        if not self.has_context(scene):
+            self.go, self.slow, self._held = True, False, self.HOLD_TICKS
+            self.last = dict(p_go=1.0, p_slow=0.0, std_go=0.0, std_slow=0.0, net=False)
+            return self.go, self.slow
         fr = list(self.frames)
         x = np.concatenate([fr[max(len(fr) - 1 - lag, 0)] for lag in HIST_LAGS])
         p_go, p_slow, s_go, s_slow = self.net.forward(x)
-        self.n_queries += 1
+        self.n_net += 1
         self._held += 1
         if self._held >= self.HOLD_TICKS:
             go, slow = p_go >= self.go_threshold, p_slow >= self.slow_threshold
             if go != self.go or slow != self.slow:
                 self.go, self.slow, self._held = go, slow, 0
         self.last = dict(p_go=float(p_go), p_slow=float(p_slow),
-                         std_go=float(s_go), std_slow=float(s_slow))
+                         std_go=float(s_go), std_slow=float(s_slow), net=True)
         return self.go, self.slow

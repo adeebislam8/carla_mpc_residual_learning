@@ -84,7 +84,8 @@ PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install \
   gymnasium scipy matplotlib "casadi==3.7.2" opencv-python-headless \
   "setuptools<81" simplejson
 if [ "${B2D_YOLO:-0}" = "1" ]; then
-  PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install ultralytics onnxruntime-gpu
+  PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install ultralytics onnxruntime-gpu \
+    nvidia-ml-py      # + GPU energy for tools/b2d/bench_stack.py
   # YOLOP lane lines for the sparse-route (sensor-only) agent: pretrained
   # hustvl/YOLOP, BDD100K; perception/lanes.py
   mkdir -p "$REPO/models/yolop"

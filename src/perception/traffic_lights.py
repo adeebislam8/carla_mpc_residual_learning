@@ -42,9 +42,15 @@ class TrafficLightDetector:
     # shrunk to YOLO's 640 -- so crop first, then run at higher resolution.
     ROI = (0.2, 0.8, 0.0, 0.7)      # x0, x1, y0, y1 as fractions
 
-    def __init__(self, model='yolov8n.pt', conf=0.25, imgsz=960, vote=5):
+    def __init__(self, model='yolov8n.pt', conf=0.25, imgsz=960, vote=5, device='cuda'):
         from ultralytics import YOLO
         self.model = YOLO(model)
+        try:
+            import torch
+            self.device = device if (device != 'cuda' or torch.cuda.is_available()) else 'cpu'
+        except ImportError:
+            self.device = 'cpu'
+        self.last_net_s = 0.0
         self.conf, self.imgsz = conf, imgsz
         self.history = deque(maxlen=vote)
         self.last = {}
@@ -56,8 +62,11 @@ class TrafficLightDetector:
         rx0, rx1, ry0, ry1 = (int(self.ROI[0] * W), int(self.ROI[1] * W),
                               int(self.ROI[2] * H), int(self.ROI[3] * H))
         roi = img_bgr[ry0:ry1, rx0:rx1]
-        res = self.model.predict(roi, imgsz=self.imgsz, conf=self.conf,
+        import time
+        t0 = time.perf_counter()
+        res = self.model.predict(roi, imgsz=self.imgsz, conf=self.conf, device=self.device,
                                  classes=[TL_CLASS, STOP_CLASS], verbose=False)[0]
+        self.last_net_s = time.perf_counter() - t0
         light_box, stop_frac = None, 0.0
         for b, c in zip(res.boxes.xyxy.cpu().numpy(), res.boxes.cls.cpu().numpy()):
             x0, y0, x1, y1 = b + [rx0, ry0, rx0, ry0]       # back to full-image pixels

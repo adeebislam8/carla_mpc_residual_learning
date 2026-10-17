@@ -222,9 +222,18 @@ class MPCController:
             road_widths: Optional road width constraints
             target_lane_d: Target lateral position (None = stay in current lane)
             
+        reuse_ok (attribute, set by the env per tick): on a clear road the
+        previous solution's next stage may be applied instead of solving, at
+        most REUSE_MAX ticks in a row and only while we are where that solution
+        predicted (mpc_reuse efficiency study).
+
         Returns:
             (throttle, steering): Control outputs in [-1, 1]
         """
+        self.last_reused = False
+        if self._try_reuse(d, v):
+            return self.last_control[0], self.last_control[1]
+        self._since_solve = 0
 
         if self.acados_solver is None:
             print("⚠️  ACADOS solver not initialized, using fallback controller")
@@ -457,7 +466,9 @@ class MPCController:
 
         # 8. Solve ACADOS OCP
         self.solve_calls += 1
+        _t_solve = time.perf_counter()
         status = self.acados_solver.solve()
+        self.last_solve_s = time.perf_counter() - _t_solve     # acados OCP alone
 
         # Record what the solver was fed, whether or not it succeeded -- the
         # failures only mean something next to the successes.
@@ -489,6 +500,7 @@ class MPCController:
             # print(f"⚠️ ACADOS failed status={status}")
             self.solve_failures += 1
             self.consecutive_failures += 1
+            self._plan_x = None                  # never reuse a plan past a failure
             # SQP_RTI warm-starts from the previous iterate, so a NaN solution
             # (HPIPM status 3) would otherwise seed every subsequent solve and
             # the controller never recovers within the episode.
@@ -523,6 +535,8 @@ class MPCController:
                 track_err=float(self.last_track_err),
                 plan_violation=float(self.last_plan_violation))
         u0 = self.acados_solver.get(1, "u")
+        # Keep the planned states for mpc_reuse (stage k = k ticks ahead: dt = tick).
+        self._plan_x = [np.array(self.acados_solver.get(k, "x")) for k in range(min(self.N, 4))]
         
         # Update control derivatives for next iteration
         self.derD = u0[0]
@@ -567,6 +581,31 @@ class MPCController:
         self.last_good_control = self.last_control.copy()
 
         return throttle, steering
+
+    REUSE_MAX = 1            # consecutive reused ticks (1: OCP at 10 Hz on clear road)
+    REUSE_TOL_N, REUSE_TOL_V = 0.3, 1.0
+
+    def _try_reuse(self, d, v):
+        """mpc_reuse: apply stage 1 + k of the last solution instead of
+        solving, if allowed, not done REUSE_MAX times already, and the vehicle
+        is where that solution put it now (lateral within REUSE_TOL_N m,
+        speed within REUSE_TOL_V m/s)."""
+        if not getattr(self, 'reuse_ok', False) or getattr(self, '_plan_x', None) is None:
+            return False
+        k = getattr(self, '_since_solve', 0) + 1
+        if k > self.REUSE_MAX or k + 1 >= len(self._plan_x):
+            return False
+        pred = self._plan_x[k]                       # state predicted for now
+        if abs(d - pred[1]) > self.REUSE_TOL_N or abs(v - pred[3]) > self.REUSE_TOL_V:
+            return False
+        nxt = self._plan_x[k + 1]
+        self._since_solve = k
+        self.last_solve_s = 0.0
+        self.last_reused = True
+        steering = float(np.clip(nxt[5] / np.deg2rad(self.steer_norm_deg), -1.0, 1.0))
+        self.previous_control = self.last_control.copy()
+        self.last_control = np.array([float(np.clip(nxt[4], -1.0, 1.0)), steering])
+        return True
 
     def _reset_solver_iterate(self, s, d, alpha, v, D, delta):
         """

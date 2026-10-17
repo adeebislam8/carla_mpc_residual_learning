@@ -4,6 +4,7 @@
 #   ./tools/b2d/run_b2d.sh smoke            # 9 Overtaking routes, one per type
 #   ./tools/b2d/run_b2d.sh ot_eb            # Overtaking + Emergency_Brake, 105 routes
 #   ./tools/b2d/run_b2d.sh full             # all 220 official routes
+#   ./tools/b2d/run_b2d.sh abl44            # one route per scenario type (ablations)
 #   CONFIG=tools/b2d/config_student.json TAG=student ./tools/b2d/run_b2d.sh ot_eb
 #
 # The leaderboard starts (and kills) its own CARLA 0.9.15 server -- stop any
@@ -25,6 +26,10 @@ GPU_RANK=${GPU_RANK:-0}
 OUT=$REPO/results/b2d/${TAG}_${SET}
 CONDA=${CONDA:-$(command -v conda || echo "$HOME/anaconda3/bin/conda")}
 PY="$CONDA run --no-capture-output -n b2d python"
+# DUMP=1: every 20th tick's front image + LiDAR -> $OUT/dump (input of
+# tools/b2d/bench_stack.py / quantize_yolop.py, the offline efficiency study)
+DUMP_DIR=""
+[ "${DUMP:-0}" = "1" ] && DUMP_DIR="$OUT/dump"
 
 ROUTES=$REPO/tools/b2d/routes/${SET}.xml
 
@@ -39,7 +44,8 @@ if [ "$SET" = "score" ]; then
 fi
 
 mkdir -p "$OUT" "$REPO/tools/b2d/routes"     # not for 'score' (made empty *_score dirs)
-if [ -f "$ROUTES" ] && [ "$SET" != "smoke" ] && [ "$SET" != "ot_eb" ] && [ "$SET" != "full" ]; then
+if [ -f "$ROUTES" ] && [ "$SET" != "smoke" ] && [ "$SET" != "ot_eb" ] && [ "$SET" != "full" ] \
+   && [ "$SET" != "abl44" ]; then
   : # a prepared routes file tools/b2d/routes/<SET>.xml (e.g. train_clips)
 else
 case "$SET" in
@@ -48,6 +54,8 @@ case "$SET" in
   ot_eb) [ -f "$ROUTES" ] || python3 "$REPO/tools/b2d/make_subset.py" --b2d "$B2D" \
            --ability Overtaking Emergency_Brake --out "$ROUTES" ;;
   full)  ROUTES=$B2D/leaderboard/data/bench2drive220.xml ;;
+  abl44) [ -f "$ROUTES" ] || python3 "$REPO/tools/b2d/make_subset.py" --b2d "$B2D" \
+           --all-types --per-type 1 --out "$ROUTES" ;;
   *)     # any other name: the routes of the scenario types in TYPES, e.g.
          #   TYPES="HardBreakRoute" TAG=dbg ./tools/b2d/run_b2d.sh hb
          [ -n "${TYPES:-}" ] || { echo "unknown set $SET (set TYPES=... for a custom set)"; exit 1; }
@@ -69,7 +77,8 @@ cat > "$OUT/eval_cmd.sh" <<EOS
 cd "$B2D"
 export PYTHONPATH="$PYTHONPATH" SCENARIO_RUNNER_ROOT="$SCENARIO_RUNNER_ROOT" \\
        LEADERBOARD_ROOT="$LEADERBOARD_ROOT" IS_BENCH2DRIVE=True PYTHONNOUSERSITE=1 \\
-       CARLA_ROOT="$CARLA_ROOT" B2D_TRACE_DIR="$OUT/traces" B2D_RECORD_DIR="$OUT/rec"
+       CARLA_ROOT="$CARLA_ROOT" B2D_TRACE_DIR="$OUT/traces" B2D_RECORD_DIR="$OUT/rec" \
+       B2D_DUMP_DIR="$DUMP_DIR"
 exec python "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py" \\
   --routes="$ROUTES" --repetitions=1 --track=SENSORS \\
   --checkpoint="$OUT/eval.json" \\

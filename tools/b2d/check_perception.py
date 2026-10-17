@@ -89,6 +89,14 @@ def main():
           f"in-lane object detected {100 * tot['det'] / n:.0f}%, missed {100 * tot['miss'] / n:.0f}%, "
           f"phantom {100 * tot['phan'] / n:.0f}%, range error median {np.median(err_all) if err_all else float('nan'):.2f} m")
     print('light states reported (ticks):', dict(lights_all))
+    nl = []
+    for p in files:
+        rows = list(csv.DictReader(open(p)))
+        if rows and rows[0].get('n_route_lights') not in (None, ''):
+            nl.append((os.path.basename(p)[:40], int(rows[0]['n_route_lights'])))
+    if nl:
+        print('GT lights indexed on each route (0 everywhere = GT index broken, not "no lights"):',
+              ', '.join(f'{n}:{k}' for n, k in nl))
     if conf:
         cols = ['red', 'yellow', 'green', 'unknown', 'none']
         print('\nlights, true (rows) vs reported (cols), ticks:')

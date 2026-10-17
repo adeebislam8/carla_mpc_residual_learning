@@ -19,6 +19,21 @@ and ORION's plan for that frame (orion_infer.py npz, 'plan_fl' + 'steps'):
           dv = v_plan(1-1.5 s) - v is debiased by its median per 1 m/s speed bin
           (fit on all frames) before thresholding.
   ep      episode index, for episode-level train/val splits
+
+Rule-checked labels (default; --no-filter for the raw-teacher ablation):
+ORION is a strong but fallible teacher.  A 'go' (pull out now) is DROPPED
+from the training mask when a gap check on the SAME frame's features says the
+pass is unsafe -- observable quantities only (what the student itself sees),
+so the filter adds no expert/learner asymmetry (LEAD):
+  * oncoming car in the passing lane meets us before the pass is done:
+    onc_tmeet < T_pass + 1.5 s, T_pass = (blk_ds + blk_extent + 15) / max(v, 5)
+  * a faster car close behind in the passing lane (pbehind_ds > -15 m and
+    pbehind_vs > v + 1)
+  * a slower car ahead in the passing lane inside the pass zone
+'wait' labels are kept (conservative); waits with a clear passing lane behind
+a long-stopped blocker are only COUNTED (teacher over-caution), or flipped to
+go with --flip-cautious.  Hydra-MDP-style rule supervision of a learned
+policy, applied to the teacher's labels.
 """
 
 import argparse
@@ -31,8 +46,33 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
-from student.tactical import (FEATURE_NAMES, HIST_LAGS, frame_features,  # noqa: E402
-                              go_label, plan_dv, stack_history)
+from student.tactical import (FEATURE_NAMES, FRAME_NAMES, HIST_LAGS,  # noqa: E402
+                              frame_features, go_label, plan_dv, stack_history)
+
+F = {n: i for i, n in enumerate(FRAME_NAMES)}
+PASS_MARGIN_M, PASS_MIN_V, MEET_MARGIN_S = 15.0, 5.0, 1.5
+
+
+def go_unsafe(f):
+    """Reason string if passing now is unsafe by the frame's own features
+    (frame_features vector), else None."""
+    v = f[F['v']]
+    t_pass = (f[F['blk_ds']] + f[F['blk_extent']] + PASS_MARGIN_M) / max(v, PASS_MIN_V)
+    if f[F['onc_present']] and f[F['onc_tmeet']] < t_pass + MEET_MARGIN_S:
+        return 'oncoming'
+    if f[F['pbehind_present']] and f[F['pbehind_ds']] > -15.0 and f[F['pbehind_vs']] > v + 1.0:
+        return 'from_behind'
+    if (f[F['pahead_present']] and f[F['pahead_vs']] < v
+            and f[F['pahead_ds']] < f[F['blk_ds']] + f[F['blk_extent']] + 10.0):
+        return 'slow_ahead'
+    return None
+
+
+def wait_overcautious(f):
+    """Clear passing lane and a blocker stationary >= 10 s."""
+    return (not f[F['onc_present']] or f[F['onc_tmeet']] > 15.0) and \
+        not f[F['pbehind_present']] and not f[F['pahead_present']] and \
+        f[F['blk_stopped']] >= 10.0 and abs(f[F['blk_vs']]) < 0.5
 
 
 def main():
@@ -43,6 +83,10 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--slow-on', type=float, default=-1.5, help='debiased dv below -> slow=1')
     ap.add_argument('--slow-off', type=float, default=-0.5, help='debiased dv above -> slow=0')
+    ap.add_argument('--no-filter', action='store_true',
+                    help='raw ORION go labels (the ablation); default: rule-checked')
+    ap.add_argument('--flip-cautious', action='store_true',
+                    help='turn over-cautious waits into go (default: only count them)')
     args = ap.parse_args()
 
     labels = {}
@@ -50,6 +94,8 @@ def main():
         for p in glob.glob(os.path.join(os.path.expanduser(root), '*.npz')):
             labels[os.path.splitext(os.path.basename(p))[0]] = p
     X, YG, MG, DV, V, EP, names = [], [], [], [], [], [], []
+    import collections
+    fstats = collections.Counter()
     for root in args.rec:
         for ep in sorted(glob.glob(os.path.join(os.path.expanduser(root), '*'))):
             meta_p = os.path.join(ep, 'meta.jsonl')
@@ -71,6 +117,16 @@ def main():
                 sc, plan = r['scene'], lab['plan_fl'][j]
                 X.append(stack_history(frames, i))
                 g = go_label(sc, plan)
+                if g == 1:
+                    why = go_unsafe(frames[i])
+                    if why:
+                        fstats['go_unsafe_' + why] += 1
+                        if not args.no_filter:
+                            g = -1                      # dropped: the teacher's mistake
+                elif g == 0 and wait_overcautious(frames[i]):
+                    fstats['wait_overcautious'] += 1
+                    if args.flip_cautious and not args.no_filter:
+                        g = 1
                 YG.append(max(g, 0))
                 MG.append(g >= 0)
                 DV.append(plan_dv(sc, plan))
@@ -94,6 +150,9 @@ def main():
                         feature_names=np.array(FEATURE_NAMES),
                         config=json.dumps(dict(hist_lags=HIST_LAGS, slow_on=args.slow_on,
                                                slow_off=args.slow_off,
+                                               filtered=not args.no_filter,
+                                               flip_cautious=args.flip_cautious,
+                                               filter_stats=dict(fstats),
                                                dv_bias_by_speed=med.round(3).tolist())))
     mg = np.asarray(MG)
     yg = np.asarray(YG)
@@ -103,6 +162,8 @@ def main():
     print(f'  slow: confident {m_slow.sum()} ({m_slow.mean() * 100:.0f}%), '
           f'slow=1 {int(y_slow[m_slow].sum())}')
     print('  dv bias by speed bin (m/s): ' + ' '.join(f'{x:+.1f}' for x in med))
+    print(f"  rule check ({'applied' if not args.no_filter else 'counted only, --no-filter'}): "
+          + (', '.join(f'{k} {v}' for k, v in sorted(fstats.items())) or 'nothing flagged'))
 
 
 if __name__ == '__main__':

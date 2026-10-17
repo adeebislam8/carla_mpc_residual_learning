@@ -16,8 +16,9 @@ Pipeline per tick:
   5. cluster on a 0.4 m occupancy grid, gaps up to ~1.2 m bridged
      (8-connected components)
   6. track clusters by nearest neighbour with constant-velocity prediction;
-     velocity = smoothed centroid motion; 'stopped_for' = time since the
-     track last moved > 1 m/s
+     velocity = least-squares slope of the centroid over the last 1 s, reported
+     only while the track is latched MOVING (see "velocity" below);
+     'stopped_for' = time since the track was last moving
   7. guess a coarse type from the footprint: vehicle / walker / prop
 
 Everything physically on the road shows up -- cars, pedestrians, cones,
@@ -25,12 +26,27 @@ warning signs -- and things hidden behind others really are hidden.  Which
 clusters matter (the road corridor) is decided by the caller in route
 coordinates (carlaEnv._set_obstacles_from_tracks).
 
+Velocity (rewritten 2026-10-17 after Bench2Drive ssmoke4): per-tick centroid
+differencing gave PARKED cars 7-12 m/s up close -- the centroid jumps as the
+visible faces change and clusters split/merge.  That one error made a parked
+car look like traffic driving away (no follow cap, overtake gate off) or
+oncoming (dropped from the lead logic), and the CBF, which predicts obstacles
+at their velocity, saw it leave: 8 vehicle/layout collisions in 9 routes, at
+walking pace behind the blocker.  Now:
+  * least-squares slope over HIST_S of centroid history (not tick differences)
+  * a centroid more than RESEG_M off the track's prediction in ONE tick is a
+    re-segmentation, not motion: history restarts, velocity is not updated
+  * MOVING latch: speed > V_ON for LATCH_S with real displacement to start
+    reporting velocity, < V_OFF for LATCH_S to stop (lower for walkers/bikes)
+  * the reported velocity changes by at most A_MAX per second
+
 Point format: CARLA's LidarMeasurement as the leaderboard parses it, (N, 4)
 float32 x, y, z, intensity in the sensor frame (x forward, y right, z up --
 Unreal's left-handed frame, the same one carla.Transform uses).
 """
 
 import math
+from collections import deque
 
 import numpy as np
 
@@ -50,9 +66,14 @@ class LidarObstacleTracker:
     EGO_HALF = (2.6, 1.2)         # ego footprint to drop (vehicle frame)
     GATE_M = 2.5                  # association radius
     COAST_S = 0.3                 # keep unmatched tracks this long
-    V_ALPHA = 0.25                # velocity smoothing
-    MOVING_V = 1.0
-    V_DEADBAND = 0.6              # centroid jitter on static objects reaches ~0.5 m/s
+    HIST_S = 1.0                  # velocity = LS slope over this much centroid history
+    MIN_SPAN_S = 0.4              # ... once it spans at least this
+    RESEG_M = 1.2                 # one-tick deviation from prediction = re-segmentation
+    LATCH_S = 0.3
+    V_ON = {'vehicle': 1.5, 'small': 0.7}     # start moving (m/s), walkers/bikes: 'small'
+    V_OFF = {'vehicle': 0.8, 'small': 0.4}    # stop moving
+    MIN_DISP = {'vehicle': 0.6, 'small': 0.3}  # net displacement over the history (m)
+    A_MAX = 8.0                   # reported velocity change limit, m/s^2
 
     def __init__(self, mount=(1.3, 0.0, 2.5, 0.0)):
         self.mx, self.my, self.mz, myaw = mount
@@ -146,6 +167,64 @@ class LidarObstacleTracker:
 
     # ── tracking ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _halves_agree(T, X, Y, v_on):
+        """Real motion shows in BOTH halves of the window; a centroid step
+        (re-segmentation the RESEG_M test missed) only in one."""
+        n = len(T) // 2
+        if n < 3:
+            return False
+        vs = []
+        for sl in (slice(0, n), slice(n, None)):
+            t, x, y = T[sl] - T[sl].mean(), X[sl], Y[sl]
+            den = float((t * t).sum())
+            if den <= 0:
+                return False
+            vs.append(((t * (x - x.mean())).sum() / den, (t * (y - y.mean())).sum() / den))
+        (ax, ay), (bx, by) = vs
+        na, nb = math.hypot(ax, ay), math.hypot(bx, by)
+        return min(na, nb) > 0.6 * v_on and (ax * bx + ay * by) > 0.7 * na * nb   # < ~45 deg apart
+
+    def _update_velocity(self, tr, t, dt):
+        """LS velocity over the history; reported (tr vx, vy) only while the
+        MOVING latch is on, rate-limited by A_MAX."""
+        cls = 'small' if tr['type'].startswith(('walker', 'vehicle.bike')) else 'vehicle'
+        h = tr['hist']
+        if len(h) < 3 or h[-1][0] - h[0][0] < self.MIN_SPAN_S:
+            # Too little history (new track / just re-segmented): hold the
+            # current state -- not evidence of stopping, nor of moving.
+            if tr['moving']:
+                tr['last_moving'] = t
+            return
+        T = np.array([p[0] for p in h])
+        T = T - T.mean()
+        X = np.array([p[1] for p in h])
+        Y = np.array([p[2] for p in h])
+        den = float((T * T).sum())
+        vx_ls = float((T * (X - X.mean())).sum() / den)
+        vy_ls = float((T * (Y - Y.mean())).sum() / den)
+        disp = math.hypot(X[-1] - X[0], Y[-1] - Y[0])
+        sp = math.hypot(vx_ls, vy_ls)
+        tr['fit'] = (vx_ls, vy_ls)               # prediction only, never reported
+        if not tr['moving']:
+            go = sp > self.V_ON[cls] and disp > self.MIN_DISP[cls] and \
+                self._halves_agree(T, X, Y, self.V_ON[cls])
+            tr['on_t'] = tr['on_t'] + dt if go else 0.0
+            if tr['on_t'] >= self.LATCH_S:
+                # >= MIN_SPAN + LATCH of consistent motion: take the fit as is
+                tr['moving'], tr['off_t'] = True, 0.0
+                tr['vx'], tr['vy'], tr['last_moving'] = vx_ls, vy_ls, t
+            return
+        tr['off_t'] = tr['off_t'] + dt if sp < self.V_OFF[cls] else 0.0
+        if tr['off_t'] >= self.LATCH_S:
+            tr['moving'], tr['on_t'] = False, 0.0
+        tx, ty = (vx_ls, vy_ls) if tr['moving'] else (0.0, 0.0)
+        step = self.A_MAX * dt                       # spikes damped while latched
+        tr['vx'] += float(np.clip(tx - tr['vx'], -step, step))
+        tr['vy'] += float(np.clip(ty - tr['vy'], -step, step))
+        if tr['moving']:
+            tr['last_moving'] = t
+
     def update(self, points_sensor, ego_xy_yaw, t):
         dt = 0.05 if self.t_prev is None else max(t - self.t_prev, 1e-3)
         self.t_prev = t
@@ -156,8 +235,11 @@ class LidarObstacleTracker:
 
         # predict, then greedy nearest-neighbour association
         for tr in self.tracks.values():
-            tr['px'] = tr['x'] + tr['vx'] * dt
-            tr['py'] = tr['y'] + tr['vy'] * dt
+            # predict with the raw fit too while not yet latched: a fast car's
+            # 0.6 m/tick must not read as a re-segmentation jump
+            fx, fy = (tr['vx'], tr['vy']) if tr.get('moving') else tr.get('fit', (0.0, 0.0))
+            tr['px'] = tr['x'] + fx * dt
+            tr['py'] = tr['y'] + fy * dt
         pairs = []
         for ci, c in enumerate(clusters):
             for tid, tr in self.tracks.items():
@@ -172,17 +254,16 @@ class LidarObstacleTracker:
             used_c.add(ci)
             used_t.add(tid)
             c, tr = clusters[ci], self.tracks[tid]
-            vx_m = (c['x'] - tr['x']) / dt
-            vy_m = (c['y'] - tr['y']) / dt
-            a = self.V_ALPHA
-            tr['vx'] = (1 - a) * tr['vx'] + a * vx_m
-            tr['vy'] = (1 - a) * tr['vy'] + a * vy_m
+            if d > self.RESEG_M:
+                tr['hist'].clear()            # re-segmented: no motion from this jump
+            tr['hist'].append((t, c['x'], c['y']))
+            while tr['hist'] and t - tr['hist'][0][0] > self.HIST_S:
+                tr['hist'].popleft()
             tr.update(x=c['x'], y=c['y'], length=c['length'], width=c['width'],
                       height=max(tr['height'] * 0.8, c['height']), n=c['n'],
                       pts=c['pts'], last_seen=t, age=tr['age'] + dt)
-            if math.hypot(tr['vx'], tr['vy']) > self.MOVING_V:
-                tr['last_moving'] = t
             tr['type'] = self._type(tr)
+            self._update_velocity(tr, t, dt)
         for ci, c in enumerate(clusters):
             if ci in used_c:
                 continue
@@ -191,7 +272,9 @@ class LidarObstacleTracker:
             self.tracks[tid] = dict(id=tid, x=c['x'], y=c['y'], vx=0.0, vy=0.0,
                                     length=c['length'], width=c['width'], height=c['height'],
                                     n=c['n'], pts=c['pts'], last_seen=t, age=0.0,
-                                    last_moving=None, type=self._type(c))
+                                    last_moving=None, type=self._type(c),
+                                    hist=deque([(t, c['x'], c['y'])]), moving=False,
+                                    on_t=0.0, off_t=0.0)
         for tid in [k for k, tr in self.tracks.items() if t - tr['last_seen'] > self.COAST_S]:
             del self.tracks[tid]
 
@@ -199,11 +282,7 @@ class LidarObstacleTracker:
         for tr in self.tracks.values():
             if tr['last_seen'] != t:
                 continue
-            # A young track's velocity is not trustworthy yet, and below the
-            # deadband it is centroid jitter (visible faces change), not motion.
-            still = tr['age'] < 0.25 or math.hypot(tr['vx'], tr['vy']) < self.V_DEADBAND
-            out.append(dict(id=tr['id'], x=tr['x'], y=tr['y'],
-                            vx=0.0 if still else tr['vx'], vy=0.0 if still else tr['vy'],
+            out.append(dict(id=tr['id'], x=tr['x'], y=tr['y'], vx=tr['vx'], vy=tr['vy'],
                             length=tr['length'], width=tr['width'], height=tr['height'],
                             type=tr['type'], pts=tr['pts'],
                             stopped_for=(99.0 if tr['last_moving'] is None

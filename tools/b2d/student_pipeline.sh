@@ -13,8 +13,10 @@
 #   rec    our rules-arm agent drives them; ORION's 6 cameras + scene recorded
 #          -> results/b2d/rec_train_clips/rec/<route>/          [b2d env + CARLA]
 #   label  ORION labels every recorded route offline           [orion env, GPU]
-#   build  features + go/slow labels -> data/tactical_r0.npz
-#   train  ensemble -> models/tactical_r0                       [orion env (torch)]
+#          (TEACHERS="orion simlingo": SimLingo too            [simlingo env, GPU])
+#   build  features + go/slow labels -> data/tactical_r0.npz (rule-checked labels)
+#          and data/tactical_r0_raw.npz (raw teacher, the ablation); per teacher
+#   train  ensemble -> models/tactical_r0 (+ _raw)              [orion env (torch)]
 #   eval   rules arm + tactical student on EVAL_SET (default: all 220 official
 #          routes), then every arm run on that set side by side, per scenario
 #          type (tools/b2d/compare_arms.py)                      [b2d env + CARLA]
@@ -37,6 +39,8 @@ PER_TYPE=${PER_TYPE:-3}          # Emergency_Brake types (+ VehicleOpensDoorTwoW
 TWOWAYS=${TWOWAYS:-10}           # the student's target: TwoWays types
 ONEWAY=${ONEWAY:-6}              # one-way Overtaking types (pass cases without oncoming)
 PRUNE=${PRUNE:-0}
+TEACHERS=${TEACHERS:-orion}      # orion | "orion simlingo" (teacher ablation)
+SIMLINGO_ROOT=${SIMLINGO_ROOT:-$NETT/simlingo}
 EVAL_SET=${EVAL_SET:-full}       # full = all 220 routes; ot_eb = the 105-route subset
 CLIPS=tools/b2d/routes/train_clips.xml
 RUN=results/b2d/rec_train_clips
@@ -76,10 +80,27 @@ if has label; then
     PYTHONNOUSERSITE=1 "$CONDA" run --no-capture-output -n orion python tools/orion/orion_infer.py \
       --orion-root "$ORION_ROOT" --jpeg-quality 0 --episode "${todo[@]}" --out "$RUN/labels"
   fi
+  if [[ " $TEACHERS " == *" simlingo "* ]]; then
+    say "SimLingo labelling"
+    stodo=()
+    for ep in "$RUN"/rec/*/; do
+      ep=${ep%/}; n=$(basename "$ep")
+      [ -f "$ep/meta.jsonl" ] || continue
+      [ -f "$RUN/labels_simlingo/$n.npz" ] || stodo+=("$ep")
+    done
+    echo "   ${#stodo[@]} routes to label"
+    if [ ${#stodo[@]} -gt 0 ]; then
+      pkill -9 -f CarlaUE4 2>/dev/null; sleep 5
+      PYTHONNOUSERSITE=1 "$CONDA" run --no-capture-output -n simlingo python tools/simlingo/simlingo_infer.py \
+        --simlingo-root "$SIMLINGO_ROOT" --episode "${stodo[@]}" --out "$RUN/labels_simlingo"
+    fi
+  fi
   if [ "$PRUNE" = "1" ]; then
     for ep in "$RUN"/rec/*/; do
       n=$(basename "${ep%/}")
-      [ -f "$RUN/labels/$n.npz" ] && rm -rf "$ep"/CAM_* && echo "   pruned $n"
+      [ -f "$RUN/labels/$n.npz" ] || continue
+      [[ " $TEACHERS " == *" simlingo "* ]] && [ ! -f "$RUN/labels_simlingo/$n.npz" ] && continue
+      rm -rf "$ep"/CAM_* "$ep"/SIMLINGO_FRONT && echo "   pruned $n"
     done
   fi
 fi
@@ -88,12 +109,24 @@ if has build; then
   say "building the tactical dataset"
   mkdir -p data
   python3 tools/student/build_tactical.py --rec "$RUN/rec" --labels "$RUN/labels" --out "$DATA" || exit 1
+  python3 tools/student/build_tactical.py --rec "$RUN/rec" --labels "$RUN/labels" --no-filter \
+    --out "${DATA%.npz}_raw.npz" || exit 1
+  if [[ " $TEACHERS " == *" simlingo "* ]]; then
+    python3 tools/student/build_tactical.py --rec "$RUN/rec" --labels "$RUN/labels_simlingo" \
+      --out data/tactical_simlingo.npz || exit 1
+  fi
 fi
 
 if has train; then
   say "training the tactical student"
   PYTHONNOUSERSITE=1 "$CONDA" run --no-capture-output -n orion python tools/student/train_tactical.py \
     --data "$DATA" --out "$MODEL" || exit 1
+  PYTHONNOUSERSITE=1 "$CONDA" run --no-capture-output -n orion python tools/student/train_tactical.py \
+    --data "${DATA%.npz}_raw.npz" --out "${MODEL}_raw" || exit 1
+  if [[ " $TEACHERS " == *" simlingo "* ]]; then
+    PYTHONNOUSERSITE=1 "$CONDA" run --no-capture-output -n orion python tools/student/train_tactical.py \
+      --data data/tactical_simlingo.npz --out models/tactical_simlingo || exit 1
+  fi
 fi
 
 if has eval; then

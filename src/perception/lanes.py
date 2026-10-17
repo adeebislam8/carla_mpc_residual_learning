@@ -137,27 +137,32 @@ def fit_lane_centre(X, Y, x_bins=(4.0, 36.0, 2.0), lane_width=3.5, gap=0.8, ref0
 
 
 class LanePerception:
-    def __init__(self, onnx_path, camera=None, every=2):
+    def __init__(self, onnx_path, camera=None, every=2, device='cuda'):
         import os
         import onnxruntime as ort
         if not os.path.isfile(onnx_path):
             raise FileNotFoundError(f'YOLOP weights not found: {onnx_path} '
                                     f'(B2D_YOLO=1 ./tools/b2d/setup_b2d.sh downloads them)')
-        prov = [p for p in ('CUDAExecutionProvider', 'CPUExecutionProvider')
-                if p in ort.get_available_providers()]
+        want = ('CUDAExecutionProvider', 'CPUExecutionProvider') if device == 'cuda' \
+            else ('CPUExecutionProvider',)
+        prov = [p for p in want if p in ort.get_available_providers()]
         self.sess = ort.InferenceSession(onnx_path, providers=prov)
         self.cam = camera or CameraGeometry()
         self.every = every
         self.n = 0
         self.last = dict(valid=False)
+        self.last_net_s = 0.0          # YOLOP inference time of the last call (0 if skipped)
 
     def masks(self, img_bgr):
         import cv2
         rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         canvas, r, dw, dh, nw, nh = letterbox(rgb)
         x = ((canvas / 255.0 - MEAN) / STD).transpose(2, 0, 1)[None].astype(np.float32)
+        import time
+        t0 = time.perf_counter()
         _, da, ll = self.sess.run(['det_out', 'drive_area_seg', 'lane_line_seg'],
                                   input_feed={'images': x})
+        self.last_net_s = time.perf_counter() - t0
         da = np.argmax(da[:, :, dh:dh + nh, dw:dw + nw], axis=1)[0]
         ll = np.argmax(ll[:, :, dh:dh + nh, dw:dw + nw], axis=1)[0]
         return da, ll, r
@@ -167,6 +172,7 @@ class LanePerception:
         YOLOP runs every `every` calls (the last estimate is returned in
         between, flagged fresh=False)."""
         self.n += 1
+        self.last_net_s = 0.0
         if (self.n - 1) % self.every:
             return dict(self.last, fresh=False)
         da, ll, r = self.masks(img_bgr)
