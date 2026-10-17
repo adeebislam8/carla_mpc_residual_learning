@@ -384,6 +384,9 @@ class CarlaMPCEnv(gym.Env):
         # obstacle_face: LiDAR tracks enter the CBF as points on their near face
         # / inner edge, not the cluster centroid (_set_obstacles_from_tracks).
         self.obstacle_face = False
+        # obstacle_priority: the num_obstacles slots go to what is laterally
+        # near us first (_set_obstacles_from_tracks).
+        self.obstacle_priority = False
         self.selected_obstacle_stopped = np.full(num_obstacles, np.inf)
         self._route_junction = None      # bool per road-width sample
         self._stop_lines_s = []          # route s of stop lines (set by the B2D agent)
@@ -1754,8 +1757,9 @@ class CarlaMPCEnv(gym.Env):
     PERCEIVED_DS = (-40.0, 120.0)
     LONG_OBJECT_M = 5.0              # split longer clusters into points along them
 
+    PRIORITY_LAT_M = 3.0             # obstacle_priority: |d - ego d| of the first tier
     FACE_STEP_M = 3.0                # inner-edge points this far apart (= CBF a_obs)
-    FACE_MAX_PTS = 4
+    FACE_MAX_PTS = 8
 
     def _face_points(self, tr, s_o, d_o):
         """A LiDAR cluster as CBF points on its NEAR FACE and INNER EDGE.
@@ -1782,6 +1786,10 @@ class CarlaMPCEnv(gym.Env):
         s0, s1 = float(s_p.min()), float(s_p.max())
         if tr.get('type', '').startswith('vehicle.lidar'):
             s1 = max(s1, s0 + 4.0)          # seen from behind: only the rear face
+        # only the part the CBF window can use (a 65 m cone line got 4 points
+        # 21 m apart -- sbase_face 1825)
+        s0 = max(s0, min(s1, self.current_s - 5.0))
+        s1 = min(s1, max(s0, self.current_s + 30.0))
         k = int(min(self.FACE_MAX_PTS, 1 + np.ceil((s1 - s0) / self.FACE_STEP_M)))
         return [(float(s), d_in) for s in np.linspace(s0, s1, k)] if k > 1 else [(s0, d_in)]
 
@@ -1831,7 +1839,18 @@ class CarlaMPCEnv(gym.Env):
         self._track_s_hint = hints
         self._perceived = perceived
         self._n_cand = len(cand)
-        cand.sort(key=lambda c: c[0])
+        if self.obstacle_priority:
+            # Slots by threat, not by along-route order: everything within
+            # PRIORITY_LAT_M of us laterally (our lane, a car alongside, the
+            # first oncoming lane once we pull out) before roadside clutter.
+            # By s alone the 6 slots filled with cones / kerb clusters / things
+            # behind, and a parked car in our lane got one only ~5 m before it
+            # (sbase 1852/2664: gate 0, no CBF point -> drove into it).
+            cand.sort(key=lambda c: (abs(c[2] - self.current_d) >= self.PRIORITY_LAT_M,
+                                     abs(c[0])))
+        else:
+            cand.sort(key=lambda c: c[0])
+        self._n_near = sum(abs(c[2] - self.current_d) < self.PRIORITY_LAT_M for c in cand)
         self.selected_obstacles = np.ones((self.num_obstacles, 2)) * -100
         self.selected_obstacle_vs = np.zeros(self.num_obstacles)
         self.selected_obstacle_vel = np.zeros((self.num_obstacles, 2))

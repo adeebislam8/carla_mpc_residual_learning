@@ -55,6 +55,9 @@ Efficiency / robustness (sensor-only):
     on, for at most creep_max_s)
   obstacle_face (false: LiDAR obstacles enter the CBF as points on the
     cluster's near face / inner edge instead of its centroid)
+  obstacle_priority (false: the MPC's 6 obstacle slots go to objects laterally
+    within 3 m of the ego first, then by distance; false = by distance along
+    the route, behind-first)
   record_simlingo (false: also record SimLingo's front camera, 1024x512 FOV 110
     at (-1.5, 0, 2.0), for the SimLingo teacher -- tools/simlingo/)
 Env B2D_DUMP_DIR: every 20th tick, front image + LiDAR + pose -> npz, the
@@ -113,7 +116,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 sparse_route=None, yolop='models/yolop/yolop-640-640.onnx',
                 light_gate_m=60.0, device='cuda', creep_after_s=None,
                 creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False,
-                obstacle_face=False)
+                obstacle_face=False, obstacle_priority=False)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -425,6 +428,7 @@ class MPCCAgent(AutonomousAgent):
         core._initialize_mpc()
         core.mpc_reuse = bool(c['mpc_reuse'])
         core.obstacle_face = bool(c['obstacle_face'])
+        core.obstacle_priority = bool(c['obstacle_priority'])
         if c['perception']:
             core._attach_perception_cameras()
         self.core = core
@@ -665,7 +669,7 @@ class MPCCAgent(AutonomousAgent):
                              else int(self.tactical.last.get('net', False))),
                 mpc_reused=int(getattr(core.mpc_controller, 'last_reused', False)),
                 ocp_fail=int(getattr(core.mpc_controller, 'consecutive_failures', 0)),
-                n_cand=getattr(core, '_n_cand', None),
+                n_cand=getattr(core, '_n_cand', None), n_near=getattr(core, '_n_near', None),
                 **{f'ms_{k}': round(1000.0 * v, 2) for k, v in self._ms.items()},
                 **(self._perception_check() if not self.cfg['privileged'] else {})))
         return control
