@@ -76,14 +76,22 @@ fi
 #   Bench2Drive: py-trees networkx shapely psutil xmlschema ephem tabulate six
 #                simple-watchdog-timer dictor requests pexpect transforms3d,
 #                setuptools<81 (pkg_resources), simplejson (optional)
-#   B2D_YOLO=1:  ultralytics (pulls PyTorch, ~2.5 GB) for 'perception': true
+#   B2D_YOLO=1:  ultralytics (pulls PyTorch, ~2.5 GB) for 'perception': true and
+#                the sensor-only lights; onnxruntime-gpu + YOLOP weights for lanes
 PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install \
   "carla==0.9.15" "py-trees==0.8.3" networkx shapely psutil xmlschema ephem \
   tabulate six simple-watchdog-timer dictor requests pexpect transforms3d \
   gymnasium scipy matplotlib "casadi==3.7.2" opencv-python-headless \
   "setuptools<81" simplejson
 if [ "${B2D_YOLO:-0}" = "1" ]; then
-  PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install ultralytics
+  PYTHONNOUSERSITE=1 "$CONDA" run -n b2d python -m pip install ultralytics onnxruntime-gpu
+  # YOLOP lane lines for the sparse-route (sensor-only) agent: pretrained
+  # hustvl/YOLOP, BDD100K; perception/lanes.py
+  mkdir -p "$REPO/models/yolop"
+  if [ ! -s "$REPO/models/yolop/yolop-640-640.onnx" ]; then
+    wget -q -O "$REPO/models/yolop/yolop-640-640.onnx" \
+      https://github.com/hustvl/YOLOP/raw/main/weights/yolop-640-640.onnx
+  fi
 fi
 # acados_template is an editable/local install in the source env (the acados
 # submodule), which a conda clone does not always carry over: find where the

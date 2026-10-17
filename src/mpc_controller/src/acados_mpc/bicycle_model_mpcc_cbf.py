@@ -154,13 +154,18 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
     # car (Bench2Drive: ~1.4 m left of centre most of a route, outside-lane
     # infractions, side-swipes).  The env sets it per step; 1 = original.
     gate_on = MX.sym("gate_on")
+    # 14th parameter, per stage: n_lane = lateral offset of the perceived lane
+    # centre from the reference path.  With the sparse Bench2Drive route the
+    # path is a curve through nodes <= 50 m apart; the real lane centre comes
+    # from the camera (perception/lanes.py).  0 = track the path itself.
+    n_lane = MX.sym("n_lane")
     p = vertcat(s_obs1, n_obs1, 
                 s_obs2, n_obs2,
                 s_obs3, n_obs3,
                 s_obs4, n_obs4,
                 s_obs5, n_obs5,
                 s_obs6, n_obs6,
-                gate_on)
+                gate_on, n_lane)
 
     """---------------------"""
 
@@ -454,7 +459,7 @@ def bicycle_model(dt, coeff, knots, path_msg, degree=3, use_cbf=True, qc=None,
     GATE_DEPTH = 0.8 if gate_depth is None else float(gate_depth)
 
     HUBER_D = 3.0
-    e_lat = n - n_ref
+    e_lat = n - n_ref - n_lane
     lat_cost = 2.0 * HUBER_D**2 * (sqrt(1.0 + (e_lat / HUBER_D)**2) - 1.0)
 
     # closest_distance = fmin(dist_obs1, fmin(dist_obs2, fmin(dist_obs3, fmin(dist_obs4, fmin(dist_obs5, dist_obs6)))))

@@ -48,8 +48,11 @@ def compass_to_yaw(compass):
 class EgoStateEstimator:
     K = 0.3          # GNSS correction gain per tick
 
-    def __init__(self, lat_ref, lon_ref):
+    def __init__(self, lat_ref, lon_ref, antenna_x=0.0):
+        # GNSS reports the ANTENNA position; ours (ORION's rig) sits 1.4 m
+        # behind the vehicle origin -- uncorrected, a constant 1.4 m pose error.
         self.lat_ref, self.lon_ref = lat_ref, lon_ref
+        self.antenna_x = antenna_x
         self.x = self.y = self.yaw = None
         self.speed = 0.0
         self.yaw_rate = 0.0
@@ -62,6 +65,8 @@ class EgoStateEstimator:
             yaw_c = compass_to_yaw(float(compass))
         else:
             yaw_c = self.yaw if self.yaw is not None else 0.0
+        gx -= self.antenna_x * math.cos(yaw_c)        # antenna -> vehicle origin
+        gy -= self.antenna_x * math.sin(yaw_c)
         if self.x is None:
             self.x, self.y, self.yaw = gx, gy, yaw_c
         else:

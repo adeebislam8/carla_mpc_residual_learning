@@ -680,7 +680,7 @@ class LocalPlannerMPC(CompatibleNode):
                     self.constraint.dist_obs5_max,
                     self.constraint.dist_obs6_max,
                 ]))
-                self.acados_solver.set(i, "p", np.append(self.objects_frenet_points.flatten(), 1.0))
+                self.acados_solver.set(i, "p", np.append(self.objects_frenet_points.flatten(), [1.0, 0.0]))
 
             # print("obstacles reset")
             # self.objects_frenet_points = np.ones((6, 2), dtype=np.float32) * -100

@@ -53,6 +53,11 @@ evaluated in -- only on-board sensors and the route:
                     detector (perception/lidar_obstacles.py)
   * traffic lights  front camera: pretrained COCO YOLO + colour (perception/
                     traffic_lights.py); stop signs likewise
+  * route           the leaderboard's DOWNSAMPLED plan (a node every <= 50 m +
+                    junction entries/exits, as the base agent class gives every
+                    agent) densified by a cubic spline -- not the full 1 m route
+  * lane centre     front camera, pretrained YOLOP lane lines projected to the
+                    ground (perception/lanes.py) -> offset from that spline
   * stop lines / junctions   from the route's own commands (junction = LEFT /
                     RIGHT / STRAIGHT segments); no HD map
   * corridor        the MPCC's fixed two-lane default (no lane widths)
@@ -88,7 +93,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 gate_mode='pass_slow', full_brake=True, breakaway=True,
                 behavior_rules=False, rules_queue=False,
                 record=False, tactical=None, scene_radius_m=110.0,
-                privileged=True, lidar_mount=[1.3, 0.0, 2.5, 0.0])
+                privileged=True, lidar_mount=[1.3, 0.0, 2.5, 0.0],
+                sparse_route=None, yolop='models/yolop/yolop-640-640.onnx')
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -101,6 +107,7 @@ ORION_CAMS = [
     ('CAM_FRONT_RIGHT', 0.27, 0.55, 55.0, 70), ('CAM_BACK', -2.0, 0.0, 180.0, 110),
     ('CAM_BACK_LEFT', -0.32, -0.55, -110.0, 70), ('CAM_BACK_RIGHT', -0.32, 0.55, 110.0, 70)]
 JPEG_QUALITY = 20
+GNSS_X = -1.4          # IMU/GNSS mount (ORION's rig); the estimator corrects for it
 
 
 class RoutePlanner:
@@ -147,6 +154,31 @@ def _local_to_world(tf, loc):
             tf.location.y + loc.x * math.sin(yaw) + loc.y * math.cos(yaw))
 
 
+def densify_route(nodes, spacing=1.0):
+    """Sparse route nodes [(x, y)] -> points every `spacing` m along a
+    shape-preserving cubic (PCHIP, chord-length parametrised) through them, plus
+    for each output point the index of the node segment it lies in.  (A natural
+    CubicSpline overshot ~5 m sideways on a straight before a junction: node
+    spacing jumps from 50 m to ~14 m there.)"""
+    from scipy.interpolate import PchipInterpolator as CubicSpline
+    P = np.asarray(nodes, dtype=float)
+    keep = np.r_[True, np.hypot(*np.diff(P, axis=0).T) > 0.5]
+    P = P[keep]
+    idx_map = np.nonzero(keep)[0]
+    if len(P) < 2:
+        return P.tolist(), [0] * len(P)
+    t = np.r_[0.0, np.cumsum(np.hypot(*np.diff(P, axis=0).T))]
+    if len(P) == 2:
+        tt = np.arange(0.0, t[-1], spacing)
+        pts = P[0] + np.outer(tt / t[-1], P[1] - P[0])
+    else:
+        cx, cy = CubicSpline(t, P[:, 0]), CubicSpline(t, P[:, 1])
+        tt = np.arange(0.0, t[-1], spacing)
+        pts = np.stack([cx(tt), cy(tt)], axis=1)
+    seg = np.clip(np.searchsorted(t, tt, side='right') - 1, 0, len(P) - 2)
+    return pts.tolist(), idx_map[seg].tolist()
+
+
 def _road_width(wp, junction_margin=4.0):
     """Same corridor rule as PathPlanner.get_road_width_at_waypoint, without
     building a GlobalRoutePlanner (slow on Town12/13)."""
@@ -179,7 +211,7 @@ class MPCCAgent(AutonomousAgent):
                 self.cfg.update(json.load(f))
         # Model paths in a config are relative to the repo (the evaluator runs
         # from the Bench2Drive dir).
-        for key in ('student', 'tactical'):
+        for key in ('student', 'tactical', 'yolop'):
             if self.cfg.get(key) and not os.path.isabs(self.cfg[key]):
                 self.cfg[key] = os.path.join(_REPO, self.cfg[key])
         print(f'[MPCCAgent] config {path_to_conf_file}: {self.cfg}', flush=True)
@@ -234,9 +266,9 @@ class MPCCAgent(AutonomousAgent):
             cams.append({'type': 'sensor.lidar.ray_cast', 'x': mx, 'y': my, 'z': mz,
                          'roll': 0.0, 'pitch': 0.0, 'yaw': myaw, 'id': 'LIDAR'})
         return cams + [
-            {'type': 'sensor.other.imu', 'x': -1.4, 'y': 0.0, 'z': 0.0, 'roll': 0.0,
+            {'type': 'sensor.other.imu', 'x': GNSS_X, 'y': 0.0, 'z': 0.0, 'roll': 0.0,
              'pitch': 0.0, 'yaw': 0.0, 'sensor_tick': 0.05, 'id': 'IMU'},
-            {'type': 'sensor.other.gnss', 'x': -1.4, 'y': 0.0, 'z': 0.0, 'roll': 0.0,
+            {'type': 'sensor.other.gnss', 'x': GNSS_X, 'y': 0.0, 'z': 0.0, 'roll': 0.0,
              'pitch': 0.0, 'yaw': 0.0, 'sensor_tick': 0.01, 'id': 'GPS'}] + speed
 
     def set_global_plan(self, global_plan_gps, global_plan_world_coord):
@@ -277,8 +309,21 @@ class MPCCAgent(AutonomousAgent):
 
         # Route -> Frenet path + corridor table, as _generate_path does.
         sensor_only = not c['privileged']
+        if c['sparse_route'] is None:
+            c['sparse_route'] = sensor_only
         pts, wps, cmds = [], [], []
-        for tf, cmd in self._dense_route:
+        if c['sparse_route']:
+            # What every end-to-end agent gets: the base class's downsampled
+            # plan.  A node's RoadOption labels the segment that starts there.
+            nodes = [(tf.location.x, tf.location.y) for tf, _ in self._global_plan_world_coord]
+            ncmd = [int(getattr(cm, 'value', cm)) for _, cm in self._global_plan_world_coord]
+            dense, seg = densify_route(nodes)
+            self._dense_route_used = []
+            for (x, y), k in zip(dense, seg):
+                pts.append((x, y))
+                cmds.append(ncmd[k])
+                wps.append(None)
+        for tf, cmd in ([] if c['sparse_route'] else self._dense_route):
             p = (tf.location.x, tf.location.y)
             if pts and math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) < 0.5:
                 continue
@@ -327,13 +372,20 @@ class MPCCAgent(AutonomousAgent):
             from leaderboard.utils.route_manipulation import _get_latlon_ref
             from perception.ego_state import EgoStateEstimator
             from perception.lidar_obstacles import LidarObstacleTracker
-            self._ego_est = EgoStateEstimator(*_get_latlon_ref(world))
+            self._ego_est = EgoStateEstimator(*_get_latlon_ref(world), antenna_x=GNSS_X)
             self._lidar = LidarObstacleTracker(mount=tuple(c['lidar_mount']))
             self._tl = None
             if c['traffic_rules']:
                 from perception.traffic_lights import TrafficLightDetector
                 self._tl = TrafficLightDetector()
             self._last_applied = (0.0, 0.0, 0.0)          # throttle, brake, steer
+            self._lanes = None
+            if c['sparse_route']:
+                from perception.lanes import LanePerception, CameraGeometry
+                fx, fy, fyaw, ffov = ORION_CAMS[0][1:]
+                self._lanes = LanePerception(c['yolop'], camera=CameraGeometry(
+                    W=1600, H=900, fov_deg=ffov, x=fx, y=fy, z=1.60))
+                core.mpc_controller.n_lane_fn = core.lane_offset
             self._stop_entries_done = set()
             self._stop_sign_seen_t = -1e9
             # Stop-line context for the rules arm: every junction entry.
@@ -559,8 +611,31 @@ class MPCCAgent(AutonomousAgent):
             gnss[:2], float(imu[-1]), speed, gyro_z=float(imu[5]))
         thr, brk, steer = self._last_applied
         core._update_vehicle_state_from(x, y, yaw, v, yaw_rate, thr, brk, steer)
+        if self._lanes is not None:
+            self._update_lane(input_data['CAM_FRONT'][1][:, :, :3], x, y, yaw)
         tracks = self._lidar.update(input_data['LIDAR'][1], (x, y, yaw), timestamp)
         core._set_obstacles_from_tracks(tracks)
+
+    def _update_lane(self, img, ex, ey, yaw):
+        """YOLOP lane centre (vehicle frame) -> offset from the spline route,
+        sampled along it; inside junctions the spline itself is the reference
+        (no lane markings there)."""
+        core = self.core
+        est = self._lanes.update(img)
+        self._lane_valid = bool(est.get('valid'))
+        if not self._lane_valid:
+            return
+        c0, c1, c2 = est['coeffs']
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        ss, dd = [], []
+        for xv in np.arange(max(est['x_min'], 4.0), min(est['x_max'], 35.0), 2.5):
+            yv = c0 + c1 * xv + c2 * xv * xv
+            wx, wy = ex + cy * xv - sy * yv, ey + sy * xv + cy * yv
+            s_q, d_q, _ = core.frenet_converter.world_to_frenet(wx, wy, 0, s_hint=core.current_s + xv)
+            ss.append(s_q)
+            dd.append(0.0 if core._in_junction(s_q) else d_q)
+        if len(ss) >= 2 and np.all(np.diff(ss) > 0):
+            core.set_lane_offsets(ss, dd)
 
     def _perception_check(self):
         """DIAGNOSTIC ONLY (trace), never used for control: the nearest
@@ -573,7 +648,12 @@ class MPCCAgent(AutonomousAgent):
         per = [a for a in getattr(core, '_perceived', []) if abs(a['d']) < 2.0 and 0 < a['ds'] < 40]
         p = min(per, key=lambda a: a['ds']) if per else None
         out['per_ds'] = None if p is None else p['ds']
+        out['per_d'] = None if p is None else round(p['d'], 2)
         out['per_type'] = None if p is None else p['type']
+        # GT relative to the TRUE ego position (not the estimate), measured to
+        # the object's NEAR face (LiDAR sees the face, not the centre), lateral
+        # in the same lane frame as perception.
+        s_ego, _, _ = core.frenet_converter.world_to_frenet(loc.x, loc.y, 0, s_hint=core.current_s)
         gt = []
         for a in CarlaDataProvider.get_world().get_actors():
             t = a.type_id
@@ -583,13 +663,36 @@ class MPCCAgent(AutonomousAgent):
             al = a.get_location()
             if al.distance(loc) > 45.0:
                 continue
-            s_o, d_o, _ = core.frenet_converter.world_to_frenet(al.x, al.y, 0, s_hint=core.current_s)
-            if abs(d_o) < 2.0 and 0 < s_o - core.current_s < 40:
-                gt.append((s_o - core.current_s, t))
+            s_o, d_o, _ = core.frenet_converter.world_to_frenet(al.x, al.y, 0, s_hint=s_ego)
+            d_o -= core.lane_offset(s_o)
+            ds = s_o - s_ego - a.bounding_box.extent.x
+            if abs(d_o) < 2.0 and 0 < ds < 40:
+                gt.append((ds, round(d_o, 2), t))
         g = min(gt) if gt else None
         out['gt_ds'] = None if g is None else round(g[0], 2)
-        out['gt_type'] = None if g is None else g[1]
+        out['gt_d'] = None if g is None else g[1]
+        out['gt_type'] = None if g is None else g[2]
         out['light'] = (self._tl.last.get('light') if self._tl is not None else None)
+        # True state of the light governing us (simulator; diagnostic only).
+        try:
+            tl = self.hero_actor.get_traffic_light()
+            out['gt_light'] = None if tl is None else str(tl.get_state()).split('.')[-1].lower()
+        except Exception:
+            out['gt_light'] = None
+        # Our lateral offset from the lane centre, estimated vs true (the true
+        # one from the map -- diagnostic only).
+        out['lane_valid'] = bool(getattr(self, '_lane_valid', False))
+        est_off = core.current_d - core.lane_offset(core.current_s)
+        try:
+            wp = CarlaDataProvider.get_map().get_waypoint(loc, project_to_road=True,
+                                                          lane_type=carla.LaneType.Driving)
+            wl = wp.transform.location
+            wyaw = math.radians(wp.transform.rotation.yaw)
+            true_off = -math.sin(wyaw) * (loc.x - wl.x) + math.cos(wyaw) * (loc.y - wl.y)
+            out['lane_off_est'] = round(est_off, 2)
+            out['lane_off_true'] = round(true_off, 2)
+        except Exception:
+            pass
         return out
 
     def _sensor_stop_target(self, input_data, timestamp):
@@ -652,7 +755,7 @@ class MPCCAgent(AutonomousAgent):
         route_fl = []
         for k in range(1, 21):
             s_k = min(core.current_s + 2.0 * k, core.path_length)
-            x, y, _ = core.frenet_converter.frenet_to_world(s_k, 0.0, 0.0)
+            x, y, _ = core.frenet_converter.frenet_to_world(s_k, core.lane_offset(s_k), 0.0)
             dx, dy = x - ex, y - ey
             route_fl.append([round(cy * dx + sy * dy, 2), round(sy * dx - cy * dy, 2)])
         lead = core.mpc_controller.lead
@@ -661,7 +764,8 @@ class MPCCAgent(AutonomousAgent):
             ahead = (core._road_width_s > core.current_s) & core._route_junction
             if ahead.any():
                 jd = float(core._road_width_s[ahead].min() - core.current_s)
-        sc = dict(v=round(core.current_speed, 3), d=round(core.current_d, 3),
+        d_lane = core.current_d - core.lane_offset(core.current_s)
+        sc = dict(v=round(core.current_speed, 3), d=round(d_lane, 3),
                   gate_rule=float(core._gate_on()),
                   lead_ds=None if lead is None else round(lead[0] - core.current_s, 2),
                   lead_v=None if lead is None else round(lead[1], 2),

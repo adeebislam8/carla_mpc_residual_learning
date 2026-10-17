@@ -1635,7 +1635,7 @@ class CarlaMPCEnv(gym.Env):
             ds = s_obs - self.current_s
             if not (self.GATE_WINDOW[0] < ds < self.GATE_WINDOW[1]):
                 continue
-            if abs(d_obs) < self.GATE_LANE_M and \
+            if abs(d_obs - self.lane_offset(s_obs)) < self.GATE_LANE_M and \
                     -self.FOLLOW_STATIC_V < vs < self.GATE_PASS_V:
                 stationary = abs(vs) < self.FOLLOW_STATIC_V and abs(vd) < self.FOLLOW_STATIC_V
                 if stationary and not self._passable(i):
@@ -1693,7 +1693,34 @@ class CarlaMPCEnv(gym.Env):
             self.mpc_controller.steer_norm_deg if self.mpc_controller else 45.0)
         self.lateral_accel = self.current_speed * float(yaw_rate)
 
-    PERCEIVED_D = (-8.0, 4.5)        # road corridor kept from LiDAR tracks (route frame)
+    # ── perceived lane centre (sparse route) ────────────────────────────
+    LANE_BLEND = 0.3                 # new measurement weight per update
+    LANE_DECAY_M = 20.0              # beyond the perceived range, fade to 0
+
+    def set_lane_offsets(self, s_arr, d_arr):
+        """Lane-centre offset from the reference path, sampled at route s
+        (perception/lanes.py via the agent), blended with the previous estimate
+        so a single bad frame cannot jerk the reference."""
+        s_arr, d_arr = np.asarray(s_arr, float), np.asarray(d_arr, float)
+        if len(s_arr) < 2:
+            return
+        if getattr(self, '_lane_s', None) is not None:
+            prev = np.array([self.lane_offset(x) for x in s_arr])
+            d_arr = (1 - self.LANE_BLEND) * prev + self.LANE_BLEND * d_arr
+        self._lane_s, self._lane_d = s_arr, d_arr
+
+    def lane_offset(self, s):
+        """Perceived lane-centre offset at route s (0 without perception)."""
+        ls = getattr(self, '_lane_s', None)
+        if ls is None:
+            return 0.0
+        if s <= ls[0]:
+            return float(self._lane_d[0])
+        if s >= ls[-1]:
+            return float(self._lane_d[-1]) * max(0.0, 1.0 - (s - ls[-1]) / self.LANE_DECAY_M)
+        return float(np.interp(s, ls, self._lane_d))
+
+    PERCEIVED_D = (-8.0, 4.5)        # road corridor kept from LiDAR tracks (lane frame)
     PERCEIVED_DS = (-40.0, 120.0)
     LONG_OBJECT_M = 5.0              # split longer clusters into points along them
 
@@ -1712,13 +1739,14 @@ class CarlaMPCEnv(gym.Env):
             s_o, d_o, _ = self.frenet_converter.world_to_frenet(tr['x'], tr['y'], 0, s_hint=hint)
             hints[tr['id']] = s_o
             ds = s_o - self.current_s
-            if not (self.PERCEIVED_D[0] < d_o < self.PERCEIVED_D[1]
+            d_lane = d_o - self.lane_offset(s_o)      # relative to the perceived lane centre
+            if not (self.PERCEIVED_D[0] < d_lane < self.PERCEIVED_D[1]
                     and self.PERCEIVED_DS[0] < ds < self.PERCEIVED_DS[1]):
                 continue
             s2, d2, _ = self.frenet_converter.world_to_frenet(
                 tr['x'] + 0.5 * tr['vx'], tr['y'] + 0.5 * tr['vy'], 0, s_hint=s_o)
             vs, vd = (s2 - s_o) / 0.5, (d2 - d_o) / 0.5
-            perceived.append(dict(type=tr['type'], ds=round(ds, 2), d=round(d_o, 2),
+            perceived.append(dict(type=tr['type'], ds=round(ds, 2), d=round(d_lane, 2),
                                   vs=round(vs, 2), vd=round(vd, 2),
                                   stopped_for=round(float(tr['stopped_for']), 2)))
             pts = [(s_o, d_o)]

@@ -123,6 +123,9 @@ class MPCController:
         # Extra speed cap (m/s) for every stage, e.g. the tactical student's
         # 'slow down'; None = none.
         self.v_cap = None
+        # Lane-centre offset from the path as a function of s (perception),
+        # per stage into OCP parameter 14 and the corridor; None = 0.
+        self.n_lane_fn = None
         self.recover_margin = 0.5         # m OUTSIDE the corridor before it fires
         #
         # NOTE: this used to trigger on abs(n) > 2.5, which collided exactly with
@@ -289,7 +292,11 @@ class MPCController:
             o[valid_mask] += np.asarray(obstacle_vel, dtype=float)[valid_mask] * (dt_stage * k)
             return o
 
-        self.acados_solver.set(0, "p", np.append(obstacles_at(0).flatten(), self.gate_on))
+        def n_lane_at(s_q):
+            return float(self.n_lane_fn(s_q)) if self.n_lane_fn is not None else 0.0
+
+        self.acados_solver.set(0, "p", np.append(obstacles_at(0).flatten(),
+                                                 [self.gate_on, n_lane_at(s)]))
         
         # 6. Count valid obstacles (those with s > -50)
         valid_obs_count = np.sum(obstacles[:, 0] > -50)
@@ -331,6 +338,11 @@ class MPCController:
             
             # Add safety margin
             
+            # Perceived lane centre (sparse route): the corridor moves with it.
+            n_lane_i = n_lane_at(s + max(v, 0.0) * dt_stage * i)
+            n_min_adaptive += n_lane_i
+            n_max_adaptive += n_lane_i
+
             # Clamp to reasonable values
             n_min_adaptive = max(n_min_adaptive, -10.0)
             n_max_adaptive = min(n_max_adaptive, 10.0)
@@ -429,7 +441,8 @@ class MPCController:
             self.acados_solver.constraints_set(i, "uh", uh_constraints)
 
             # Set obstacle parameters for this timestep
-            self.acados_solver.set(i, "p", np.append(obstacles_at(i).flatten(), self.gate_on))
+            self.acados_solver.set(i, "p", np.append(obstacles_at(i).flatten(),
+                                                     [self.gate_on, n_lane_i]))
 
             if i == 1:  # keep one representative stage for the diagnostics
                 diag_lh, diag_uh = lh_constraints, uh_constraints
@@ -730,7 +743,7 @@ class MPCController:
         # ACADOS uses the spline coefficients as parameters
         # We just need to update them in the solver at each stage
         for i in range(self.N + 1):
-            self.acados_solver.set(i, "p", np.append(np.zeros(12), 1.0))  # reset params first
+            self.acados_solver.set(i, "p", np.append(np.zeros(12), [1.0, 0.0]))  # reset params first
         
         # Update the kapparef in the model so dynamics use new path
         self.model.kapparef_s = kappa_spline
