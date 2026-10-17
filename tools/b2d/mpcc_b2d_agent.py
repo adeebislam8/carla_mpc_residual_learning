@@ -179,6 +179,32 @@ def densify_route(nodes, spacing=1.0):
     return pts.tolist(), idx_map[seg].tolist()
 
 
+def route_sag_bound(nodes, margin=1.0, cap=5.0):
+    """Per node segment: how far the real lane can lie from the densified
+    route.  A chord of length L between nodes on a road turning by dtheta per
+    chord misses the arc by its sagitta ~ L * dtheta / 8 (R60 bend, 45 m nodes:
+    4.2 m, as measured).  The perceived lane correction is clipped to this, so
+    on a straight a mis-tracked lane cannot drag the car across lanes."""
+    P0 = np.asarray(nodes, dtype=float)
+    keep = np.r_[True, np.hypot(*np.diff(P0, axis=0).T) > 0.5]     # as densify_route
+    P, idx_map = P0[keep], np.nonzero(keep)[0]
+    n = len(P)
+    if n < 2:
+        return [margin] * max(len(P0), 1)
+    v = np.diff(P, axis=0)
+    L = np.hypot(v[:, 0], v[:, 1])
+    h = np.arctan2(v[:, 1], v[:, 0])
+    turn = np.abs((np.diff(h) + np.pi) % (2 * np.pi) - np.pi)       # at inner nodes
+    out = []
+    for k in range(n - 1):
+        dth = max(turn[k - 1] if k >= 1 else 0.0, turn[k] if k < len(turn) else 0.0)
+        out.append(float(min(cap, margin + L[k] * dth / 8.0)))
+    out.append(out[-1])
+    # back to ORIGINAL node indices (densify_route's seg ids)
+    pos = np.clip(np.searchsorted(idx_map, np.arange(len(P0)), side='right') - 1, 0, n - 1)
+    return [out[p] for p in pos]
+
+
 def _road_width(wp, junction_margin=4.0):
     """Same corridor rule as PathPlanner.get_road_width_at_waypoint, without
     building a GlobalRoutePlanner (slow on Town12/13)."""
@@ -318,11 +344,15 @@ class MPCCAgent(AutonomousAgent):
             nodes = [(tf.location.x, tf.location.y) for tf, _ in self._global_plan_world_coord]
             ncmd = [int(getattr(cm, 'value', cm)) for _, cm in self._global_plan_world_coord]
             dense, seg = densify_route(nodes)
+            nb = route_sag_bound(nodes)
             self._dense_route_used = []
+            lane_bound = []
             for (x, y), k in zip(dense, seg):
                 pts.append((x, y))
                 cmds.append(ncmd[k])
                 wps.append(None)
+                lane_bound.append(nb[k])
+            self._lane_bound = np.array(lane_bound)
         for tf, cmd in ([] if c['sparse_route'] else self._dense_route):
             p = (tf.location.x, tf.location.y)
             if pts and math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) < 0.5:
@@ -671,8 +701,10 @@ class MPCCAgent(AutonomousAgent):
             wx, wy = ex + cy * xv - sy * yv, ey + sy * xv + cy * yv
             s_q, d_q, _ = core.frenet_converter.world_to_frenet(wx, wy, 0, s_hint=core.current_s + xv)
             ss.append(s_q)
-            # (bounded: the spline's sag on a bend is <= ~4 m)
-            dd.append(0.0 if core._in_junction(s_q) else float(np.clip(d_q, -5.0, 5.0)))
+            # Bounded by how wrong the sparse route can be here (route_sag_bound)
+            j = min(int(np.searchsorted(self._route_s, s_q)), len(self._lane_bound) - 1)
+            b = self._lane_bound[j]
+            dd.append(0.0 if core._in_junction(s_q) else float(np.clip(d_q, -b, b)))
         if len(ss) >= 2 and np.all(np.diff(ss) > 0):
             core.set_lane_offsets(ss, dd)
 
