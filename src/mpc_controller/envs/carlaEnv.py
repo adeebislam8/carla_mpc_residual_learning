@@ -369,6 +369,12 @@ class CarlaMPCEnv(gym.Env):
         # Construction 2->0/5, overtaking 48.9->33.3%) -- a geometric rule cannot
         # tell an accident from a traffic jam.
         self.rules_queue = rules_queue
+        # Tactical student hooks (src/student/tactical.py), set per tick by the
+        # driver: gate_scale multiplies the overtake gate (1 = no effect);
+        # tactical_wait makes every stationary in-lane obstacle a lead to stop
+        # behind (the student said 'wait, do not pass now').
+        self.gate_scale = 1.0
+        self.tactical_wait = False
         self.selected_obstacle_stopped = np.full(num_obstacles, np.inf)
         self._route_junction = None      # bool per road-width sample
         self._stop_lines_s = []          # route s of stop lines (set by the B2D agent)
@@ -1448,7 +1454,7 @@ class CarlaMPCEnv(gym.Env):
         controller inside the leaderboard's own world loop.  Call after
         _update_vehicle_state() and _detect_obstacles()."""
         self.mpc_controller.lead = self._lead_in_lane() if self.follow else None
-        self.mpc_controller.gate_on = self._gate_on()
+        self.mpc_controller.gate_on = self._gate_on() * float(self.gate_scale)
         # _t_mpc_start = time.perf_counter()
         mpc_throttle, mpc_steering = self.mpc_controller.solve(
             s=self.current_s,
@@ -1544,6 +1550,8 @@ class CarlaMPCEnv(gym.Env):
         """Is stationary obstacle i one to drive around?  Baseline: always (the
         minimal rule).  behavior_rules: only a long-stopped one outside
         junctions that is not queued before a stop line."""
+        if self.tactical_wait:
+            return False                    # the student said: wait behind it
         if not self.behavior_rules:
             return True
         s_obs = self.selected_obstacles[i][0]

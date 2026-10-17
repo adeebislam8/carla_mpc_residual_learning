@@ -10,6 +10,8 @@
 #   base     tools/b2d/config_mpcc.json         MPCC + physics fixes, minimal pass rule
 #   rules    tools/b2d/config_rules.json        + hand-coded decision rules
 #   rulesq   tools/b2d/config_rules_queue.json  + queue rule (brittleness ablation)
+#   tactical tools/b2d/config_tactical.json     rules + the distilled go/slow student
+#   <name>   tools/b2d/config_<name>.json       any other config
 # Results: results/b2d/<arm>_<SET>/ ; each arm resumes if re-run.
 #
 # PARALLEL=1: each arm gets its own CARLA server and ports (30000+100*k,
@@ -78,3 +80,6 @@ for ARM in $ARMS; do
   echo; echo "################ $ARM ($SET)"
   TAG=$ARM ./tools/b2d/run_b2d.sh score "$SET"
 done
+# Every arm ever run on this set (not just these), per scenario type.
+echo; echo "################ side by side"
+python3 tools/b2d/compare_arms.py --set "$SET" --csv "results/b2d/compare_${SET}.csv"

@@ -38,7 +38,15 @@ Config (JSON, all optional):
   predict_obstacles (true: CBF uses constant-velocity obstacle positions),
   gate_mode ('pass_slow': overtake only stationary/slow cars in our lane),
   full_brake (true: D down to -1), breakaway (true: >= 0.45 throttle from rest
-  on a clear path), behavior_rules (false: the hand-coded decision-layer arm)
+  on a clear path), behavior_rules (false: the hand-coded decision-layer arm),
+  record (false: write ORION's 6 cameras + meta for offline labelling to
+  $B2D_RECORD_DIR/<route>/, the layout tools/orion/orion_infer.py reads),
+  tactical (null | dir: the go/slow student, src/student/tactical.py),
+  scene_radius_m (110: actors kept for the tactical scene)
+
+Recording uses ORION's own Bench2Drive sensor rig (team_code/orion_b2d_agent.py)
+and its RoutePlanner command logic, so the teacher sees exactly its training
+inputs; images are JPEG quality 20, as ORION's agent re-encodes them.
 """
 
 import json
@@ -64,12 +72,49 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 authority_horizon=10, residual_window=None, obstacle_radius_m=45.0,
                 stall_kick='clear', follow=True, predict_obstacles=True,
                 gate_mode='pass_slow', full_brake=True, breakaway=True,
-                behavior_rules=False, rules_queue=False)
+                behavior_rules=False, rules_queue=False,
+                record=False, tactical=None, scene_radius_m=110.0)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
 # made the MPCC 'overtake' it into the opposite lane at 13 m/s (ot_eb traces).
 DRIVABLE_PROPS = ('dirtdebris',)
+
+# ORION's Bench2Drive sensor rig, verbatim (team_code/orion_b2d_agent.py).
+ORION_CAMS = [
+    ('CAM_FRONT', 0.80, 0.0, 0.0, 70), ('CAM_FRONT_LEFT', 0.27, -0.55, -55.0, 70),
+    ('CAM_FRONT_RIGHT', 0.27, 0.55, 55.0, 70), ('CAM_BACK', -2.0, 0.0, 180.0, 110),
+    ('CAM_BACK_LEFT', -0.32, -0.55, -110.0, 70), ('CAM_BACK_RIGHT', -0.32, 0.55, 110.0, 70)]
+JPEG_QUALITY = 20
+
+
+class RoutePlanner:
+    """ORION's RoutePlanner (Bench2DriveZoo team_code/planner.py) on world
+    coordinates: pops route nodes within min_distance, returns the current and
+    next node with their RoadOption -- the 'command' / 'near_xy' ORION uses."""
+
+    def __init__(self, plan_world, min_distance=4.0, max_distance=50.0):
+        from collections import deque
+        self.route = deque((np.array([tf.location.x, tf.location.y]), cmd)
+                           for tf, cmd in plan_world)
+        self.min_distance, self.max_distance = min_distance, max_distance
+
+    def run_step(self, pos):
+        if len(self.route) == 1:
+            return self.route[0], self.route[0]
+        to_pop, farthest, cum = 0, -np.inf, 0.0
+        for i in range(1, len(self.route)):
+            if cum > self.max_distance:
+                break
+            cum += np.linalg.norm(self.route[i][0] - self.route[i - 1][0])
+            dist = np.linalg.norm(self.route[i][0] - pos)
+            if dist <= self.min_distance and dist > farthest:
+                farthest, to_pop = dist, i
+        for _ in range(to_pop):
+            if len(self.route) > 2:
+                self.route.popleft()
+        return self.route[0], self.route[1]
+
 
 # Comfortable stopping deceleration for the rule layer, m/s^2.
 RULE_DECEL = 4.0
@@ -117,6 +162,11 @@ class MPCCAgent(AutonomousAgent):
                 raise FileNotFoundError(f'agent config {path_to_conf_file!r} not found')
             with open(path_to_conf_file) as f:
                 self.cfg.update(json.load(f))
+        # Model paths in a config are relative to the repo (the evaluator runs
+        # from the Bench2Drive dir).
+        for key in ('student', 'tactical'):
+            if self.cfg.get(key) and not os.path.isabs(self.cfg[key]):
+                self.cfg[key] = os.path.join(_REPO, self.cfg[key])
         print(f'[MPCCAgent] config {path_to_conf_file}: {self.cfg}', flush=True)
         self.core = None
         self.policy = None
@@ -131,11 +181,39 @@ class MPCCAgent(AutonomousAgent):
         # Per-step trace -> <B2D_TRACE_DIR>/route_<n>.csv + .png (run_b2d.sh sets it)
         self.trace = []
         self.trace_dir = os.environ.get('B2D_TRACE_DIR')
+        # Recording for ORION labelling, and the tactical student.
+        self.rec_dir, self.rec_meta, self.rec_obs = None, None, []
+        if self.cfg['record']:
+            root = os.environ.get('B2D_RECORD_DIR')
+            if not root:
+                raise RuntimeError("config 'record': true needs B2D_RECORD_DIR")
+            name = '_'.join((self.route_name or f'route_{int(time.time())}').split('_')[:5])
+            self.rec_dir = os.path.join(root, name)
+            for cam, *_ in ORION_CAMS:
+                os.makedirs(os.path.join(self.rec_dir, cam), exist_ok=True)
+            self.rec_meta = open(os.path.join(self.rec_dir, 'meta.jsonl'), 'w')
+        self.tactical = None
+        if self.cfg['tactical']:
+            from student.tactical import TacticalPolicy
+            self.tactical = TacticalPolicy(self.cfg['tactical'])
+        self._planner = None
+        self.n_go = self.n_wait = self.n_slow = 0
 
     def sensors(self):
         # Ground-truth obstacles come from the world; the speedometer keeps the
         # leaderboard's sensor interface (and its sync wait) happy.
-        return [{'type': 'sensor.speedometer', 'reading_frequency': 20, 'id': 'SPEED'}]
+        speed = [{'type': 'sensor.speedometer', 'reading_frequency': 20, 'id': 'SPEED'}]
+        if not self.cfg.get('record'):
+            return speed
+        cams = [{'type': 'sensor.camera.rgb', 'x': x, 'y': y, 'z': 1.60,
+                 'roll': 0.0, 'pitch': 0.0, 'yaw': yaw,
+                 'width': 1600, 'height': 900, 'fov': fov, 'id': cid}
+                for cid, x, y, yaw, fov in ORION_CAMS]
+        return cams + [
+            {'type': 'sensor.other.imu', 'x': -1.4, 'y': 0.0, 'z': 0.0, 'roll': 0.0,
+             'pitch': 0.0, 'yaw': 0.0, 'sensor_tick': 0.05, 'id': 'IMU'},
+            {'type': 'sensor.other.gnss', 'x': -1.4, 'y': 0.0, 'z': 0.0, 'roll': 0.0,
+             'pitch': 0.0, 'yaw': 0.0, 'sensor_tick': 0.01, 'id': 'GPS'}] + speed
 
     def set_global_plan(self, global_plan_gps, global_plan_world_coord):
         super().set_global_plan(global_plan_gps, global_plan_world_coord)
@@ -208,6 +286,7 @@ class MPCCAgent(AutonomousAgent):
                                         support_sigma=c['support_sigma'],
                                         axes=c['student_axes'])
             self.policy.attach(core)
+        self._planner = RoutePlanner(self._global_plan_world_coord)
         if c['traffic_rules']:
             self._index_traffic_rules(world)
             # Stop-line context for the behavior_rules arm (queued traffic).
@@ -239,6 +318,8 @@ class MPCCAgent(AutonomousAgent):
         world = CarlaDataProvider.get_world()
         ego = self.hero_actor.get_location()
         r = self.cfg['obstacle_radius_m']
+        if self.cfg['record'] or self.tactical is not None:
+            r = max(r, self.cfg['scene_radius_m'])
         alive = {}
         for a in world.get_actors():
             t = a.type_id
@@ -308,10 +389,23 @@ class MPCCAgent(AutonomousAgent):
                                       else core.current_s + stop_ds)
         core.mpc_controller.stop_margin = STOP_LINE_MARGIN_M
 
+        scene = None
+        if self.cfg['record'] or self.tactical is not None:
+            scene = self._scene(stop_ds)
+        if self.tactical is not None:
+            go, slow = self.tactical.step(scene)
+            blocked = scene.get('_blocker') is not None
+            core.gate_scale = 1.0 if go else 0.0
+            core.tactical_wait = (not go) and blocked
+            core.mpc_controller.v_cap = max(core.current_speed - 2.0, 0.0) if slow else None
+            self.n_go += int(go and blocked)
+            self.n_wait += int((not go) and blocked)
+            self.n_slow += int(slow)
+
         action = np.zeros(2)
         if self.policy is not None:
             action = self.policy.predict(core._get_observation())[0]
-        _, _, thr, steer = core._compute_final_action(action)
+        u_nom_thr, u_nom_steer, thr, steer = core._compute_final_action(action)
 
         # Last resort only: the soft OCP still carrying speed into the line.
         if stop_ds is not None and stop_ds - STOP_LINE_MARGIN_M < 2.0 \
@@ -326,6 +420,8 @@ class MPCCAgent(AutonomousAgent):
             control.throttle, control.brake = 0.0, float(-thr)
         control.steer = float(-steer)            # env convention (carlaEnv.step)
         self.t_control.append(time.perf_counter() - t0)
+        if self.rec_dir is not None:
+            self._record(input_data, scene, (u_nom_thr, u_nom_steer), (thr, steer))
         if self.trace_dir:
             lead = core.mpc_controller.lead
             loc = self.hero_actor.get_location()
@@ -390,8 +486,98 @@ class MPCCAgent(AutonomousAgent):
             print(f'[MPCCAgent] trace plot failed: {e}', flush=True)
         print(f'[MPCCAgent] trace -> {stem}.csv', flush=True)
 
+    def _scene(self, stop_ds):
+        """The tactical scene (src/student/tactical.py) for this tick: every
+        kept actor in ego-relative Frenet terms, and the route ahead in the ego
+        frame (for labelling ORION's plan against)."""
+        core = self.core
+        tf = self.hero_actor.get_transform()
+        yaw = math.radians(tf.rotation.yaw)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        ex, ey = tf.location.x, tf.location.y
+        acts = []
+        for npc in self._actors.values():
+            a = npc.get('actor')
+            if a is None or npc.get('s') is None:
+                continue
+            loc, vel = a.get_location(), a.get_velocity()
+            s_o, d_o, _ = core.frenet_converter.world_to_frenet(loc.x, loc.y, 0, s_hint=npc['s'])
+            s2, d2, _ = core.frenet_converter.world_to_frenet(
+                loc.x + 0.5 * vel.x, loc.y + 0.5 * vel.y, 0, s_hint=s_o)
+            if math.hypot(vel.x, vel.y) > 1.0:
+                npc['last_moving_step'] = self.n_steps
+            lm = npc.get('last_moving_step')
+            acts.append(dict(type=a.type_id, ds=round(s_o - core.current_s, 2), d=round(d_o, 2),
+                             vs=round((s2 - s_o) / 0.5, 2), vd=round((d2 - d_o) / 0.5, 2),
+                             stopped_for=99.0 if lm is None else round((self.n_steps - lm) * 0.05, 2)))
+        route_fl = []
+        for k in range(1, 21):
+            s_k = min(core.current_s + 2.0 * k, core.path_length)
+            x, y, _ = core.frenet_converter.frenet_to_world(s_k, 0.0, 0.0)
+            dx, dy = x - ex, y - ey
+            route_fl.append([round(cy * dx + sy * dy, 2), round(sy * dx - cy * dy, 2)])
+        lead = core.mpc_controller.lead
+        jd = None
+        if core._route_junction is not None:
+            ahead = (core._road_width_s > core.current_s) & core._route_junction
+            if ahead.any():
+                jd = float(core._road_width_s[ahead].min() - core.current_s)
+        sc = dict(v=round(core.current_speed, 3), d=round(core.current_d, 3),
+                  gate_rule=float(core._gate_on()),
+                  lead_ds=None if lead is None else round(lead[0] - core.current_s, 2),
+                  lead_v=None if lead is None else round(lead[1], 2),
+                  stop_ds=None if stop_ds is None else round(stop_ds, 2),
+                  junction_ds=jd, actors=acts, route_fl=route_fl)
+        from student.tactical import blocker_info
+        sc['_blocker'] = blocker_info(sc)
+        return sc
+
+    def _record(self, input_data, scene, u_nom, u_final):
+        """One frame in tools/orion/orion_infer.py's episode layout, plus the
+        tactical scene and the MPCC's own action for the student."""
+        import cv2
+        step = self.n_steps
+        for cam, *_ in ORION_CAMS:
+            img = input_data[cam][1][:, :, :3]
+            cv2.imwrite(os.path.join(self.rec_dir, cam, f'{step:06d}.jpg'), img,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        imu = input_data['IMU'][1]
+        loc = self.hero_actor.get_location()
+        (_, cmd), (near, _) = self._planner.run_step(np.array([loc.x, loc.y]))
+        sc = {k: v for k, v in scene.items() if not k.startswith('_')}
+        rec = dict(step=step, x=float(loc.x), y=float(loc.y), compass=float(imu[-1]),
+                   speed=float(input_data['SPEED'][1]['speed']),
+                   accel=[float(v) for v in imu[:3]], gyro=[float(v) for v in imu[3:6]],
+                   command=int(getattr(cmd, 'value', cmd)),
+                   near_xy=[float(near[0]), float(near[1])],
+                   s=float(self.core.current_s), d=float(self.core.current_d),
+                   alpha=float(self.core.current_alpha),
+                   u_nom=[float(u_nom[0]), float(u_nom[1])],
+                   u_final=[float(u_final[0]), float(u_final[1])], scene=sc)
+        self.rec_meta.write(json.dumps(rec) + '\n')
+        self.rec_obs.append(np.asarray(self.core._get_observation(), dtype=np.float32))
+
+    def _close_recording(self):
+        if self.rec_meta is not None:
+            self.rec_meta.close()
+            self.rec_meta = None
+            if self.rec_obs:
+                np.save(os.path.join(self.rec_dir, 'obs.npy'), np.stack(self.rec_obs))
+            with open(os.path.join(self.rec_dir, 'summary.json'), 'w') as f:
+                json.dump({'route': self.route_name, 'frames': len(self.rec_obs),
+                           'outcome': None, 'driver': 'mpcc' if self.tactical is None
+                           else 'tactical', 'flags': self.cfg}, f, indent=2, default=str)
+            print(f'[MPCCAgent] recorded {len(self.rec_obs)} frames -> {self.rec_dir}', flush=True)
+
     def destroy(self):
         # Also runs when setup() failed half-way: nothing may be assumed set.
+        try:
+            self._close_recording()
+        except Exception as e:
+            print(f'[MPCCAgent] closing recording failed: {e}', flush=True)
+        if getattr(self, 'tactical', None) is not None:
+            print(f'[MPCCAgent] tactical: go {self.n_go} / wait {self.n_wait} ticks with a '
+                  f'blocker, slow {self.n_slow} ticks', flush=True)
         if getattr(self, 'trace_dir', None) and getattr(self, 'trace', None):
             try:
                 self._write_trace()

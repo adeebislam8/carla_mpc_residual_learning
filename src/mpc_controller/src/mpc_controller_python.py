@@ -120,6 +120,9 @@ class MPCController:
         # 1.0 = original: pull toward the passing lane for any obstacle in the
         # gate window.  The env lowers it for traffic that should be followed.
         self.gate_on = 1.0
+        # Extra speed cap (m/s) for every stage, e.g. the tactical student's
+        # 'slow down'; None = none.
+        self.v_cap = None
         self.recover_margin = 0.5         # m OUTSIDE the corridor before it fires
         #
         # NOTE: this used to trigger on abs(n) > 2.5, which collided exactly with
@@ -380,6 +383,8 @@ class MPCController:
                 room = s_lead + v_lead * dt_stage * i - gap - s_cap
                 v_stage_max = min(v_stage_max, float(np.sqrt(
                     v_lead ** 2 + 2.0 * self.follow_decel * max(room, 0.0))))
+            if self.v_cap is not None:
+                v_stage_max = min(v_stage_max, float(self.v_cap))
             if self.stop_s is None and self.lead is None:
                 v_stage_max = max(v_stage_max, 1.0)   # never demand a full stop
 

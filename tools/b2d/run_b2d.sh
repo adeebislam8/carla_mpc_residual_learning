@@ -39,6 +39,9 @@ if [ "$SET" = "score" ]; then
 fi
 
 mkdir -p "$OUT" "$REPO/tools/b2d/routes"     # not for 'score' (made empty *_score dirs)
+if [ -f "$ROUTES" ] && [ "$SET" != "smoke" ] && [ "$SET" != "ot_eb" ] && [ "$SET" != "full" ]; then
+  : # a prepared routes file tools/b2d/routes/<SET>.xml (e.g. train_clips)
+else
 case "$SET" in
   smoke) [ -f "$ROUTES" ] || python3 "$REPO/tools/b2d/make_subset.py" --b2d "$B2D" \
            --ability Overtaking --per-type 1 --out "$ROUTES" ;;
@@ -51,6 +54,7 @@ case "$SET" in
          [ -f "$ROUTES" ] || python3 "$REPO/tools/b2d/make_subset.py" --b2d "$B2D" \
            --types $TYPES --out "$ROUTES" ;;
 esac
+fi
 
 cd "$B2D"
 export PYTHONPATH=$CARLA_ROOT/PythonAPI:$CARLA_ROOT/PythonAPI/carla:$B2D/leaderboard:$B2D/scenario_runner:$REPO/src:${PYTHONPATH:-}
@@ -65,7 +69,7 @@ cat > "$OUT/eval_cmd.sh" <<EOS
 cd "$B2D"
 export PYTHONPATH="$PYTHONPATH" SCENARIO_RUNNER_ROOT="$SCENARIO_RUNNER_ROOT" \\
        LEADERBOARD_ROOT="$LEADERBOARD_ROOT" IS_BENCH2DRIVE=True PYTHONNOUSERSITE=1 \\
-       CARLA_ROOT="$CARLA_ROOT" B2D_TRACE_DIR="$OUT/traces"
+       CARLA_ROOT="$CARLA_ROOT" B2D_TRACE_DIR="$OUT/traces" B2D_RECORD_DIR="$OUT/rec"
 exec python "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py" \\
   --routes="$ROUTES" --repetitions=1 --track=SENSORS \\
   --checkpoint="$OUT/eval.json" \\
