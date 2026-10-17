@@ -43,13 +43,14 @@ def main():
     conf = collections.Counter()
     lane_err_all, lane_valid_all = [], []
     print(f"{'route':48s} {'pose med/p95':>13s} {'det':>5s} {'miss':>5s} {'phan':>5s} {'rngerr':>7s}"
-          f" {'lane ok':>8s} {'lat med/p95':>12s}")
+          f" {'lane ok':>8s} {'lat med/p95':>12s} {'R/Y/unk':>12s}")
     for p in files:
         rows = list(csv.DictReader(open(p)))
         if not rows or 'gt_ds' not in rows[0]:
             continue
         c, pose, err = collections.Counter(), [], []
         lane_err, lane_valid = [], []
+        rl = collections.Counter(r.get('light') or 'none' for r in rows)
         for r in rows:
             if 'lane_valid' in r and r['lane_valid'] not in ('', None):
                 lane_valid.append(r['lane_valid'] == 'True')
@@ -76,7 +77,8 @@ def main():
               f"{np.median(err) if err else float('nan'):6.2f} "
               f"{100 * np.mean(lane_valid) if lane_valid else float('nan'):7.0f}% "
               f"{np.median(lane_err) if lane_err else float('nan'):5.2f}/"
-              f"{np.percentile(lane_err, 95) if lane_err else float('nan'):5.2f}")
+              f"{np.percentile(lane_err, 95) if lane_err else float('nan'):5.2f} "
+              f"{rl['red']:>4d}/{rl['yellow']}/{rl['unknown']}")
         tot.update(c)
         pose_all += pose
         err_all += err

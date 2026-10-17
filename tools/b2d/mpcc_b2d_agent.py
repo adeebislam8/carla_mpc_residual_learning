@@ -345,6 +345,7 @@ class MPCCAgent(AutonomousAgent):
             # No HD map: the MPCC's fixed two-lane corridor; junctions from the
             # route's own commands (RoadOption LEFT/RIGHT/STRAIGHT = 1/2/3).
             core._road_widths = None
+            self._route_s, self._route_cmds = np.array(ws), np.array(cmds)
             core._route_junction = np.array([cm in (1, 2, 3) for cm in cmds])
             j = core._route_junction
             self._junction_entries = [float(ws[i]) for i in range(len(j))
@@ -390,6 +391,20 @@ class MPCCAgent(AutonomousAgent):
             self._stop_sign_seen_t = -1e9
             # Stop-line context for the rules arm: every junction entry.
             core._stop_lines_s = list(self._junction_entries)
+            # DIAGNOSTIC ONLY (_perception_check), never read by control: the
+            # dense lane-centre route (true lane offset) and the lights whose
+            # stop lines are on our route (true light state).
+            self._diag_fc = None
+            if c['sparse_route']:
+                dp = []
+                for tf, _ in self._dense_route:
+                    p = (tf.location.x, tf.location.y)
+                    if not dp or math.hypot(p[0] - dp[-1][0], p[1] - dp[-1][1]) >= 0.5:
+                        dp.append(p)
+                self._diag_fc = FrenetConverter(dp)
+            self._index_traffic_rules(world)
+            self._diag_lights, self._rule_lights = self._rule_lights, []
+            self._rule_signs = []
         elif c['traffic_rules']:
             self._index_traffic_rules(world)
             # Stop-line context for the behavior_rules arm (queued traffic).
@@ -403,7 +418,9 @@ class MPCCAgent(AutonomousAgent):
             for wp in tl.get_stop_waypoints():
                 loc = wp.transform.location
                 s, d, _ = fc.world_to_frenet(loc.x, loc.y, 0)
-                if abs(d) < 2.0 and 0.0 < s < self.core.path_length:
+                # (4 m on the sparse spline: it sags up to ~4 m on bends)
+                if abs(d) < (4.0 if self.cfg['sparse_route'] else 2.0) \
+                        and 0.0 < s < self.core.path_length:
                     self._rule_lights.append((float(s), tl))
         for st in world.get_actors().filter('traffic.stop'):
             x, y = _local_to_world(st.get_transform(), st.trigger_volume.location)
@@ -616,16 +633,37 @@ class MPCCAgent(AutonomousAgent):
         tracks = self._lidar.update(input_data['LIDAR'][1], (x, y, yaw), timestamp)
         core._set_obstacles_from_tracks(tracks)
 
+    LANE_JUMP_M = 1.75        # half a lane: a fit further from the tracked lane is rejected
+    LANE_REACQUIRE = 10       # consecutive rejected YOLOP frames (~1 s) -> re-anchor to route
+
     def _update_lane(self, img, ex, ey, yaw):
         """YOLOP lane centre (vehicle frame) -> offset from the spline route,
         sampled along it; inside junctions the spline itself is the reference
         (no lane markings there)."""
         core = self.core
-        est = self._lanes.update(img)
+        # Track ONE lane: search where the tracked lane's centre should be now
+        # (vehicle-frame y = its offset from the route - ours), so it keeps its
+        # identity while we pass beside it.  Re-anchor to the route (y = -d)
+        # on route lane-change segments (RoadOption 5/6), at start, and after
+        # ~1 s of rejected fits.
+        i = min(int(np.searchsorted(self._route_s, core.current_s + 10.0)), len(self._route_cmds) - 1)
+        lane_change = self._route_cmds[i] in (5, 6)
+        lost = getattr(self, '_lane_rejects', 0) >= self.LANE_REACQUIRE
+        if getattr(core, '_lane_s', None) is None or lane_change or lost:
+            ref0 = -core.current_d
+        else:
+            ref0 = core.lane_offset(core.current_s) - core.current_d
+        est = self._lanes.update(img, ref0=ref0)
         self._lane_valid = bool(est.get('valid'))
-        if not self._lane_valid:
+        if not self._lane_valid or not est.get('fresh'):
             return
         c0, c1, c2 = est['coeffs']
+        x_near = max(est['x_min'], 6.0)
+        if abs(c0 + c1 * x_near + c2 * x_near ** 2 - ref0) > self.LANE_JUMP_M:
+            self._lane_rejects = getattr(self, '_lane_rejects', 0) + 1
+            self._lane_valid = False
+            return
+        self._lane_rejects = 0
         cy, sy = math.cos(yaw), math.sin(yaw)
         ss, dd = [], []
         for xv in np.arange(max(est['x_min'], 4.0), min(est['x_max'], 35.0), 2.5):
@@ -633,7 +671,8 @@ class MPCCAgent(AutonomousAgent):
             wx, wy = ex + cy * xv - sy * yv, ey + sy * xv + cy * yv
             s_q, d_q, _ = core.frenet_converter.world_to_frenet(wx, wy, 0, s_hint=core.current_s + xv)
             ss.append(s_q)
-            dd.append(0.0 if core._in_junction(s_q) else d_q)
+            # (bounded: the spline's sag on a bend is <= ~4 m)
+            dd.append(0.0 if core._in_junction(s_q) else float(np.clip(d_q, -5.0, 5.0)))
         if len(ss) >= 2 and np.all(np.diff(ss) > 0):
             core.set_lane_offsets(ss, dd)
 
@@ -673,22 +712,29 @@ class MPCCAgent(AutonomousAgent):
         out['gt_d'] = None if g is None else g[1]
         out['gt_type'] = None if g is None else g[2]
         out['light'] = (self._tl.last.get('light') if self._tl is not None else None)
-        # True state of the light governing us (simulator; diagnostic only).
-        try:
-            tl = self.hero_actor.get_traffic_light()
-            out['gt_light'] = None if tl is None else str(tl.get_state()).split('.')[-1].lower()
-        except Exception:
-            out['gt_light'] = None
-        # Our lateral offset from the lane centre, estimated vs true (the true
-        # one from the map -- diagnostic only).
+        # True state of the next light on our route whose stop line is <= 60 m
+        # ahead (simulator; diagnostic only).  (hero.get_traffic_light() is
+        # set only inside the trigger box -- it read 'none' on every tick.)
+        nxt = [(s_l - s_ego, tl) for s_l, tl in getattr(self, '_diag_lights', [])
+               if -1.0 < s_l - s_ego < 60.0]
+        out['gt_light'] = (str(min(nxt, key=lambda r: r[0])[1].state).split('.')[-1].lower()
+                           if nxt else None)
+        # Our lateral offset from the ROUTE's lane centre, estimated vs true.
+        # True = offset from the dense lane-centre route (not the nearest map
+        # lane: that switches lanes with us when we pass, hiding lane-tracking
+        # failures).
         out['lane_valid'] = bool(getattr(self, '_lane_valid', False))
         est_off = core.current_d - core.lane_offset(core.current_s)
         try:
-            wp = CarlaDataProvider.get_map().get_waypoint(loc, project_to_road=True,
-                                                          lane_type=carla.LaneType.Driving)
-            wl = wp.transform.location
-            wyaw = math.radians(wp.transform.rotation.yaw)
-            true_off = -math.sin(wyaw) * (loc.x - wl.x) + math.cos(wyaw) * (loc.y - wl.y)
+            if getattr(self, '_diag_fc', None) is not None:
+                self._diag_s, true_off, _ = self._diag_fc.world_to_frenet(
+                    loc.x, loc.y, 0, s_hint=getattr(self, '_diag_s', None))
+            else:
+                wp = CarlaDataProvider.get_map().get_waypoint(loc, project_to_road=True,
+                                                              lane_type=carla.LaneType.Driving)
+                wl = wp.transform.location
+                wyaw = math.radians(wp.transform.rotation.yaw)
+                true_off = -math.sin(wyaw) * (loc.x - wl.x) + math.cos(wyaw) * (loc.y - wl.y)
             out['lane_off_est'] = round(est_off, 2)
             out['lane_off_true'] = round(true_off, 2)
         except Exception:

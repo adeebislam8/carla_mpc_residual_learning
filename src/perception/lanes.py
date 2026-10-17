@@ -72,8 +72,12 @@ class CameraGeometry:
         return u, v
 
 
-def fit_lane_centre(X, Y, x_bins=(4.0, 36.0, 2.0), lane_width=3.5, gap=0.8):
-    """Lane-line ground points -> quadratic of the ego-lane centre, right(x)."""
+def fit_lane_centre(X, Y, x_bins=(4.0, 36.0, 2.0), lane_width=3.5, gap=0.8, ref0=0.0):
+    """Lane-line ground points -> quadratic of the TRACKED lane's centre,
+    right(x).  ref0 = where that lane's centre is expected near the car
+    (vehicle-frame y): 0 = the lane the car is in; the caller passes the
+    previous estimate so the lane keeps its identity while the car is beside
+    it (overtaking) instead of switching to whichever lane the car occupies."""
     xs, cs, ws = [], [], []
     lo, hi, step = x_bins
     for x0 in np.arange(lo, hi, step):
@@ -86,7 +90,7 @@ def fit_lane_centre(X, Y, x_bins=(4.0, 36.0, 2.0), lane_width=3.5, gap=0.8):
         elif xs:
             ref = cs[-1]
         else:
-            ref = 0.0
+            ref = ref0
         m = (X >= x0) & (X < x0 + step) & np.isfinite(Y) & (np.abs(Y) < 12.0)
         if m.sum() < 3:
             continue
@@ -158,19 +162,20 @@ class LanePerception:
         ll = np.argmax(ll[:, :, dh:dh + nh, dw:dw + nw], axis=1)[0]
         return da, ll, r
 
-    def update(self, img_bgr):
-        """Lane-centre estimate; YOLOP runs every `every` calls (the last
-        estimate is returned in between)."""
+    def update(self, img_bgr, ref0=0.0):
+        """Lane-centre estimate of the lane expected at vehicle-frame y = ref0;
+        YOLOP runs every `every` calls (the last estimate is returned in
+        between, flagged fresh=False)."""
         self.n += 1
         if (self.n - 1) % self.every:
-            return self.last
+            return dict(self.last, fresh=False)
         da, ll, r = self.masks(img_bgr)
         v, u = np.nonzero(ll)
         if len(u) < 20:
             self.last = dict(valid=False)
-            return self.last
+            return dict(self.last, fresh=True)
         X, Y = self.cam.pixels_to_ground(u / r, v / r)
-        fit = fit_lane_centre(X, Y)
+        fit = fit_lane_centre(X, Y, ref0=ref0)
         self.last = dict(valid=fit is not None, **(fit or {}),
                          drivable_frac=float(da.mean()))
-        return self.last
+        return dict(self.last, fresh=True)
