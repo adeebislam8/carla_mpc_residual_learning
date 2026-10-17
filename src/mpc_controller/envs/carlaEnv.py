@@ -381,6 +381,9 @@ class CarlaMPCEnv(gym.Env):
         # mpc_reuse: on a clear road the OCP is solved every 2nd tick
         # (MPCController.solve(reuse_ok=...)).
         self.mpc_reuse = False
+        # obstacle_face: LiDAR tracks enter the CBF as points on their near face
+        # / inner edge, not the cluster centroid (_set_obstacles_from_tracks).
+        self.obstacle_face = False
         self.selected_obstacle_stopped = np.full(num_obstacles, np.inf)
         self._route_junction = None      # bool per road-width sample
         self._stop_lines_s = []          # route s of stop lines (set by the B2D agent)
@@ -1751,6 +1754,37 @@ class CarlaMPCEnv(gym.Env):
     PERCEIVED_DS = (-40.0, 120.0)
     LONG_OBJECT_M = 5.0              # split longer clusters into points along them
 
+    FACE_STEP_M = 3.0                # inner-edge points this far apart (= CBF a_obs)
+    FACE_MAX_PTS = 4
+
+    def _face_points(self, tr, s_o, d_o):
+        """A LiDAR cluster as CBF points on its NEAR FACE and INNER EDGE.
+        The cluster centroid is not the object's centre: LiDAR sees the faces
+        towards us, so a car's centroid sits near its rear face from behind
+        and moves along it as we pass, and a merged pile-up's centroid can be
+        metres beyond its first face.  The CBF ellipse (a_obs x b_lat) was
+        sized for a privileged actor CENTRE; around the centroid it let the ego
+        drive into the face (ssmoke6: 1852 at 7.7 m/s with the centroid 4.2 m
+        ahead and the face 2.2 m).  Points: the edge nearest our lateral
+        position, from the nearest face to the far end every FACE_STEP_M.
+        Cluster points -> route frame by the local tangent at the centroid."""
+        fc = self.frenet_converter
+        x0, y0, _ = fc.frenet_to_world(s_o, 0.0, 0.0)
+        x1, y1, _ = fc.frenet_to_world(s_o + 1.0, 0.0, 0.0)
+        xn, yn, _ = fc.frenet_to_world(s_o, 1.0, 0.0)
+        t = np.array([x1 - x0, y1 - y0])
+        n = np.array([xn - x0, yn - y0])
+        t /= max(np.linalg.norm(t), 1e-6)
+        n /= max(np.linalg.norm(n), 1e-6)
+        P = np.asarray(tr['pts'], float) - np.array([tr['x'], tr['y']])
+        s_p, d_p = s_o + P @ t, d_o + P @ n
+        d_in = float(d_p[np.argmin(np.abs(d_p - self.current_d))])
+        s0, s1 = float(s_p.min()), float(s_p.max())
+        if tr.get('type', '').startswith('vehicle.lidar'):
+            s1 = max(s1, s0 + 4.0)          # seen from behind: only the rear face
+        k = int(min(self.FACE_MAX_PTS, 1 + np.ceil((s1 - s0) / self.FACE_STEP_M)))
+        return [(float(s), d_in) for s in np.linspace(s0, s1, k)] if k > 1 else [(s0, d_in)]
+
     def _set_obstacles_from_tracks(self, tracks):
         """Sensor-only replacement for _detect_obstacles: LiDAR tracks
         (perception/lidar_obstacles.py) -> the same selected_obstacles /
@@ -1775,9 +1809,12 @@ class CarlaMPCEnv(gym.Env):
             vs, vd = (s2 - s_o) / 0.5, (d2 - d_o) / 0.5
             perceived.append(dict(type=tr['type'], ds=round(ds, 2), d=round(d_lane, 2),
                                   vs=round(vs, 2), vd=round(vd, 2),
-                                  stopped_for=round(float(tr['stopped_for']), 2)))
+                                  stopped_for=round(float(tr['stopped_for']), 2),
+                                  id=tr.get('id'), length=round(float(tr.get('length', 0.0)), 2)))
             pts = [(s_o, d_o)]
-            if tr.get('length', 0.0) > self.LONG_OBJECT_M and tr.get('pts') is not None \
+            if self.obstacle_face and tr.get('pts') is not None and len(tr['pts']) >= 3:
+                pts = self._face_points(tr, s_o, d_o)
+            elif tr.get('length', 0.0) > self.LONG_OBJECT_M and tr.get('pts') is not None \
                     and len(tr['pts']) >= 5:
                 P = np.asarray(tr['pts'])
                 c = P.mean(axis=0)
@@ -1793,6 +1830,7 @@ class CarlaMPCEnv(gym.Env):
                     cand.append((sp - self.current_s, sp, dp, vs, vd, float(tr['stopped_for'])))
         self._track_s_hint = hints
         self._perceived = perceived
+        self._n_cand = len(cand)
         cand.sort(key=lambda c: c[0])
         self.selected_obstacles = np.ones((self.num_obstacles, 2)) * -100
         self.selected_obstacle_vs = np.zeros(self.num_obstacles)

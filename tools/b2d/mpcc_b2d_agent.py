@@ -53,6 +53,8 @@ Efficiency / robustness (sensor-only):
   creep_after_s (null | s: stopped this long with nothing to wait for (no stop
     line, no junction ahead) -> creep past the blocker at creep_v m/s, the CBF
     on, for at most creep_max_s)
+  obstacle_face (false: LiDAR obstacles enter the CBF as points on the
+    cluster's near face / inner edge instead of its centroid)
   record_simlingo (false: also record SimLingo's front camera, 1024x512 FOV 110
     at (-1.5, 0, 2.0), for the SimLingo teacher -- tools/simlingo/)
 Env B2D_DUMP_DIR: every 20th tick, front image + LiDAR + pose -> npz, the
@@ -110,7 +112,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 privileged=True, lidar_mount=[1.3, 0.0, 2.5, 0.0],
                 sparse_route=None, yolop='models/yolop/yolop-640-640.onnx',
                 light_gate_m=60.0, device='cuda', creep_after_s=None,
-                creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False)
+                creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False,
+                obstacle_face=False)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -421,6 +424,7 @@ class MPCCAgent(AutonomousAgent):
         core._ego_s_hint = 0.0
         core._initialize_mpc()
         core.mpc_reuse = bool(c['mpc_reuse'])
+        core.obstacle_face = bool(c['obstacle_face'])
         if c['perception']:
             core._attach_perception_cameras()
         self.core = core
@@ -660,6 +664,8 @@ class MPCCAgent(AutonomousAgent):
                 student_net=(None if self.tactical is None
                              else int(self.tactical.last.get('net', False))),
                 mpc_reused=int(getattr(core.mpc_controller, 'last_reused', False)),
+                ocp_fail=int(getattr(core.mpc_controller, 'consecutive_failures', 0)),
+                n_cand=getattr(core, '_n_cand', None),
                 **{f'ms_{k}': round(1000.0 * v, 2) for k, v in self._ms.items()},
                 **(self._perception_check() if not self.cfg['privileged'] else {})))
         return control
@@ -848,24 +854,37 @@ class MPCCAgent(AutonomousAgent):
         out['per_ds'] = None if p is None else p['ds']
         out['per_d'] = None if p is None else round(p['d'], 2)
         out['per_type'] = None if p is None else p['type']
+        # its track: id (re-segmentations show as id changes), along-route /
+        # lateral speed and stopped time as the gate / follow logic saw them
+        for k in ('id', 'vs', 'vd', 'stopped_for', 'length'):
+            out[f'per_{k}'] = None if p is None else p.get(k)
         # GT relative to the TRUE ego position (not the estimate), measured to
         # the object's NEAR face (LiDAR sees the face, not the centre), lateral
         # in the same lane frame as perception.
         s_ego, _, _ = core.frenet_converter.world_to_frenet(loc.x, loc.y, 0, s_hint=core.current_s)
         gt = []
+        anyn = None          # nearest actor in ANY direction: matches eval.json collision ids
         for a in CarlaDataProvider.get_world().get_actors():
             t = a.type_id
             if a.id == self.hero_actor.id or not (t.startswith('vehicle.') or t.startswith('walker.')
                                                   or t.startswith('static.prop')):
                 continue
             al = a.get_location()
-            if al.distance(loc) > 45.0:
+            dist = al.distance(loc)
+            if dist > 45.0:
                 continue
             s_o, d_o, _ = core.frenet_converter.world_to_frenet(al.x, al.y, 0, s_hint=s_ego)
+            if anyn is None or dist < anyn[0]:
+                v = a.get_velocity()
+                anyn = (dist, a.id, t, s_o - s_ego, d_o - core.current_d, math.hypot(v.x, v.y))
             d_o -= core.lane_offset(s_o)
             ds = s_o - s_ego - a.bounding_box.extent.x
             if abs(d_o) < 2.0 and 0 < ds < 40:
                 gt.append((ds, round(d_o, 2), t))
+        # (relative s / d of its CENTRE from the true ego, and its true speed)
+        for k, i in (('m', 0), ('id', 1), ('type', 2), ('ds', 3), ('dd', 4), ('v', 5)):
+            val = None if anyn is None else anyn[i]
+            out[f'any_{k}'] = round(val, 2) if isinstance(val, float) else val
         g = min(gt) if gt else None
         out['gt_ds'] = None if g is None else round(g[0], 2)
         out['gt_d'] = None if g is None else g[1]
