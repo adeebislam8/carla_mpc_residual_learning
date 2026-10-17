@@ -44,6 +44,20 @@ Config (JSON, all optional):
   tactical (null | dir: the go/slow student, src/student/tactical.py),
   scene_radius_m (110: actors kept for the tactical scene)
 
+privileged (true | false).  true: ground-truth actors and light states from the
+simulator plus the HD map (an ORACLE-perception setting).  false: the
+Bench2Drive SENSORS-track setting the end-to-end models (UniAD, VAD, ORION) are
+evaluated in -- only on-board sensors and the route:
+  * ego pose        GNSS + IMU compass + speedometer (perception/ego_state.py)
+  * obstacles       LiDAR, ground removal + clustering + tracking, no learned
+                    detector (perception/lidar_obstacles.py)
+  * traffic lights  front camera: pretrained COCO YOLO + colour (perception/
+                    traffic_lights.py); stop signs likewise
+  * stop lines / junctions   from the route's own commands (junction = LEFT /
+                    RIGHT / STRAIGHT segments); no HD map
+  * corridor        the MPCC's fixed two-lane default (no lane widths)
+The simulator is read only for the trace/diagnostics, never for control.
+
 Recording uses ORION's own Bench2Drive sensor rig (team_code/orion_b2d_agent.py)
 and its RoutePlanner command logic, so the teacher sees exactly its training
 inputs; images are JPEG quality 20, as ORION's agent re-encodes them.
@@ -73,7 +87,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 stall_kick='clear', follow=True, predict_obstacles=True,
                 gate_mode='pass_slow', full_brake=True, breakaway=True,
                 behavior_rules=False, rules_queue=False,
-                record=False, tactical=None, scene_radius_m=110.0)
+                record=False, tactical=None, scene_radius_m=110.0,
+                privileged=True, lidar_mount=[1.3, 0.0, 2.5, 0.0])
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -203,12 +218,21 @@ class MPCCAgent(AutonomousAgent):
         # Ground-truth obstacles come from the world; the speedometer keeps the
         # leaderboard's sensor interface (and its sync wait) happy.
         speed = [{'type': 'sensor.speedometer', 'reading_frequency': 20, 'id': 'SPEED'}]
-        if not self.cfg.get('record'):
+        sensor_only = not self.cfg.get('privileged', True)
+        if not self.cfg.get('record') and not sensor_only:
             return speed
+        # Recording: ORION's whole rig.  Sensor-only driving alone: just the
+        # front camera (traffic lights / stop signs) -- 6 x 1600x900 renders
+        # are the slowest part of a tick.
+        use = ORION_CAMS if self.cfg.get('record') else ORION_CAMS[:1]
         cams = [{'type': 'sensor.camera.rgb', 'x': x, 'y': y, 'z': 1.60,
                  'roll': 0.0, 'pitch': 0.0, 'yaw': yaw,
                  'width': 1600, 'height': 900, 'fov': fov, 'id': cid}
-                for cid, x, y, yaw, fov in ORION_CAMS]
+                for cid, x, y, yaw, fov in use]
+        if sensor_only:
+            mx, my, mz, myaw = self.cfg['lidar_mount']
+            cams.append({'type': 'sensor.lidar.ray_cast', 'x': mx, 'y': my, 'z': mz,
+                         'roll': 0.0, 'pitch': 0.0, 'yaw': myaw, 'id': 'LIDAR'})
         return cams + [
             {'type': 'sensor.other.imu', 'x': -1.4, 'y': 0.0, 'z': 0.0, 'roll': 0.0,
              'pitch': 0.0, 'yaw': 0.0, 'sensor_tick': 0.05, 'id': 'IMU'},
@@ -252,13 +276,16 @@ class MPCCAgent(AutonomousAgent):
         core.map = cmap
 
         # Route -> Frenet path + corridor table, as _generate_path does.
-        pts, wps = [], []
-        for tf, _ in self._dense_route:
+        sensor_only = not c['privileged']
+        pts, wps, cmds = [], [], []
+        for tf, cmd in self._dense_route:
             p = (tf.location.x, tf.location.y)
             if pts and math.hypot(p[0] - pts[-1][0], p[1] - pts[-1][1]) < 0.5:
                 continue
             pts.append(p)
-            wps.append(cmap.get_waypoint(tf.location, project_to_road=True,
+            cmds.append(int(getattr(cmd, 'value', cmd)))
+            wps.append(None if sensor_only else
+                       cmap.get_waypoint(tf.location, project_to_road=True,
                                          lane_type=carla.LaneType.Driving))
         core.frenet_converter = FrenetConverter(pts)
         core.path_length = core.frenet_converter.get_path_length()
@@ -268,10 +295,19 @@ class MPCCAgent(AutonomousAgent):
             s, _, _ = core.frenet_converter.world_to_frenet(x, y, 0, s_hint=hint)
             ws.append(s)
             hint = s
-        core._road_widths = np.array(widths)
         core._road_width_s = np.array(ws)
-        core._route_junction = np.array([bool(wp.is_junction) if wp is not None else False
-                                         for wp in wps])
+        if sensor_only:
+            # No HD map: the MPCC's fixed two-lane corridor; junctions from the
+            # route's own commands (RoadOption LEFT/RIGHT/STRAIGHT = 1/2/3).
+            core._road_widths = None
+            core._route_junction = np.array([cm in (1, 2, 3) for cm in cmds])
+            j = core._route_junction
+            self._junction_entries = [float(ws[i]) for i in range(len(j))
+                                      if j[i] and (i == 0 or not j[i - 1])]
+        else:
+            core._road_widths = np.array(widths)
+            core._route_junction = np.array([bool(wp.is_junction) if wp is not None else False
+                                             for wp in wps])
         core.racing_npcs = []
         core.current_s = 0.0
         core._ego_s_hint = 0.0
@@ -287,7 +323,22 @@ class MPCCAgent(AutonomousAgent):
                                         axes=c['student_axes'])
             self.policy.attach(core)
         self._planner = RoutePlanner(self._global_plan_world_coord)
-        if c['traffic_rules']:
+        if sensor_only:
+            from leaderboard.utils.route_manipulation import _get_latlon_ref
+            from perception.ego_state import EgoStateEstimator
+            from perception.lidar_obstacles import LidarObstacleTracker
+            self._ego_est = EgoStateEstimator(*_get_latlon_ref(world))
+            self._lidar = LidarObstacleTracker(mount=tuple(c['lidar_mount']))
+            self._tl = None
+            if c['traffic_rules']:
+                from perception.traffic_lights import TrafficLightDetector
+                self._tl = TrafficLightDetector()
+            self._last_applied = (0.0, 0.0, 0.0)          # throttle, brake, steer
+            self._stop_entries_done = set()
+            self._stop_sign_seen_t = -1e9
+            # Stop-line context for the rules arm: every junction entry.
+            core._stop_lines_s = list(self._junction_entries)
+        elif c['traffic_rules']:
             self._index_traffic_rules(world)
             # Stop-line context for the behavior_rules arm (queued traffic).
             core._stop_lines_s = sorted([s for s, _ in self._rule_lights] +
@@ -375,16 +426,24 @@ class MPCCAgent(AutonomousAgent):
         self.n_steps += 1
         core.current_step = self.n_steps
 
-        core._update_vehicle_state()
-        core._ego_s_hint = core.current_s
-        if not self.cfg['perception']:
-            self._refresh_obstacles()
-        core._detect_obstacles()
+        if self.cfg['privileged']:
+            core._update_vehicle_state()
+            core._ego_s_hint = core.current_s
+            if not self.cfg['perception']:
+                self._refresh_obstacles()
+            core._detect_obstacles()
+        else:
+            self._sense(input_data, timestamp)
 
         # Traffic rules enter the MPCC as a constraint: the stop line caps
         # every stage's speed by the braking envelope (MPCController.stop_s),
         # so the OCP plans the stop itself.
-        stop_ds = self._rule_stop_target() if self.cfg['traffic_rules'] else None
+        if not self.cfg['traffic_rules']:
+            stop_ds = None
+        elif self.cfg['privileged']:
+            stop_ds = self._rule_stop_target()
+        else:
+            stop_ds = self._sensor_stop_target(input_data, timestamp)
         core.mpc_controller.stop_s = (None if stop_ds is None
                                       else core.current_s + stop_ds)
         core.mpc_controller.stop_margin = STOP_LINE_MARGIN_M
@@ -419,6 +478,8 @@ class MPCCAgent(AutonomousAgent):
         else:
             control.throttle, control.brake = 0.0, float(-thr)
         control.steer = float(-steer)            # env convention (carlaEnv.step)
+        if not self.cfg['privileged']:
+            self._last_applied = (control.throttle, control.brake, control.steer)
         self.t_control.append(time.perf_counter() - t0)
         if self.rec_dir is not None:
             self._record(input_data, scene, (u_nom_thr, u_nom_steer), (thr, steer))
@@ -443,7 +504,8 @@ class MPCCAgent(AutonomousAgent):
                 lead_ds=None if lead is None else round(lead[0] - core.current_s, 1),
                 lead_v=None if lead is None else round(lead[1], 1),
                 n_obs=int((core.selected_obstacles[:, 0] > -50).sum()),
-                alpha=round(float(core.last_authority_info.get('alpha', 1.0)), 2)))
+                alpha=round(float(core.last_authority_info.get('alpha', 1.0)), 2),
+                **(self._perception_check() if not self.cfg['privileged'] else {})))
         return control
 
     def _write_trace(self):
@@ -486,17 +548,94 @@ class MPCCAgent(AutonomousAgent):
             print(f'[MPCCAgent] trace plot failed: {e}', flush=True)
         print(f'[MPCCAgent] trace -> {stem}.csv', flush=True)
 
+    # ── sensor-only perception ──────────────────────────────────────────────
+
+    def _sense(self, input_data, timestamp):
+        core = self.core
+        imu = input_data['IMU'][1]
+        gnss = input_data['GPS'][1]
+        speed = float(input_data['SPEED'][1]['speed'])
+        x, y, yaw, v, yaw_rate = self._ego_est.update(
+            gnss[:2], float(imu[-1]), speed, gyro_z=float(imu[5]))
+        thr, brk, steer = self._last_applied
+        core._update_vehicle_state_from(x, y, yaw, v, yaw_rate, thr, brk, steer)
+        tracks = self._lidar.update(input_data['LIDAR'][1], (x, y, yaw), timestamp)
+        core._set_obstacles_from_tracks(tracks)
+
+    def _perception_check(self):
+        """DIAGNOSTIC ONLY (trace), never used for control: the nearest
+        object ahead in our lane by perception vs by ground truth, and the
+        pose estimate's error -- to validate the sensor-only stack."""
+        core = self.core
+        out = {}
+        loc = self.hero_actor.get_location()
+        out['pose_err'] = round(math.hypot(self._ego_est.x - loc.x, self._ego_est.y - loc.y), 2)
+        per = [a for a in getattr(core, '_perceived', []) if abs(a['d']) < 2.0 and 0 < a['ds'] < 40]
+        p = min(per, key=lambda a: a['ds']) if per else None
+        out['per_ds'] = None if p is None else p['ds']
+        out['per_type'] = None if p is None else p['type']
+        gt = []
+        for a in CarlaDataProvider.get_world().get_actors():
+            t = a.type_id
+            if a.id == self.hero_actor.id or not (t.startswith('vehicle.') or t.startswith('walker.')
+                                                  or t.startswith('static.prop')):
+                continue
+            al = a.get_location()
+            if al.distance(loc) > 45.0:
+                continue
+            s_o, d_o, _ = core.frenet_converter.world_to_frenet(al.x, al.y, 0, s_hint=core.current_s)
+            if abs(d_o) < 2.0 and 0 < s_o - core.current_s < 40:
+                gt.append((s_o - core.current_s, t))
+        g = min(gt) if gt else None
+        out['gt_ds'] = None if g is None else round(g[0], 2)
+        out['gt_type'] = None if g is None else g[1]
+        out['light'] = (self._tl.last.get('light') if self._tl is not None else None)
+        return out
+
+    def _sensor_stop_target(self, input_data, timestamp):
+        """Distance to where we must stop now, from the camera alone: a red
+        (or still-stoppable yellow) light ahead stops us at the next junction
+        entry on the route; a stop sign seen in the last 3 s means one full
+        stop at the next entry."""
+        core = self.core
+        if self._tl is None:
+            return None
+        det = self._tl.detect(input_data['CAM_FRONT'][1][:, :, :3])
+        if det['stop_sign']:
+            self._stop_sign_seen_t = timestamp
+        s, v = core.current_s, core.current_speed
+        reach = 6.0 + v ** 2 / (2 * RULE_DECEL) + 10.0
+        nxt = [e for e in self._junction_entries if -1.0 < e - s < reach]
+        if not nxt:
+            return None
+        e = nxt[0]
+        ds = e - s - 0.5
+        light = det['light']
+        if light == 'red' or (light == 'yellow' and v ** 2 / (2 * max(ds, 0.1)) <= 2 * RULE_DECEL):
+            return ds
+        if timestamp - self._stop_sign_seen_t < 3.0 and e not in self._stop_entries_done:
+            if v < 0.1 and ds < 3.0:
+                self._stop_entries_done.add(e)          # full stop made
+                return None
+            return ds
+        return None
+
     def _scene(self, stop_ds):
         """The tactical scene (src/student/tactical.py) for this tick: every
         kept actor in ego-relative Frenet terms, and the route ahead in the ego
         frame (for labelling ORION's plan against)."""
         core = self.core
-        tf = self.hero_actor.get_transform()
-        yaw = math.radians(tf.rotation.yaw)
+        if self.cfg['privileged']:
+            tf = self.hero_actor.get_transform()
+            yaw = math.radians(tf.rotation.yaw)
+            ex, ey = tf.location.x, tf.location.y
+        else:                       # the estimated pose, never the simulator's
+            ex, ey, yaw = self._ego_est.x, self._ego_est.y, self._ego_est.yaw
         cy, sy = math.cos(yaw), math.sin(yaw)
-        ex, ey = tf.location.x, tf.location.y
         acts = []
-        for npc in self._actors.values():
+        if not self.cfg['privileged']:
+            acts = list(getattr(core, '_perceived', []))
+        for npc in (self._actors.values() if self.cfg['privileged'] else []):
             a = npc.get('actor')
             if a is None or npc.get('s') is None:
                 continue

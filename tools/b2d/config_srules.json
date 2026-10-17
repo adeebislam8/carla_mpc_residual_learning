@@ -1,0 +1,9 @@
+{
+  "privileged": false,
+  "steer_fix": true,
+  "qc": 0.5,
+  "gate_depth": 0.98,
+  "target_speed": 15.0,
+  "traffic_rules": true,
+  "behavior_rules": true
+}

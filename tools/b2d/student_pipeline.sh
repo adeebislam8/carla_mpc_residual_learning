@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Tactical-student pipeline on Bench2Drive, one command, foreground, resumable.
+# Runs in the SENSOR-ONLY setting (config_record / config_tactical have
+# privileged: false): the student's scene comes from LiDAR tracks, the agent
+# from GNSS/IMU, camera lights -- the same inputs class as UniAD / VAD / ORION.
 #
 #   ./tools/b2d/student_pipeline.sh            # all stages
 #   STAGES="label build train" ./tools/b2d/student_pipeline.sh
@@ -94,7 +97,7 @@ if has train; then
 fi
 
 if has eval; then
-  say "evaluating rules arm + tactical student on $EVAL_SET"
+  say "evaluating sensor-only rules arm + tactical student on $EVAL_SET"
   TAG=tactical CONFIG=tools/b2d/config_tactical.json ./tools/b2d/run_b2d.sh "$EVAL_SET"
   say "all arms on $EVAL_SET, side by side"
   python3 tools/b2d/compare_arms.py --set "$EVAL_SET" --b2d "$B2D" \

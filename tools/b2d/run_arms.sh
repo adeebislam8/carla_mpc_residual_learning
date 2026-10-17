@@ -11,6 +11,10 @@
 #   rules    tools/b2d/config_rules.json        + hand-coded decision rules
 #   rulesq   tools/b2d/config_rules_queue.json  + queue rule (brittleness ablation)
 #   tactical tools/b2d/config_tactical.json     rules + the distilled go/slow student
+#   sbase    tools/b2d/config_sbase.json        SENSOR-ONLY MPCC (LiDAR+camera+GNSS/IMU,
+#                                               no map, no ground truth) -- comparable to
+#                                               UniAD / VAD / ORION's setting
+#   srules   tools/b2d/config_srules.json       sensor-only + hand-coded rules
 #   <name>   tools/b2d/config_<name>.json       any other config
 # Results: results/b2d/<arm>_<SET>/ ; each arm resumes if re-run.
 #

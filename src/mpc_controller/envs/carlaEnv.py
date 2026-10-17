@@ -1676,6 +1676,79 @@ class CarlaMPCEnv(gym.Env):
                 return False                   # something is in our path: stay stopped
         return True
 
+    # ── sensor-only state (Bench2Drive SENSORS track: no simulator truth) ──
+
+    def _update_vehicle_state_from(self, x, y, yaw, speed, yaw_rate,
+                                   applied_throttle, applied_brake, applied_steer):
+        """Same as _update_vehicle_state, from an ESTIMATED pose (GNSS + IMU +
+        speedometer, perception/ego_state.py) and the control we applied last
+        tick, instead of reading the simulator."""
+        self.current_s, self.current_d, self.current_alpha = \
+            self.frenet_converter.world_to_frenet(x, y, yaw, s_hint=self._ego_s_hint)
+        self._ego_s_hint = self.current_s
+        self.current_speed = float(speed)
+        self.current_throttle = -applied_brake if applied_brake > 0 else applied_throttle
+        self.current_brake = applied_brake
+        self.current_steering = applied_steer * np.deg2rad(
+            self.mpc_controller.steer_norm_deg if self.mpc_controller else 45.0)
+        self.lateral_accel = self.current_speed * float(yaw_rate)
+
+    PERCEIVED_D = (-8.0, 4.5)        # road corridor kept from LiDAR tracks (route frame)
+    PERCEIVED_DS = (-40.0, 120.0)
+    LONG_OBJECT_M = 5.0              # split longer clusters into points along them
+
+    def _set_obstacles_from_tracks(self, tracks):
+        """Sensor-only replacement for _detect_obstacles: LiDAR tracks
+        (perception/lidar_obstacles.py) -> the same selected_obstacles /
+        _vs / _vel / _stopped arrays the MPCC, follow and gate logic read.
+        Clusters off the road corridor (buildings, walls, poles) are dropped by
+        their route offset; long ones (bus, cone line, barrier) become several
+        points so the CBF sees their length, not just their centre.  Also keeps
+        self._perceived, the tactical scene's actor list."""
+        hints = getattr(self, '_track_s_hint', {})
+        perceived, cand = [], []
+        for tr in tracks:
+            hint = hints.get(tr['id'], self.current_s)
+            s_o, d_o, _ = self.frenet_converter.world_to_frenet(tr['x'], tr['y'], 0, s_hint=hint)
+            hints[tr['id']] = s_o
+            ds = s_o - self.current_s
+            if not (self.PERCEIVED_D[0] < d_o < self.PERCEIVED_D[1]
+                    and self.PERCEIVED_DS[0] < ds < self.PERCEIVED_DS[1]):
+                continue
+            s2, d2, _ = self.frenet_converter.world_to_frenet(
+                tr['x'] + 0.5 * tr['vx'], tr['y'] + 0.5 * tr['vy'], 0, s_hint=s_o)
+            vs, vd = (s2 - s_o) / 0.5, (d2 - d_o) / 0.5
+            perceived.append(dict(type=tr['type'], ds=round(ds, 2), d=round(d_o, 2),
+                                  vs=round(vs, 2), vd=round(vd, 2),
+                                  stopped_for=round(float(tr['stopped_for']), 2)))
+            pts = [(s_o, d_o)]
+            if tr.get('length', 0.0) > self.LONG_OBJECT_M and tr.get('pts') is not None \
+                    and len(tr['pts']) >= 5:
+                P = np.asarray(tr['pts'])
+                c = P.mean(axis=0)
+                axis = np.linalg.eigh(np.cov((P - c).T) + 1e-6 * np.eye(2))[1][:, -1]
+                order = np.argsort((P - c) @ axis)
+                pts = []
+                for q in np.quantile(np.arange(len(P)), [0.0, 0.25, 0.5, 0.75, 1.0]).astype(int):
+                    x, y = P[order[q]]
+                    sp, dp, _ = self.frenet_converter.world_to_frenet(x, y, 0, s_hint=s_o)
+                    pts.append((sp, dp))
+            for sp, dp in pts:
+                if -5.0 < sp - self.current_s < 30.0:
+                    cand.append((sp - self.current_s, sp, dp, vs, vd, float(tr['stopped_for'])))
+        self._track_s_hint = hints
+        self._perceived = perceived
+        cand.sort(key=lambda c: c[0])
+        self.selected_obstacles = np.ones((self.num_obstacles, 2)) * -100
+        self.selected_obstacle_vs = np.zeros(self.num_obstacles)
+        self.selected_obstacle_vel = np.zeros((self.num_obstacles, 2))
+        self.selected_obstacle_stopped = np.full(self.num_obstacles, np.inf)
+        for i, (_, sp, dp, vs, vd, st) in enumerate(cand[:self.num_obstacles]):
+            self.selected_obstacles[i] = [sp, dp]
+            self.selected_obstacle_vs[i] = vs
+            self.selected_obstacle_vel[i] = (vs, vd)
+            self.selected_obstacle_stopped[i] = st
+
     def _update_vehicle_state(self):
         """Update vehicle state from CARLA"""
         transform = self.vehicle.get_transform()
