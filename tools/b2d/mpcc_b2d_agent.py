@@ -167,6 +167,10 @@ class RoutePlanner:
 # Comfortable stopping deceleration for the rule layer, m/s^2.
 RULE_DECEL = 4.0
 STOP_LINE_MARGIN_M = 1.5
+LIGHT_GREEN_N = 3            # green detections in a row that release a red hold
+LIGHT_PASSED_M = 3.0         # past the held entry by this much: committed, release
+LIGHT_HOLD_MAX_S = 25.0      # no red/yellow seen for this long: release
+LIGHT_REHOLD_S = 8.0         # after a green release, ignore 'red' at that entry this long
 
 
 def get_entry_point():
@@ -303,6 +307,8 @@ class MPCCAgent(AutonomousAgent):
         if self.dump_dir:
             os.makedirs(self.dump_dir, exist_ok=True)
         self.n_light_runs = 0            # ticks the light detector actually ran
+        self._light_hold = None          # red hold: {e: entry s, t: last red/yellow, green: run}
+        self.n_light_holds = 0
         self._stuck_t, self._creep_t, self._creep_cool = 0.0, 0.0, 0.0
         self.n_creep_events, self.n_creep_ticks = 0, 0
 
@@ -625,11 +631,15 @@ class MPCCAgent(AutonomousAgent):
         self._ms['mpc'] = time.perf_counter() - t1
         self._ms['ocp'] = getattr(core.mpc_controller, 'last_solve_s', 0.0)
 
-        # Last resort only: the soft OCP still carrying speed into the line.
-        if stop_ds is not None and stop_ds - STOP_LINE_MARGIN_M < 2.0 \
-                and core.current_speed > 1.0:
-            thr = -1.0
-            self.n_rule_overrides += 1
+        # Last resort only: the soft OCP still carrying speed into the line --
+        # and, once (nearly) stopped there, no throttle: the slacked speed cap
+        # let the OCP pulse throttle at v ~ 0.4 m/s and creep over the line.
+        if stop_ds is not None and stop_ds - STOP_LINE_MARGIN_M < 2.0:
+            if core.current_speed > 1.0:
+                thr = -1.0
+                self.n_rule_overrides += 1
+            elif thr > -0.3:
+                thr = -0.3                     # hold the brake
 
         control = carla.VehicleControl()
         if thr >= 0:
@@ -670,6 +680,7 @@ class MPCCAgent(AutonomousAgent):
                              else int(self.tactical.last.get('net', False))),
                 mpc_reused=int(getattr(core.mpc_controller, 'last_reused', False)),
                 ocp_fail=int(getattr(core.mpc_controller, 'consecutive_failures', 0)),
+                light_hold=int(getattr(self, '_light_hold', None) is not None),
                 n_cand=getattr(core, '_n_cand', None), n_near=getattr(core, '_n_near', None),
                 **{f'ms_{k}': round(1000.0 * v, 2) for k, v in self._ms.items()},
                 **(self._perception_check() if not self.cfg['privileged'] else {})))
@@ -938,7 +949,7 @@ class MPCCAgent(AutonomousAgent):
         # detector (efficiency; also no false 'lights' from amber construction
         # lamps on open road).  A stop sign seen in the last 3 s still holds.
         g = self.cfg['light_gate_m']
-        if g is not None and timestamp - self._stop_sign_seen_t >= 3.0:
+        if g is not None and self._light_hold is None and timestamp - self._stop_sign_seen_t >= 3.0:
             s = core.current_s
             if not any(-1.0 < e - s < g for e in self._junction_entries):
                 self._tl.history.clear()
@@ -950,14 +961,40 @@ class MPCCAgent(AutonomousAgent):
         if det['stop_sign']:
             self._stop_sign_seen_t = timestamp
         s, v = core.current_s, core.current_speed
+        light = det['light']
+        hold = self._light_hold
+        if hold is not None:
+            # RED HOLD: once stopping for a light, keep the stop until the
+            # light is SEEN green (LIGHT_GREEN_N detector runs in a row) --
+            # not merely until it stops being seen red.  A single 'unknown' /
+            # missed frame used to drop the target, the OCP throttled, the car
+            # crept past entry+1 m and the light was forgotten (tsmoke: 3 of 6
+            # red-light infractions).  Released also once past the entry
+            # (already committed) or after LIGHT_HOLD_MAX_S without red/yellow
+            # (light out of view at the line, Town03/07 style).
+            if light in ('red', 'yellow'):
+                hold['t'] = timestamp
+            hold['green'] = hold['green'] + 1 if light == 'green' else 0
+            if hold['green'] >= LIGHT_GREEN_N or s > hold['e'] + LIGHT_PASSED_M \
+                    or timestamp - hold['t'] > LIGHT_HOLD_MAX_S:
+                self._light_hold = None
+                self.n_light_holds += 1
+                # a green-released entry is not re-held on a stray 'red'
+                # (the cross street's light) for LIGHT_REHOLD_S
+                self._light_released = (hold['e'], timestamp)
+            else:
+                return hold['e'] - s - 0.5
         reach = 6.0 + v ** 2 / (2 * RULE_DECEL) + 10.0
         nxt = [e for e in self._junction_entries if -1.0 < e - s < reach]
         if not nxt:
             return None
         e = nxt[0]
         ds = e - s - 0.5
-        light = det['light']
-        if light == 'red' or (light == 'yellow' and v ** 2 / (2 * max(ds, 0.1)) <= 2 * RULE_DECEL):
+        rel = getattr(self, '_light_released', None)
+        fresh = rel is None or rel[0] != e or timestamp - rel[1] > LIGHT_REHOLD_S
+        if fresh and (light == 'red' or (light == 'yellow'
+                                         and v ** 2 / (2 * max(ds, 0.1)) <= 2 * RULE_DECEL)):
+            self._light_hold = dict(e=e, t=timestamp, green=0)
             return ds
         if timestamp - self._stop_sign_seen_t < 3.0 and e not in self._stop_entries_done:
             if v < 0.1 and ds < 3.0:
@@ -1084,7 +1121,8 @@ class MPCCAgent(AutonomousAgent):
                   f'(stops the MPCC failed to plan)', flush=True)
             if not self.cfg.get('privileged', True):
                 print(f'[MPCCAgent] light detector ran {self.n_light_runs}/{n} ticks; '
-                      f'creep {self.n_creep_events} events, {self.n_creep_ticks} ticks', flush=True)
+                      f'creep {self.n_creep_events} events, {self.n_creep_ticks} ticks; '
+                      f'red holds released {self.n_light_holds}', flush=True)
             if self.policy is not None:
                 print(f'[MPCCAgent] student counters {self.policy.total}', flush=True)
             try:
