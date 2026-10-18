@@ -124,7 +124,12 @@ def teacher_frame(lab, j, rec, sc):
     y = yield_label(sc, plan)
     if y >= 0 and rule_stop_at_entry(rec):
         y = -1                                              # stopped for the light / sign
-    return go_label(sc, plan), y, plan_dv(sc, plan), True
+    # Pull-out is judged against the TRUE lane centre when the recording has
+    # it (and the true in-lane check); the perceived one is off by > half a
+    # lane on ~1/3 of sensor-only ticks.  Features stay perceived.
+    gt = rec.get('gt') or {}
+    sc_go = dict(sc, route_fl=gt['route_fl'], d=gt['d']) if gt.get('route_fl') else sc
+    return go_label(sc_go, plan), y, plan_dv(sc, plan), True
 
 
 def debias(dv, v, is_plan):

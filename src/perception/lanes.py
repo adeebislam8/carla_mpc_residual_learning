@@ -145,8 +145,23 @@ class LanePerception:
                                     f'(B2D_YOLO=1 ./tools/b2d/setup_b2d.sh downloads them)')
         want = ('CUDAExecutionProvider', 'CPUExecutionProvider') if device == 'cuda' \
             else ('CPUExecutionProvider',)
+        if device == 'cuda':
+            # onnxruntime's CUDA provider finds cuDNN / cuBLAS only if something
+            # loaded them first -- torch does.  Without the light detector (the
+            # torch user; gt_lights) YOLOP silently fell back to the CPU:
+            # 120 ms instead of 8.5 (n2 sgt_lights, 2026-10-18).
+            try:
+                import importlib
+                importlib.import_module('torch')
+            except ImportError:
+                pass
+            if hasattr(ort, 'preload_dlls'):
+                ort.preload_dlls()
         prov = [p for p in want if p in ort.get_available_providers()]
         self.sess = ort.InferenceSession(onnx_path, providers=prov)
+        if device == 'cuda' and self.sess.get_providers()[0] != 'CUDAExecutionProvider':
+            print(f'[LanePerception] WARNING: YOLOP runs on {self.sess.get_providers()[0]}, '
+                  f'not CUDA -- timing will be ~15x slower', flush=True)
         self.cam = camera or CameraGeometry()
         self.every = every
         self.n = 0

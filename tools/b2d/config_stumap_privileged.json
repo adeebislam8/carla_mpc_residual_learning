@@ -1,0 +1,12 @@
+{
+  "privileged": false,
+  "steer_fix": true,
+  "qc": 0.5,
+  "gate_depth": 0.98,
+  "target_speed": 15.0,
+  "traffic_rules": true,
+  "behavior_rules": false,
+  "creep_after_s": 12.0,
+  "sparse_route": false,
+  "tactical": "models/tactical_privileged"
+}

@@ -1302,7 +1302,18 @@ class MPCCAgent(AutonomousAgent):
             area2 = abs((p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]))
             if a_ * b_ * c_ > 1e-6:
                 kap = max(kap, 2.0 * area2 / (a_ * b_ * c_))
-        return dict(d=round(d_e, 2), actors=acts,
+        # The TRUE lane centre ahead in the true ego frame: teacher plans are
+        # judged against it (pull-out = go), not against the perceived route,
+        # which is off by > half a lane on ~1/3 of sbase ticks (n1/n2 analysis).
+        tf = self.hero_actor.get_transform()
+        yaw = math.radians(tf.rotation.yaw)
+        cy_, sy_ = math.cos(yaw), math.sin(yaw)
+        route_fl = []
+        for k in range(1, 21):
+            x, y, _ = fc.frenet_to_world(min(s_e + 2.0 * k, fc.get_path_length()), 0.0, 0.0)
+            dx, dy = x - loc.x, y - loc.y
+            route_fl.append([round(cy_ * dx + sy_ * dy, 2), round(sy_ * dx - cy_ * dy, 2)])
+        return dict(d=round(d_e, 2), actors=acts, route_fl=route_fl,
                     light_ds=None if nl is None else round(nl[0], 2),
                     light=None if nl is None else str(nl[1].state).split('.')[-1].lower(),
                     sign_ds=round(min(ns), 2) if ns else None, kappa=round(kap, 4))
