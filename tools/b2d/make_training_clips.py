@@ -86,6 +86,7 @@ def main():
     for kv in args.extra_per_type:
         t, n = kv.split('=')
         quota[t] = int(n)
+        wanted.add(t)                   # a type named here is wanted even outside --ability
 
     src = ET.parse(os.path.join(os.path.expanduser(args.b2d), args.routes)).getroot()
     # (type) -> list of (route element, scenario element), round-robin over routes

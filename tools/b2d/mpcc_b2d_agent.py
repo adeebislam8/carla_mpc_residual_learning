@@ -57,8 +57,12 @@ Efficiency / robustness (sensor-only):
     cluster's near face / inner edge instead of its centroid)
   obstacle_priority (true: the MPC's 6 obstacle slots go to objects laterally
     within 3 m of the ego first, then by distance; false = by distance along
-    the route, behind-first -- the old behaviour, sprio vs sbase on smoke:
-    DS 65.6 vs 59.1, collisions >= 3 m/s 3 vs 7)
+    the route, behind-first -- the old behaviour.  Its smoke "win" (65.6 vs
+    59.1) was a parallel run that shared the acados solver dir; clean n1:
+    noprio 60.6 vs 55.5, inside the 9-route noise of ~10 DS -- undecided)
+  aeb (true: emergency brake under every arm -- full brake when an obstacle
+    the MPC's PLANNED path will overlap is < AEB_TTC_S time-to-contact away;
+    a planned pass around it does not trigger)
   record_simlingo (false: also record SimLingo's front camera, 1024x512 FOV 110
     at (-1.5, 0, 2.0), for the SimLingo teacher -- tools/simlingo/)
 Env B2D_DUMP_DIR: every 20th tick, front image + LiDAR + pose -> npz, the
@@ -125,7 +129,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 light_gate_m=60.0, device='cuda', creep_after_s=None,
                 creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False,
                 obstacle_face=False, obstacle_priority=True,
-                gt_obstacles=False, gt_lights=False)
+                gt_obstacles=False, gt_lights=False, aeb=True)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -180,6 +184,13 @@ LIGHT_GREEN_S = 1.0          # ... spread over this long with no red/yellow betw
 LIGHT_PASSED_M = 3.0         # past the held entry by this much: committed, release
 LIGHT_HOLD_MAX_S = 25.0      # no red/yellow seen for this long: release
 LIGHT_REHOLD_S = 8.0         # after a green release, ignore 'red' at that entry this long
+# Emergency brake (aeb): a safety layer under every arm, like the CBF.
+AEB_TTC_S = 1.6              # brake when time-to-contact along the route drops below this
+AEB_LEN_M = 4.0              # ego centre -> front (2.4) + slack: obstacle points are centres or faces
+AEB_LAT_M = 1.7              # lateral overlap: ego half-width 1.0 + obstacle ~0.7
+AEB_MIN_GAP_M = 1.0          # this close and still moving: brake whatever the closing speed
+AEB_ON_N = 2                 # consecutive triggering ticks before braking (single-frame phantoms)
+AEB_OFF_N = 10               # clear ticks before releasing (0.5 s)
 
 
 def get_entry_point():
@@ -289,6 +300,9 @@ class MPCCAgent(AutonomousAgent):
         self._rule_signs = []        # (s_stop, stop_sign_actor)
         self.n_steps = 0
         self.n_rule_overrides = 0
+        self.n_aeb = 0                   # ticks the emergency brake held
+        self._aeb_on, self._aeb_off = 0, 0
+        self._aeb_active = False
         self.t_control = []
         # Per-step trace -> <B2D_TRACE_DIR>/route_<n>.csv + .png (run_b2d.sh sets it)
         self.trace = []
@@ -312,6 +326,8 @@ class MPCCAgent(AutonomousAgent):
             self.tactical = TacticalPolicy(self.cfg['tactical'])
         self._planner = None
         self.n_go = self.n_wait = self.n_slow = 0
+        self.n_yield = 0                 # ticks the student held us at a junction entry
+        self._yield_t0, self._yield_off_until = None, -1e9
         self.dump_dir = os.environ.get('B2D_DUMP_DIR')
         if self.dump_dir:
             os.makedirs(self.dump_dir, exist_ok=True)
@@ -438,6 +454,9 @@ class MPCCAgent(AutonomousAgent):
             core._road_widths = np.array(widths)
             core._route_junction = np.array([bool(wp.is_junction) if wp is not None else False
                                              for wp in wps])
+            j = core._route_junction                # entries: the student's yield target
+            self._junction_entries = [float(ws[i]) for i in range(len(j))
+                                      if j[i] and (i == 0 or not j[i - 1])]
         core.racing_npcs = []
         core.current_s = 0.0
         core._ego_s_hint = 0.0
@@ -497,6 +516,7 @@ class MPCCAgent(AutonomousAgent):
                         dp.append(p)
                 self._diag_fc = FrenetConverter(dp)
             self._index_traffic_rules(world)
+            self._diag_signs = list(self._rule_signs)     # truth for recorded labels only
             if c['gt_lights']:                  # E4: true lights + stop signs drive the stop
                 self._diag_lights = list(self._rule_lights)
             else:
@@ -625,14 +645,20 @@ class MPCCAgent(AutonomousAgent):
         if self.cfg['record'] or self.tactical is not None:
             scene = self._scene(stop_ds)
         if self.tactical is not None:
-            go, slow = self.tactical.step(scene)
+            dec = self.tactical.step(scene)
+            go, dv = dec['go'], dec['dv']
             blocked = scene.get('_blocker') is not None
             core.gate_scale = 1.0 if go else 0.0
             core.tactical_wait = (not go) and blocked
-            core.mpc_controller.v_cap = max(core.current_speed - 2.0, 0.0) if slow else None
+            core.mpc_controller.v_cap = None if dv is None else max(core.current_speed + dv, 0.0)
             self.n_go += int(go and blocked)
             self.n_wait += int((not go) and blocked)
-            self.n_slow += int(slow)
+            self.n_slow += int(dv is not None)
+            # yield: hold at the next junction entry (the light's stop machinery)
+            ys = self._yield_target(dec['yield_'], scene, timestamp)
+            if ys is not None and (stop_ds is None or ys < stop_ds):
+                stop_ds = ys
+                core.mpc_controller.stop_s = core.current_s + stop_ds
             self._ms['tactical'] = time.perf_counter() - t1
         creeping = self._update_creep(stop_ds)
 
@@ -653,6 +679,10 @@ class MPCCAgent(AutonomousAgent):
                 self.n_rule_overrides += 1
             elif thr > -0.3:
                 thr = -0.3                     # hold the brake
+
+        if self.cfg['aeb'] and self._aeb_step(core):
+            thr = -1.0
+            self.n_aeb += 1
 
         control = carla.VehicleControl()
         if thr >= 0:
@@ -691,13 +721,85 @@ class MPCCAgent(AutonomousAgent):
                 creep=int(creeping), stuck_t=round(self._stuck_t, 1),
                 student_net=(None if self.tactical is None
                              else int(self.tactical.last.get('net', False))),
+                **({} if self.tactical is None else dict(
+                    st_go=round(float(self.tactical.last.get('p_go', 1.0)), 2),
+                    st_yield=round(float(self.tactical.last.get('p_yield', 0.0)), 2),
+                    st_dv=round(float(self.tactical.last.get('dv', 0.0)), 2))),
                 mpc_reused=int(getattr(core.mpc_controller, 'last_reused', False)),
                 ocp_fail=int(getattr(core.mpc_controller, 'consecutive_failures', 0)),
                 light_hold=int(getattr(self, '_light_hold', None) is not None),
+                aeb=int(self._aeb_active),
                 n_cand=getattr(core, '_n_cand', None), n_near=getattr(core, '_n_near', None),
                 **{f'ms_{k}': round(1000.0 * v, 2) for k, v in self._ms.items()},
                 **(self._perception_check() if not self.cfg['privileged'] else {})))
         return control
+
+    YIELD_MAX_S = 15.0       # longest the student may hold us at one entry ...
+    YIELD_COOL_S = 10.0      # ... then its yield is ignored this long (no deadlock)
+
+    def _yield_target(self, want, scene, timestamp):
+        """Stop distance for the student's 'yield' (the next junction entry,
+        like a red light), or None.  A yield held YIELD_MAX_S is dropped for
+        YIELD_COOL_S: the student can delay us, never strand us."""
+        e = scene.get('entry_ds')
+        if not want or e is None or scene.get('in_junction') or e > 30.0 \
+                or timestamp < self._yield_off_until:
+            self._yield_t0 = None
+            return None
+        if self._yield_t0 is None:
+            self._yield_t0 = timestamp
+        if timestamp - self._yield_t0 > self.YIELD_MAX_S:
+            self._yield_t0, self._yield_off_until = None, timestamp + self.YIELD_COOL_S
+            return None
+        self.n_yield += 1
+        return e - 0.5
+
+    def _aeb_hit(self, core):
+        """Is an obstacle about to be hit?  Time-to-contact along the route
+        below AEB_TTC_S (or closer than AEB_MIN_GAP_M while moving), AND the
+        MPC's planned path at that time overlaps the obstacle's
+        constant-velocity position laterally -- so a pass the OCP is already
+        steering around does not brake (fallback: hold the current d)."""
+        v = core.current_speed
+        if v < 0.3:
+            return False
+        mpc = core.mpc_controller
+        plan = None
+        if getattr(mpc, 'consecutive_failures', 0) == 0:
+            try:
+                plan = mpc.get_predicted_trajectory()       # (N, 2): s, d per stage
+            except Exception:
+                plan = None
+        dt = getattr(mpc, 'dt', 0.05)
+        for (s_o, d_o), (vs, vd) in zip(core.selected_obstacles, core.selected_obstacle_vel):
+            if s_o <= -50.0:
+                continue
+            gap = s_o - core.current_s - AEB_LEN_M
+            if gap > 40.0 or s_o - core.current_s <= 0.0:
+                continue
+            closing = v - vs
+            if gap > AEB_MIN_GAP_M and (closing <= 0.3 or gap / closing > AEB_TTC_S):
+                continue
+            t = 0.0 if gap <= 0.0 or closing <= 0.3 else gap / closing
+            d_ego = core.current_d
+            if plan is not None and len(plan):
+                d_ego = float(plan[min(int(round(t / dt)), len(plan) - 1)][1])
+            if abs(d_o + vd * t - d_ego) < AEB_LAT_M:
+                return True
+        return False
+
+    def _aeb_step(self, core):
+        """Debounced emergency brake: on after AEB_ON_N triggering ticks in a
+        row, off after AEB_OFF_N clear ticks (or once stopped)."""
+        if self._aeb_hit(core):
+            self._aeb_on, self._aeb_off = self._aeb_on + 1, 0
+        else:
+            self._aeb_on, self._aeb_off = 0, self._aeb_off + 1
+        if self._aeb_on >= AEB_ON_N:
+            self._aeb_active = True
+        elif self._aeb_active and (self._aeb_off >= AEB_OFF_N or core.current_speed < 0.3):
+            self._aeb_active = False
+        return self._aeb_active
 
     STUCK_V, MOVING_V = 0.3, 1.0
     CREEP_CONTEXT_M = 40.0      # a junction entry this close ahead = a queue / light: wait
@@ -1107,12 +1209,15 @@ class MPCCAgent(AutonomousAgent):
             if ahead.any():
                 jd = float(core._road_width_s[ahead].min() - core.current_s)
         d_lane = core.current_d - core.lane_offset(core.current_s)
+        ent = [e - core.current_s for e in getattr(self, '_junction_entries', [])
+               if e - core.current_s > 0.0]
         sc = dict(v=round(core.current_speed, 3), d=round(d_lane, 3),
-                  gate_rule=float(core._gate_on()),
                   lead_ds=None if lead is None else round(lead[0] - core.current_s, 2),
                   lead_v=None if lead is None else round(lead[1], 2),
                   stop_ds=None if stop_ds is None else round(stop_ds, 2),
-                  junction_ds=jd, actors=acts, route_fl=route_fl)
+                  junction_ds=jd, entry_ds=round(min(ent), 2) if ent else None,
+                  in_junction=bool(core._in_junction(core.current_s)),
+                  actors=acts, route_fl=route_fl)
         from student.tactical import blocker_info
         sc['_blocker'] = blocker_info(sc)
         return sc
@@ -1143,9 +1248,64 @@ class MPCCAgent(AutonomousAgent):
                    s=float(self.core.current_s), d=float(self.core.current_d),
                    alpha=float(self.core.current_alpha),
                    u_nom=[float(u_nom[0]), float(u_nom[1])],
-                   u_final=[float(u_final[0]), float(u_final[1])], scene=sc)
+                   u_final=[float(u_final[0]), float(u_final[1])], scene=sc,
+                   gt=self._gt_scene(), student=(None if self.tactical is None
+                                                 else dict(self.tactical.last)))
         self.rec_meta.write(json.dumps(rec) + '\n')
         self.rec_obs.append(np.asarray(self.core._get_observation(), dtype=np.float32))
+
+    def _gt_scene(self):
+        """Simulator truth for this frame, written to the recording for LABELS
+        only (the privileged expert teacher, masking teacher stops at red
+        lights); never a student feature.  Frenet in the TRUE lane-centre frame
+        (the dense route) from the TRUE ego pose: actors as in the scene
+        (ds, d, vs, vd, stopped_for), the next light on the route and its
+        state, the next stop sign, and the route's curvature ahead."""
+        core = self.core
+        fc = getattr(self, '_diag_fc', None) or core.frenet_converter
+        loc = self.hero_actor.get_location()
+        s_e, d_e, _ = fc.world_to_frenet(loc.x, loc.y, 0, s_hint=getattr(self, '_gt_s', None))
+        self._gt_s = s_e
+        moving = self.__dict__.setdefault('_gt_rec_moving', {})
+        acts = []
+        for a in CarlaDataProvider.get_world().get_actors():
+            ty = a.type_id
+            if a.id == self.hero_actor.id or not (ty.startswith('vehicle.') or ty.startswith('walker.')
+                                                  or ty.startswith('static.prop')):
+                continue
+            if any(k in ty for k in DRIVABLE_PROPS):
+                continue
+            al = a.get_location()
+            if al.distance(loc) > self.cfg['scene_radius_m']:
+                continue
+            vel = a.get_velocity()
+            s_o, d_o, _ = fc.world_to_frenet(al.x, al.y, 0, s_hint=s_e)
+            s2, d2, _ = fc.world_to_frenet(al.x + 0.5 * vel.x, al.y + 0.5 * vel.y, 0, s_hint=s_o)
+            if math.hypot(vel.x, vel.y) > 1.0:
+                moving[a.id] = self.n_steps
+            lm = moving.get(a.id)
+            acts.append(dict(type=ty, ds=round(s_o - s_e, 2), d=round(d_o, 2),
+                             vs=round((s2 - s_o) / 0.5, 2), vd=round((d2 - d_o) / 0.5, 2),
+                             len=round(2 * a.bounding_box.extent.x, 2),
+                             stopped_for=99.0 if lm is None else round((self.n_steps - lm) * 0.05, 2)))
+        lights = getattr(self, '_diag_lights', None) or getattr(self, '_rule_lights', [])
+        signs = getattr(self, '_diag_signs', None) or getattr(self, '_rule_signs', [])
+        s_c = core.current_s                    # light / sign stop lines are on our route's s
+        nl = [(s_l - s_c, tl) for s_l, tl in lights if -1.0 < s_l - s_c < 80.0]
+        nl = min(nl, key=lambda r: r[0]) if nl else None
+        ns = [s_l - s_c for s_l, _ in signs if -2.0 < s_l - s_c < 80.0]
+        kap = 0.0                               # max |curvature| 5-40 m ahead (3-point)
+        pts = [fc.frenet_to_world(min(s_e + k, fc.get_path_length()), 0.0, 0.0)[:2]
+               for k in range(0, 45, 5)]
+        for p0, p1, p2 in zip(pts, pts[1:], pts[2:]):
+            a_ = math.dist(p0, p1); b_ = math.dist(p1, p2); c_ = math.dist(p0, p2)
+            area2 = abs((p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]))
+            if a_ * b_ * c_ > 1e-6:
+                kap = max(kap, 2.0 * area2 / (a_ * b_ * c_))
+        return dict(d=round(d_e, 2), actors=acts,
+                    light_ds=None if nl is None else round(nl[0], 2),
+                    light=None if nl is None else str(nl[1].state).split('.')[-1].lower(),
+                    sign_ds=round(min(ns), 2) if ns else None, kappa=round(kap, 4))
 
     def _close_recording(self):
         if self.rec_meta is not None:
@@ -1167,7 +1327,7 @@ class MPCCAgent(AutonomousAgent):
             print(f'[MPCCAgent] closing recording failed: {e}', flush=True)
         if getattr(self, 'tactical', None) is not None:
             print(f'[MPCCAgent] tactical: go {self.n_go} / wait {self.n_wait} ticks with a '
-                  f'blocker, slow {self.n_slow} ticks', flush=True)
+                  f'blocker, speed cap {self.n_slow} ticks, yield {self.n_yield} ticks', flush=True)
         if getattr(self, 'trace_dir', None) and getattr(self, 'trace', None):
             try:
                 self._write_trace()
@@ -1180,7 +1340,7 @@ class MPCCAgent(AutonomousAgent):
                       f'{1000 * np.median(self.t_control):.1f} ms, p95 '
                       f'{1000 * np.percentile(self.t_control, 95):.1f} ms', flush=True)
             print(f'[MPCCAgent] rule-layer brake overrides: {self.n_rule_overrides} '
-                  f'(stops the MPCC failed to plan)', flush=True)
+                  f'(stops the MPCC failed to plan); emergency-brake ticks {self.n_aeb}', flush=True)
             if not self.cfg.get('privileged', True):
                 print(f'[MPCCAgent] light detector ran {self.n_light_runs}/{n} ticks; '
                       f'creep {self.n_creep_events} events, {self.n_creep_ticks} ticks; '

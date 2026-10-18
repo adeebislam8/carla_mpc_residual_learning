@@ -5,27 +5,39 @@ Bench2Drive (ot_eb, 2026-10-17) left the MPCC+CBF -- even with hand-coded
 behaviour rules -- at ~49% Overtaking against ORION's 71%, and every remaining
 failure was a JUDGMENT: pulling into the oncoming lane without a gap, not
 telling an accident from a queue, not slowing for a hazard about to appear.
-So the student does not nudge throttle/steer.  It outputs two decisions the
-MPCC executes:
+So the student does not nudge throttle/steer.  It outputs decisions the
+MPCC executes (v2, 2026-10-18: + yield, slow -> dv):
 
   go     P(pass the in-lane blocker now)  -> scales the MPCC's overtake gate;
          below 0.5 the blocker is treated as a lead to stop behind (wait)
-  slow   P(slow down now: anticipated hazard) -> a speed cap for the MPCC
+  yield  P(wait at the next junction entry: crossing / oncoming traffic)
+         -> a stop target at that entry (Merging / Give_Way gap acceptance)
+  dv     the teacher's planned speed change vs ours at ~1-1.5 s, debiased per
+         speed bin -> a speed cap v + dv when it is clearly negative (a graded
+         'slow'; replaces the binary slow head)
 
-The CBF and the safety gate stay in the loop; 'go' only ALLOWS a pass.
+The CBF, the emergency brake and the safety gate stay in the loop; 'go' only
+ALLOWS a pass.
 
 One numeric SCENE per tick -- built by the Bench2Drive agent online and saved
 in the recorder's meta.jsonl offline -- feeds both training and deployment,
 so the two can never see different features:
 
-  scene = {v, d, gate_rule, lead_ds, lead_v, stop_ds, junction_ds,
+  scene = {v, d, lead_ds, lead_v, stop_ds, junction_ds, entry_ds, in_junction,
            actors: [{type, ds, d, vs, vd, stopped_for}, ...],  # Frenet, ego-relative s
-           route_fl: [[fwd, left], ...]}                        # route centre ahead, ego frame
+           route_fl: [[fwd, left], ...],                       # route centre ahead, ego frame
+           gt: {...}}            # recording only: simulator truth for LABELS, never a feature
 
-Labels come from ORION's planned path (plan_fl: 6 waypoints, 0.5 s apart,
+(gate_rule, the rule layer's own pass decision, is no longer a feature: it was
+recorded under the rules arm and means something else under sbase -- a
+train/deploy mismatch.)
+
+Labels come from a teacher's planned path (plan_fl: 6 waypoints, 0.5 s apart,
 (forward, left) in the ego frame) compared with route_fl: does the plan pull
-into the passing lane (go) or stay behind (wait)?  does its planned speed
-drop below ours more than usual at this speed (slow)?
+into the passing lane (go) or stay behind (wait)?  does it stop short of the
+junction entry (yield)?  how does its planned speed differ from ours (dv)?
+Teachers: ORION, SimLingo (tools/*/..._infer.py), or direct labels from the
+privileged / rule experts (tools/student/expert_teacher.py).
 """
 
 import json
@@ -44,7 +56,7 @@ RIGHT_D = (1.5, 4.5)
 EMERGENCY = ('ambulance', 'firetruck', 'police')
 
 FRAME_NAMES = [
-    'v', 'd', 'gate_rule', 'lead_ds', 'lead_v', 'stop_ds', 'junction_ds',
+    'v', 'd', 'lead_ds', 'lead_v', 'stop_ds', 'junction_ds', 'entry_ds', 'in_junction',
     'blk_present', 'blk_ds', 'blk_vs', 'blk_stopped', 'blk_extent', 'blk_count',
     'onc_present', 'onc_ds', 'onc_vs', 'onc_tmeet',
     'pbehind_present', 'pbehind_ds', 'pbehind_vs',
@@ -87,11 +99,12 @@ def blocker_info(sc):
 def frame_features(sc):
     v, d = float(sc['v']), float(sc['d'])
     acts = sc['actors']
-    f = dict(v=v, d=d, gate_rule=float(sc.get('gate_rule', 0.0)),
-             lead_ds=min(sc.get('lead_ds') if sc.get('lead_ds') is not None else FAR, FAR),
-             lead_v=sc.get('lead_v') or 0.0,
-             stop_ds=min(sc.get('stop_ds') if sc.get('stop_ds') is not None else FAR, FAR),
-             junction_ds=min(sc.get('junction_ds') if sc.get('junction_ds') is not None else FAR, FAR))
+    def far(k):
+        x = sc.get(k)
+        return min(x if x is not None else FAR, FAR)
+    f = dict(v=v, d=d, lead_ds=far('lead_ds'), lead_v=sc.get('lead_v') or 0.0,
+             stop_ds=far('stop_ds'), junction_ds=far('junction_ds'), entry_ds=far('entry_ds'),
+             in_junction=float(bool(sc.get('in_junction', False))))
     b = blocker_info(sc)
     f.update(blk_present=float(b is not None), blk_ds=b['ds'] if b else FAR,
              blk_vs=b['vs'] if b else 0.0, blk_stopped=b['stopped'] if b else 0.0,
@@ -180,6 +193,38 @@ def go_label(sc, plan_fl, go_m=1.5, wait_m=0.5):
     return -1
 
 
+def yield_decision_frame(sc):
+    """A junction-entry gap decision is ours to make: the next entry is
+    2-30 m ahead, we are not inside a junction, no light / stop sign already
+    holds us (stop_ds: the rule layer), and no lead or blocker would stop us
+    before the entry anyway."""
+    e = sc.get('entry_ds')
+    if e is None or not (2.0 < e < 30.0) or sc.get('in_junction'):
+        return False
+    if sc.get('stop_ds') is not None:
+        return False
+    if sc.get('lead_ds') is not None and sc['lead_ds'] < e + 2.0:
+        return False
+    b = blocker_info(sc)
+    return b is None or b['ds'] > e
+
+
+def yield_label(sc, plan_fl, stop_v=1.0, enter_m=3.0):
+    """1 = the teacher stops short of the junction entry (yields), 0 = it
+    enters, -1 = not a decision frame or ambiguous.  From its plan: forward
+    distance after 3 s against entry_ds, and its planned speed at 2-3 s."""
+    if not yield_decision_frame(sc):
+        return -1
+    p = np.asarray(plan_fl, dtype=float)
+    fwd3, e = float(p[-1, 0]), float(sc['entry_ds'])
+    v_late = float(np.mean(plan_speeds(plan_fl)[-2:]))
+    if fwd3 < e + 0.5 and v_late < stop_v:
+        return 1
+    if fwd3 > e + enter_m:
+        return 0
+    return -1
+
+
 def plan_dv(sc, plan_fl):
     """Planned speed at ~1-1.5 s minus our speed (ORION's raw slow-down signal;
     biased by its speed inertia -- debiased per speed bin in build_tactical)."""
@@ -189,9 +234,14 @@ def plan_dv(sc, plan_fl):
 
 # ── deployment ─────────────────────────────────────────────────────────────
 
+PROB_HEADS = ('go', 'yield', 'slow')       # sigmoid outputs; 'dv' is linear (x dv_scale)
+
+
 class TacticalEnsemble:
     def __init__(self, weights, meta):
         self.meta = meta
+        self.heads = list(meta.get('heads', ['go', 'slow']))     # v1 models: go, slow
+        self.dv_scale = float(meta.get('dv_scale', 1.0))
         self.mean = np.asarray(meta['x_mean'])
         self.std = np.asarray(meta['x_std'])
         self.n_members, self.n_layers = int(meta['n_members']), int(meta['n_layers'])
@@ -204,7 +254,8 @@ class TacticalEnsemble:
         return cls(dict(np.load(os.path.join(d, 'tactical.npz'))), meta)
 
     def forward(self, x):
-        """x (D,) -> (p_go, p_slow, std_go, std_slow)."""
+        """x (D,) -> {head: (ensemble mean, ensemble std)}; probabilities for
+        go / yield / slow, metres-per-second for dv."""
         z = np.clip((np.asarray(x, float) - self.mean) / self.std, -5.0, 5.0)
         outs = []
         for member in self.layers:
@@ -213,56 +264,83 @@ class TacticalEnsemble:
                 h = h @ W + b
                 if i < self.n_layers - 1:
                     h = np.maximum(h, 0.0)
-            outs.append(1.0 / (1.0 + np.exp(-h)))
+            outs.append(h)
         o = np.stack(outs)
-        return o[:, 0].mean(), o[:, 1].mean(), o[:, 0].std(), o[:, 1].std()
+        res = {}
+        for k, name in enumerate(self.heads):
+            col = o[:, k]
+            col = 1.0 / (1.0 + np.exp(-col)) if name in PROB_HEADS else col * self.dv_scale
+            res[name] = (float(col.mean()), float(col.std()))
+        return res
 
 
 class TacticalPolicy:
-    """Per-tick decisions with a short hold, so 'go' / 'wait' does not flicker
-    between ticks (a pass half-started and aborted is the failure we are
-    fixing)."""
+    """Per-tick decisions with a short hold per head, so 'go' / 'wait' does not
+    flicker between ticks (a pass half-started and aborted is the failure we
+    are fixing).  step() -> dict(go: bool, yield_: bool, dv: float | None);
+    dv is a speed change to cap at (negative), None = no cap."""
 
     HOLD_TICKS = 10          # keep a decision >= 0.5 s
     CONTEXT_M = 60.0         # the network runs only if some actor is this close ahead
+    DV_ON, DV_OFF = -1.0, -0.5       # cap when dv <= DV_ON, release when dv > DV_OFF
+    SLOW_DV = -2.0                   # v1 models: binary slow = this cap
 
-    def __init__(self, path, go_threshold=0.5, slow_threshold=0.5):
+    def __init__(self, path, go_threshold=0.5, slow_threshold=0.5, yield_threshold=0.5):
         self.net = TacticalEnsemble.load(path)
+        self.heads = self.net.heads
         self.go_threshold, self.slow_threshold = go_threshold, slow_threshold
+        self.yield_threshold = yield_threshold
         self.frames = deque(maxlen=max(HIST_LAGS) + 1)
-        self.go, self.slow, self._held = True, False, 0
+        self.reset()
         self.last = {}
         self.n_queries = 0
         self.n_net = 0           # ticks the network actually ran (efficiency)
 
     def reset(self):
         self.frames.clear()
-        self.go, self.slow, self._held = True, False, 0
+        self.out = dict(go=True, yield_=False, dv=None)
+        self._held = dict(go=self.HOLD_TICKS, yield_=self.HOLD_TICKS, dv=self.HOLD_TICKS)
 
     @classmethod
     def has_context(cls, scene):
         """Anything to decide about: an actor ahead within CONTEXT_M (or just
-        behind, in the passing lane).  With an empty road both heads' answers
-        are fixed (go = no blocker to wait for, slow = no hazard), so the
-        network is skipped -- the learned layer runs only when it matters."""
+        behind, in the passing lane).  With an empty road every head's answer
+        is fixed (go = no blocker to wait for, no one to yield to, no hazard),
+        so the network is skipped -- the learned layer runs only when it
+        matters."""
         return any(-20.0 < a['ds'] < cls.CONTEXT_M for a in scene['actors'])
+
+    def _set(self, key, value):
+        """Change a held decision only after HOLD_TICKS since its last change."""
+        self._held[key] += 1
+        if value != self.out[key] and self._held[key] >= self.HOLD_TICKS:
+            self.out[key], self._held[key] = value, 0
 
     def step(self, scene):
         self.frames.append(frame_features(scene))       # history stays complete
         self.n_queries += 1
         if not self.has_context(scene):
-            self.go, self.slow, self._held = True, False, self.HOLD_TICKS
-            self.last = dict(p_go=1.0, p_slow=0.0, std_go=0.0, std_slow=0.0, net=False)
-            return self.go, self.slow
+            self.out = dict(go=True, yield_=False, dv=None)
+            self._held = dict(go=self.HOLD_TICKS, yield_=self.HOLD_TICKS, dv=self.HOLD_TICKS)
+            self.last = dict(p_go=1.0, p_yield=0.0, dv=0.0, net=False)
+            return dict(self.out)
         fr = list(self.frames)
         x = np.concatenate([fr[max(len(fr) - 1 - lag, 0)] for lag in HIST_LAGS])
-        p_go, p_slow, s_go, s_slow = self.net.forward(x)
+        r = self.net.forward(x)
         self.n_net += 1
-        self._held += 1
-        if self._held >= self.HOLD_TICKS:
-            go, slow = p_go >= self.go_threshold, p_slow >= self.slow_threshold
-            if go != self.go or slow != self.slow:
-                self.go, self.slow, self._held = go, slow, 0
-        self.last = dict(p_go=float(p_go), p_slow=float(p_slow),
-                         std_go=float(s_go), std_slow=float(s_slow), net=True)
-        return self.go, self.slow
+        p_go = r['go'][0]
+        self._set('go', p_go >= self.go_threshold)
+        p_yield = r['yield'][0] if 'yield' in r else 0.0
+        self._set('yield_', p_yield >= self.yield_threshold)
+        if 'dv' in r:
+            dv = r['dv'][0]
+            cap_now = self.out['dv'] is not None
+            want = dv <= self.DV_ON or (cap_now and dv <= self.DV_OFF)
+            self._set('dv', round(dv, 2) if want else None)
+            if want and self.out['dv'] is not None:
+                self.out['dv'] = round(dv, 2)        # while capped, track the value
+        else:
+            dv = self.SLOW_DV if r['slow'][0] >= self.slow_threshold else 0.0
+            self._set('dv', self.SLOW_DV if dv < 0 else None)
+        self.last = dict(p_go=p_go, std_go=r['go'][1], p_yield=p_yield, dv=float(dv), net=True)
+        return dict(self.out)

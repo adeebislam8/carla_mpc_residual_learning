@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 """
-Train the tactical student (go / slow heads) on build_tactical.py datasets.
+Train the tactical student (go / yield / dv heads) on build_tactical.py datasets.
 
     conda activate orion        # any env with torch
     python tools/student/train_tactical.py --data data/tactical_r0.npz --out models/tactical_r0
 
-An ensemble of small MLPs (default 5 x [64, 64], ~7k parameters each), each on
-a bootstrap of training EPISODES, two sigmoid outputs trained with masked,
-class-balanced BCE.  Validation is a fixed set of held-out episodes.  Exports
-numpy weights for src/student/tactical.py (no torch at run time):
+An ensemble of small MLPs (default 5 x [64, 64], ~11k parameters each), each
+on a bootstrap of training EPISODES.  Heads: go and yield -- sigmoid, masked,
+class-balanced BCE (soft 0.5 targets from a two-teacher 'soft' combine are
+fine); dv -- linear, masked Huber loss on dv / DV_SCALE.  Validation is a
+fixed set of held-out episodes.  Exports numpy weights for
+src/student/tactical.py (no torch at run time):
 
     <out>/tactical.npz, tactical_meta.json
 """
@@ -18,6 +20,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+
+DV_SCALE = 3.0           # dv is learned as dv / DV_SCALE (m/s); tactical.py multiplies back
 
 
 def auc(y, p):
@@ -56,7 +60,7 @@ def main():
     parts, off = [], 0
     for p in args.data:
         d = np.load(Path(p).expanduser(), allow_pickle=False)
-        part = {k: d[k] for k in ('X', 'y_go', 'm_go', 'y_slow', 'm_slow', 'ep')}
+        part = {k: d[k] for k in ('X', 'y_go', 'm_go', 'y_yield', 'm_yield', 'dv', 'm_dv', 'ep')}
         part['ep'] = part['ep'] + off
         off += len(d['episodes'])
         names = d['feature_names'].tolist()
@@ -71,9 +75,10 @@ def main():
     X = D['X'].astype(np.float32)
     mean, std = X[tr].mean(0), np.maximum(X[tr].std(0), 1e-3)
     Xn = np.clip((X - mean) / std, -5, 5)
-    Y = np.stack([D['y_go'], D['y_slow']], 1).astype(np.float32)
-    M = np.stack([D['m_go'], D['m_slow']], 1).astype(np.float32)
-    # Class balance per head (positives are rare for both).
+    HEADS = ('go', 'yield', 'dv')
+    Y = np.stack([D['y_go'], D['y_yield'], D['dv'] / DV_SCALE], 1).astype(np.float32)
+    M = np.stack([D['m_go'], D['m_yield'], D['m_dv']], 1).astype(np.float32)
+    # Class balance per binary head (positives are rare); dv: weight 1.
     pos_w = []
     for h in range(2):
         m = M[tr, h] > 0
@@ -87,17 +92,21 @@ def main():
         for h in args.hidden:
             layers += [nn.Linear(din, h), nn.ReLU()]
             din = h
-        layers += [nn.Linear(din, 2)]
+        layers += [nn.Linear(din, len(HEADS))]
         return nn.Sequential(*layers).to(dev)
 
     T = lambda a: torch.as_tensor(a, device=dev)
     Xv, Yv, Mv = T(Xn[is_val]), T(Y[is_val]), T(M[is_val])
 
     def loss_fn(model, x, y, m):
-        logit = model(x)
-        l = nn.functional.binary_cross_entropy_with_logits(
-            logit, y, reduction='none', pos_weight=pos_w.to(dev))
-        return (l * m).sum() / m.sum().clamp(min=1.0)
+        out = model(x)
+        total = 0.0
+        for h in range(2):                                  # go, yield
+            l = nn.functional.binary_cross_entropy_with_logits(
+                out[:, h], y[:, h], reduction='none', pos_weight=pos_w[h].to(dev))
+            total = total + (l * m[:, h]).sum() / m[:, h].sum().clamp(min=1.0)
+        l = nn.functional.huber_loss(out[:, 2], y[:, 2], reduction='none', delta=1.0)
+        return total + (l * m[:, 2]).sum() / m[:, 2].sum().clamp(min=1.0)
 
     members, ep_of = [], D['ep']
     for e in range(args.members):
@@ -126,16 +135,22 @@ def main():
         print(f'member {e}: {len(idx)} frames, best val loss {best:.4f}')
 
     with torch.no_grad():
-        P = torch.stack([torch.sigmoid(m(Xv)) for m in members]).mean(0).cpu().numpy()
+        O = torch.stack([m(Xv) for m in members]).mean(0).cpu().numpy()
     metrics = {}
-    for h, name in enumerate(('go', 'slow')):
-        m = M[is_val, h] > 0
+    for h, name in enumerate(('go', 'yield')):
+        m = (M[is_val, h] > 0) & (Y[is_val, h] != 0.5)      # hard labels only
         y = Y[is_val, h][m]
-        p = P[m, h]
+        p = 1.0 / (1.0 + np.exp(-O[m, h]))
         metrics[f'{name}_val_frames'] = int(m.sum())
         metrics[f'{name}_val_pos_rate'] = float(y.mean()) if m.any() else float('nan')
         metrics[f'{name}_val_auc'] = auc(y, p)
         metrics[f'{name}_val_acc'] = float(((p >= 0.5) == (y > 0.5)).mean()) if m.any() else float('nan')
+    m = M[is_val, 2] > 0
+    dv_t, dv_p = Y[is_val, 2][m] * DV_SCALE, O[m, 2] * DV_SCALE
+    metrics['dv_val_frames'] = int(m.sum())
+    metrics['dv_val_mae'] = float(np.abs(dv_p - dv_t).mean()) if m.any() else float('nan')
+    sl = (dv_t < -1.5) | (dv_t > -0.5)                     # the old slow head, from dv
+    metrics['slow_val_auc'] = auc((dv_t[sl] < -1.5).astype(int), -dv_p[sl]) if sl.any() else float('nan')
 
     # Training cost for the paper (vs teacher labelling / end-to-end training).
     train_cost = dict(wall_s=round(time.perf_counter() - t_start, 1),
@@ -154,6 +169,7 @@ def main():
     np.savez(out / 'tactical.npz', **weights)
     n_params = int(sum(v.size for v in weights.values()))
     meta = dict(n_members=args.members, n_layers=n_layers, hidden=args.hidden,
+                heads=list(HEADS), dv_scale=DV_SCALE,
                 x_mean=mean.tolist(), x_std=std.tolist(), feature_names=names,
                 n_params_total=n_params, n_params_per_member=n_params // args.members,
                 train_episodes=int(len(train_eps)), val_episodes=int(n_val),
