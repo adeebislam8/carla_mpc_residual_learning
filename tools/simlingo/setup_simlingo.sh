@@ -25,7 +25,7 @@ PIP="$CONDA run --no-capture-output -n simlingo env PYTHONNOUSERSITE=1 python -m
 $PIP install torch==2.2.0
 $PIP install flash-attn==2.7.0.post2 --no-build-isolation || \
   echo "!! flash-attn build failed -- check CUDA_HOME / nvcc (same trap as ORION: conda cuda-toolkit)"
-$PIP install nvidia-ml-py huggingface_hub
+$PIP install nvidia-ml-py huggingface_hub scipy   # scipy: team_code/nav_planner.py
 
 if [ ! -d "$ROOT/ckpts" ] || [ -z "$(ls -A "$ROOT/ckpts" 2>/dev/null)" ]; then
   "$CONDA" run --no-capture-output -n simlingo python -c "

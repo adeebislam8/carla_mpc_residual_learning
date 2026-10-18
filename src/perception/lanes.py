@@ -132,8 +132,10 @@ def fit_lane_centre(X, Y, x_bins=(4.0, 36.0, 2.0), lane_width=3.5, gap=0.8, ref0
         if keep.all() or keep.sum() < 3:
             break
         xs, cs, ws = xs[keep], cs[keep], ws[keep]
+    # two_line_frac: share of bins bounded by both lines (1.0) vs one line +
+    # half a lane (0.5 weight) -- the lane belief's measurement confidence
     return dict(coeffs=coeffs.tolist(), x_min=float(xs.min()), x_max=float(xs.max()),
-                n_bins=int(len(xs)))
+                n_bins=int(len(xs)), two_line_frac=float(np.mean(ws == 1.0)))
 
 
 class LanePerception:

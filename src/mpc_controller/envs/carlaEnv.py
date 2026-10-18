@@ -1553,6 +1553,7 @@ class CarlaMPCEnv(gym.Env):
     RULE_QUEUE_M = 25.0         # ... nor this far upstream of a stop line (a queue)
     RULE_YIELD_T = 4.0          # yield to crossing traffic entering our path within
     RULE_QUEUE_GAP_M = 15.0     # another stopped car this close ahead of it = a queue
+    PASS_SIGMA_MAX = 1.0        # lane belief sigma (m) above which nothing is passed
 
     def _in_junction(self, s, margin=0.0):
         if self._route_junction is None or self._road_width_s is None:
@@ -1568,6 +1569,9 @@ class CarlaMPCEnv(gym.Env):
             return True                     # deadlock escape overrides every rule
         if self.tactical_wait:
             return False                    # the student said: wait behind it
+        if self.lane_sigma(self.selected_obstacles[i][0]) > self.PASS_SIGMA_MAX:
+            return False                    # lane geometry there unknown: stop behind, don't
+                                            # pull out blind (creep still breaks a deadlock)
         if not self.behavior_rules:
             return True
         s_obs = self.selected_obstacles[i][0]
@@ -1606,8 +1610,11 @@ class CarlaMPCEnv(gym.Env):
                 continue
             d_fut = d_obs + vd * horizon
             crossing = (d_obs - self.current_d) * (d_fut - self.current_d) < 0  # passes through
+            # unsure lane geometry widens 'in our lane' -- for following and
+            # braking only (the safe side; never for starting a pass)
+            lane_m = self.FOLLOW_LANE_M + min(self.lane_sigma(s_obs), 1.0)
             if min(abs(d_obs - self.current_d), abs(d_fut - self.current_d)) \
-                    >= self.FOLLOW_LANE_M and not (self.behavior_rules and crossing):
+                    >= lane_m and not (self.behavior_rules and crossing):
                 continue
             # A stationary obstacle (parked car, pile-up, cones) is to be
             # passed, not followed: capping speed to stop behind it froze the
@@ -1752,6 +1759,15 @@ class CarlaMPCEnv(gym.Env):
         if s >= ls[-1]:
             return float(self._lane_d[-1]) * max(0.0, 1.0 - (s - ls[-1]) / self.LANE_DECAY_M)
         return float(np.interp(s, ls, self._lane_d))
+
+    def lane_sigma(self, s):
+        """Uncertainty (m) of the perceived lane centre at route s, from the
+        lane belief (perception/lane_belief.py); 0 without one (legacy: the
+        estimate was taken as exact)."""
+        ss = getattr(self, '_lane_sigma_s', None)
+        if ss is None or len(ss) == 0:
+            return 0.0
+        return float(np.interp(s, ss, self._lane_sigma))
 
     PERCEIVED_D = (-8.0, 4.5)        # road corridor kept from LiDAR tracks (lane frame)
     PERCEIVED_DS = (-40.0, 120.0)

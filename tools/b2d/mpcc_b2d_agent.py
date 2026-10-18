@@ -60,6 +60,10 @@ Efficiency / robustness (sensor-only):
     the route, behind-first -- the old behaviour.  Its smoke "win" (65.6 vs
     59.1) was a parallel run that shared the acados solver dir; clean n1:
     noprio 60.6 vs 55.5, inside the 9-route noise of ~10 DS -- undecided)
+  lane_belief (false: the perceived lane centre is a probabilistic belief --
+    per-metre mean + sigma, Kalman-fused YOLOP fits with memory and lane
+    identity (perception/lane_belief.py); sigma makes uncertain stretches
+    'not passable' and widens the follow lane.  false = the 2026-10-19 tracker)
   aeb (true: emergency brake under every arm -- full brake when an obstacle
     the MPC's PLANNED path will overlap is < AEB_TTC_S time-to-contact away;
     a planned pass around it does not trigger)
@@ -114,6 +118,7 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_REPO, 'src'))
+from perception.route_geometry import densify_route, route_sag_bound  # noqa: E402
 
 DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 perception=False, traffic_rules=True, student=None,
@@ -129,7 +134,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 light_gate_m=60.0, device='cuda', creep_after_s=None,
                 creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False,
                 obstacle_face=False, obstacle_priority=True,
-                gt_obstacles=False, gt_lights=False, aeb=True)
+                gt_obstacles=False, gt_lights=False, aeb=True,
+                lane_belief=False)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -202,57 +208,6 @@ def _local_to_world(tf, loc):
     yaw = math.radians(tf.rotation.yaw)
     return (tf.location.x + loc.x * math.cos(yaw) - loc.y * math.sin(yaw),
             tf.location.y + loc.x * math.sin(yaw) + loc.y * math.cos(yaw))
-
-
-def densify_route(nodes, spacing=1.0):
-    """Sparse route nodes [(x, y)] -> points every `spacing` m along a
-    shape-preserving cubic (PCHIP, chord-length parametrised) through them, plus
-    for each output point the index of the node segment it lies in.  (A natural
-    CubicSpline overshot ~5 m sideways on a straight before a junction: node
-    spacing jumps from 50 m to ~14 m there.)"""
-    from scipy.interpolate import PchipInterpolator as CubicSpline
-    P = np.asarray(nodes, dtype=float)
-    keep = np.r_[True, np.hypot(*np.diff(P, axis=0).T) > 0.5]
-    P = P[keep]
-    idx_map = np.nonzero(keep)[0]
-    if len(P) < 2:
-        return P.tolist(), [0] * len(P)
-    t = np.r_[0.0, np.cumsum(np.hypot(*np.diff(P, axis=0).T))]
-    if len(P) == 2:
-        tt = np.arange(0.0, t[-1], spacing)
-        pts = P[0] + np.outer(tt / t[-1], P[1] - P[0])
-    else:
-        cx, cy = CubicSpline(t, P[:, 0]), CubicSpline(t, P[:, 1])
-        tt = np.arange(0.0, t[-1], spacing)
-        pts = np.stack([cx(tt), cy(tt)], axis=1)
-    seg = np.clip(np.searchsorted(t, tt, side='right') - 1, 0, len(P) - 2)
-    return pts.tolist(), idx_map[seg].tolist()
-
-
-def route_sag_bound(nodes, margin=1.0, cap=5.0):
-    """Per node segment: how far the real lane can lie from the densified
-    route.  A chord of length L between nodes on a road turning by dtheta per
-    chord misses the arc by its sagitta ~ L * dtheta / 8 (R60 bend, 45 m nodes:
-    4.2 m, as measured).  The perceived lane correction is clipped to this, so
-    on a straight a mis-tracked lane cannot drag the car across lanes."""
-    P0 = np.asarray(nodes, dtype=float)
-    keep = np.r_[True, np.hypot(*np.diff(P0, axis=0).T) > 0.5]     # as densify_route
-    P, idx_map = P0[keep], np.nonzero(keep)[0]
-    n = len(P)
-    if n < 2:
-        return [margin] * max(len(P0), 1)
-    v = np.diff(P, axis=0)
-    L = np.hypot(v[:, 0], v[:, 1])
-    h = np.arctan2(v[:, 1], v[:, 0])
-    turn = np.abs((np.diff(h) + np.pi) % (2 * np.pi) - np.pi)       # at inner nodes
-    out = []
-    for k in range(n - 1):
-        dth = max(turn[k - 1] if k >= 1 else 0.0, turn[k] if k < len(turn) else 0.0)
-        out.append(float(min(cap, margin + L[k] * dth / 8.0)))
-    out.append(out[-1])
-    # back to ORIGINAL node indices (densify_route's seg ids)
-    pos = np.clip(np.searchsorted(idx_map, np.arange(len(P0)), side='right') - 1, 0, n - 1)
-    return [out[p] for p in pos]
 
 
 def _road_width(wp, junction_margin=4.0):
@@ -500,6 +455,13 @@ class MPCCAgent(AutonomousAgent):
                 self._lanes = LanePerception(c['yolop'], camera=CameraGeometry(
                     W=1600, H=900, fov_deg=ffov, x=fx, y=fy, z=1.60), device=c['device'])
                 core.mpc_controller.n_lane_fn = core.lane_offset
+                self._lane_belief = None
+                if c['lane_belief']:
+                    from perception.lane_belief import LaneBelief
+                    rs, lb = self._route_s, self._lane_bound
+                    self._lane_belief = LaneBelief(
+                        prior_sigma_fn=lambda q: lb[min(int(np.searchsorted(rs, q)), len(lb) - 1)] / 2.0,
+                        junction_fn=core._in_junction)
             self._stop_entries_done = set()
             self._stop_sign_seen_t = -1e9
             # Stop-line context for the rules arm: every junction entry.
@@ -729,6 +691,7 @@ class MPCCAgent(AutonomousAgent):
                 ocp_fail=int(getattr(core.mpc_controller, 'consecutive_failures', 0)),
                 light_hold=int(getattr(self, '_light_hold', None) is not None),
                 aeb=int(self._aeb_active),
+                lane_sig=round(core.lane_sigma(core.current_s), 2),
                 n_cand=getattr(core, '_n_cand', None), n_near=getattr(core, '_n_near', None),
                 **{f'ms_{k}': round(1000.0 * v, 2) for k, v in self._ms.items()},
                 **(self._perception_check() if not self.cfg['privileged'] else {})))
@@ -975,6 +938,8 @@ class MPCCAgent(AutonomousAgent):
         sampled along it; inside junctions the spline itself is the reference
         (no lane markings there)."""
         core = self.core
+        if getattr(self, '_lane_belief', None) is not None:
+            return self._update_lane_belief(img, ex, ey, yaw)
         # Track ONE lane: search where the tracked lane's centre should be now
         # (vehicle-frame y = its offset from the route - ours), so it keeps its
         # identity while we pass beside it.  Re-anchor to the route (y = -d)
@@ -1011,6 +976,30 @@ class MPCCAgent(AutonomousAgent):
             dd.append(0.0 if core._in_junction(s_q) else float(np.clip(d_q, -b, b)))
         if len(ss) >= 2 and np.all(np.diff(ss) > 0):
             core.set_lane_offsets(ss, dd)
+
+    def _update_lane_belief(self, img, ex, ey, yaw):
+        """lane_belief: every YOLOP fit updates the per-metre belief (with its
+        own lane-identity test); the MPCC steers by the belief's mean and the
+        decision layer reads its sigma (CarlaMPCEnv.lane_sigma)."""
+        from perception.lane_belief import fit_points_on_route
+        core, lb = self.core, self._lane_belief
+        s, d = core.current_s, core.current_d
+        lb.advance(s)
+        i = min(int(np.searchsorted(self._route_s, s + 10.0)), len(self._route_cmds) - 1)
+        if self._route_cmds[i] in (5, 6):            # route lane change: back to the prior
+            lb.reset_range(s, s + 40.0)
+            ref0 = -d
+        else:
+            ref0 = lb.offset(s + 5.0) - d
+        est = self._lanes.update(img, ref0=ref0)
+        self._lane_valid = bool(est.get('valid'))
+        if self._lane_valid and est.get('fresh'):
+            ss, dd, xx = fit_points_on_route(est, ex, ey, yaw, core.frenet_converter, s)
+            if len(ss) >= 3:
+                self._lane_verdict = lb.update_fit(ss, dd, xx, est.get('two_line_frac', 1.0))
+        s_b, mu, sig = lb.window()
+        core._lane_s, core._lane_d = s_b, mu          # the belief already weighs the evidence
+        core._lane_sigma_s, core._lane_sigma = s_b, sig
 
     def _perception_check(self):
         """DIAGNOSTIC ONLY (trace), never used for control: the nearest
