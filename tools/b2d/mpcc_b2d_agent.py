@@ -81,7 +81,14 @@ evaluated in -- only on-board sensors and the route:
   * stop lines / junctions   from the route's own commands (junction = LEFT /
                     RIGHT / STRAIGHT segments); no HD map
   * corridor        the MPCC's fixed two-lane default (no lane widths)
-The simulator is read only for the trace/diagnostics, never for control.
+The simulator is read only for the trace/diagnostics, never for control --
+except in the perception ablation (E4), which swaps ONE module for ground truth
+while the rest stays sensor-only:
+  gt_obstacles (false)  true actors (vehicles, walkers, props) as tracks, fed
+                        through the same _set_obstacles_from_tracks as LiDAR
+  gt_lights (false)     true light states + stop signs (the privileged
+                        _rule_stop_target); camera detector off
+  sparse_route false    GT lanes: the dense 1 m lane-centre route; YOLOP off
 
 Recording uses ORION's own Bench2Drive sensor rig (team_code/orion_b2d_agent.py)
 and its RoutePlanner command logic, so the teacher sees exactly its training
@@ -117,7 +124,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 sparse_route=None, yolop='models/yolop/yolop-640-640.onnx',
                 light_gate_m=60.0, device='cuda', creep_after_s=None,
                 creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False,
-                obstacle_face=False, obstacle_priority=True)
+                obstacle_face=False, obstacle_priority=True,
+                gt_obstacles=False, gt_lights=False)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -462,7 +470,7 @@ class MPCCAgent(AutonomousAgent):
             self._ego_est = EgoStateEstimator(*_get_latlon_ref(world), antenna_x=GNSS_X)
             self._lidar = LidarObstacleTracker(mount=tuple(c['lidar_mount']))
             self._tl = None
-            if c['traffic_rules']:
+            if c['traffic_rules'] and not c['gt_lights']:
                 from perception.traffic_lights import TrafficLightDetector
                 self._tl = TrafficLightDetector(device=c['device'])
             self._last_applied = (0.0, 0.0, 0.0)          # throttle, brake, steer
@@ -489,8 +497,12 @@ class MPCCAgent(AutonomousAgent):
                         dp.append(p)
                 self._diag_fc = FrenetConverter(dp)
             self._index_traffic_rules(world)
-            self._diag_lights, self._rule_lights = self._rule_lights, []
-            self._rule_signs = []
+            if c['gt_lights']:                  # E4: true lights + stop signs drive the stop
+                self._diag_lights = list(self._rule_lights)
+            else:
+                self._diag_lights, self._rule_lights = self._rule_lights, []
+                self._rule_signs = []
+            self._gt_last_moving = {}           # gt_obstacles: actor id -> last time moving
         elif c['traffic_rules']:
             self._index_traffic_rules(world)
             # Stop-line context for the behavior_rules arm (queued traffic).
@@ -596,7 +608,7 @@ class MPCCAgent(AutonomousAgent):
         # so the OCP plans the stop itself.
         if not self.cfg['traffic_rules']:
             stop_ds = None
-        elif self.cfg['privileged']:
+        elif self.cfg['privileged'] or self.cfg['gt_lights']:
             stop_ds = self._rule_stop_target()
         else:
             t1 = time.perf_counter()
@@ -796,11 +808,51 @@ class MPCCAgent(AutonomousAgent):
             self._ms['yolop_net'] = self._lanes.last_net_s
             self._ms['lane'] = time.perf_counter() - t2
         t2 = time.perf_counter()
-        tracks = self._lidar.update(input_data['LIDAR'][1], (x, y, yaw), timestamp)
+        if self.cfg['gt_obstacles']:
+            tracks = self._gt_tracks(timestamp)
+        else:
+            tracks = self._lidar.update(input_data['LIDAR'][1], (x, y, yaw), timestamp)
         core._set_obstacles_from_tracks(tracks)
         self._ms['lidar'] = time.perf_counter() - t2
         if self.dump_dir and self.n_steps % DUMP_EVERY == 0:
             self._dump_sensors(input_data, x, y, yaw, v, timestamp)
+
+    def _gt_tracks(self, t):
+        """E4 gt_obstacles: the true actors in the LiDAR tracker's output format
+        (perception/lidar_obstacles.py), so everything downstream is unchanged:
+        box centre, true velocity, box outline as 'pts' (corners + edge
+        midpoints: long objects still get their length points), true type,
+        stopped_for = time since last moving (99 = never seen moving)."""
+        hero = self.hero_actor
+        ego = hero.get_location()
+        r = self.cfg['obstacle_radius_m']
+        out = []
+        for a in CarlaDataProvider.get_world().get_actors():
+            ty = a.type_id
+            if a.id == hero.id or not (ty.startswith('vehicle.') or ty.startswith('walker.pedestrian')
+                                       or ty.startswith('static.prop')):
+                continue
+            if any(k in ty for k in DRIVABLE_PROPS):
+                continue
+            tf = a.get_transform()
+            if tf.location.distance(ego) > r:
+                continue
+            bb = a.bounding_box
+            yaw = math.radians(tf.rotation.yaw)
+            cy, sy = math.cos(yaw), math.sin(yaw)
+            cx = tf.location.x + cy * bb.location.x - sy * bb.location.y
+            cyy = tf.location.y + sy * bb.location.x + cy * bb.location.y
+            ex, ey = bb.extent.x, bb.extent.y
+            pts = [(cx + cy * u * ex - sy * w * ey, cyy + sy * u * ex + cy * w * ey)
+                   for u, w in ((1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1))]
+            vel = a.get_velocity()
+            if math.hypot(vel.x, vel.y) > 1.0:
+                self._gt_last_moving[a.id] = t
+            lm = self._gt_last_moving.get(a.id)
+            out.append(dict(id=a.id, x=cx, y=cyy, vx=vel.x, vy=vel.y,
+                            length=2 * ex, width=2 * ey, height=2 * bb.extent.z,
+                            type=ty, pts=pts, stopped_for=99.0 if lm is None else t - lm))
+        return out
 
     def _dump_sensors(self, input_data, x, y, yaw, v, t):
         """Raw on-board inputs for the offline efficiency benchmark
