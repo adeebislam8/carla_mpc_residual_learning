@@ -108,6 +108,25 @@ def rule_stop_at_entry(rec):
     return gt.get('sign_ds') is not None and gt['sign_ds'] < e + 5.0
 
 
+def wedged_frames(recs, v_stop=0.3, thr_push=0.3, after=20, v_free=1.0):
+    """Frames where the car pushes (throttle > thr_push) yet has not moved
+    (v < v_stop) for `after` ticks -- wedged against what it hit -- until it
+    moves again (v > v_free).  rec_train_clips2: ~60 % of all standstill ticks
+    were this; labels there are noise (the teacher plans for a car that cannot
+    move) and they swamp the decision frames."""
+    out, run, wedged = [], 0, False
+    for r in recs:
+        v = float(r['scene']['v'])
+        thr = float((r.get('u_final') or [0.0, 0.0])[0])
+        run = run + 1 if (v < v_stop and thr > thr_push) else 0
+        if run >= after:
+            wedged = True
+        elif v > v_free:
+            wedged = False
+        out.append(wedged)
+    return out
+
+
 def load_labels(root):
     out = {}
     for p in glob.glob(os.path.join(os.path.expanduser(root), '*.npz')):
@@ -232,8 +251,12 @@ def main():
             ia = {int(s): j for j, s in enumerate(la['steps'])}
             ib = {int(s): j for j, s in enumerate(lb['steps'])} if two else None
             frames = [frame_features(r['scene']) for r in recs]
+            wedge = wedged_frames(recs)
+            fstats['wedged_frames_dropped'] += int(sum(wedge))
             n_ep = len(names)
             for i, r in enumerate(recs):
+                if wedge[i]:
+                    continue
                 ja = ia.get(int(r['step']))
                 jb = ib.get(int(r['step'])) if two else None
                 if ja is None or la['empty'][ja] or (two and (jb is None or lb['empty'][jb])):

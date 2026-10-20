@@ -190,6 +190,8 @@ LIGHT_GREEN_S = 1.0          # ... spread over this long with no red/yellow betw
 LIGHT_PASSED_M = 3.0         # past the held entry by this much: committed, release
 LIGHT_HOLD_MAX_S = 25.0      # no red/yellow seen for this long: release
 LIGHT_REHOLD_S = 8.0         # after a green release, ignore 'red' at that entry this long
+LIGHT_ENTRY_MAX_S = 40.0     # total red-hold time at one entry, then never hold there again
+LIGHT_YELLOW_MIN_V = 3.0     # a yellow starts a hold only while moving faster than this
 # Emergency brake (aeb): a safety layer under every arm, like the CBF.
 AEB_TTC_S = 1.6              # brake when time-to-contact along the route drops below this
 AEB_LEN_M = 4.0              # ego centre -> front (2.4) + slack: obstacle points are centres or faces
@@ -289,6 +291,8 @@ class MPCCAgent(AutonomousAgent):
         self.n_light_runs = 0            # ticks the light detector actually ran
         self._light_hold = None          # red hold: {e: entry s, t: last red/yellow, green: run}
         self.n_light_holds = 0
+        self._entry_hold_s = {}          # junction entry -> total red-hold seconds there
+        self._light_given_up = set()     # entries whose 'red' we no longer believe
         self._stuck_t, self._creep_t, self._creep_cool = 0.0, 0.0, 0.0
         self.n_creep_events, self.n_creep_ticks = 0, 0
 
@@ -1128,8 +1132,16 @@ class MPCCAgent(AutonomousAgent):
                     hold['g0'] = timestamp
             green_ok = hold['green'] >= LIGHT_GREEN_N \
                 and timestamp - hold['g0'] >= LIGHT_GREEN_S
-            if green_ok or s > hold['e'] + LIGHT_PASSED_M \
+            # A hold longer than any real red phase is someone else's light
+            # (rec_train_clips2 900031/900032: true light none, the detector
+            # saw another road's red / yellow flickers for 1-3 min): give up
+            # on that entry for good.
+            held = self._entry_hold_s.get(hold['e'], 0.0) + timestamp - hold['t0']
+            if held > LIGHT_ENTRY_MAX_S:
+                self._light_given_up.add(hold['e'])
+            if green_ok or s > hold['e'] + LIGHT_PASSED_M or held > LIGHT_ENTRY_MAX_S \
                     or timestamp - hold['t'] > LIGHT_HOLD_MAX_S:
+                self._entry_hold_s[hold['e']] = held
                 self._light_hold = None
                 self.n_light_holds += 1
                 # a green-released entry is not re-held on a stray 'red'
@@ -1144,10 +1156,13 @@ class MPCCAgent(AutonomousAgent):
         e = nxt[0]
         ds = e - s - 0.5
         rel = getattr(self, '_light_released', None)
-        fresh = rel is None or rel[0] != e or timestamp - rel[1] > LIGHT_REHOLD_S
-        if fresh and (light == 'red' or (light == 'yellow'
+        fresh = (rel is None or rel[0] != e or timestamp - rel[1] > LIGHT_REHOLD_S) \
+            and e not in self._light_given_up
+        # yellow only while moving: seen when (nearly) stopped it is a flicker or
+        # another road's light, and it restarted holds every 8 s (900031)
+        if fresh and (light == 'red' or (light == 'yellow' and v > LIGHT_YELLOW_MIN_V
                                          and v ** 2 / (2 * max(ds, 0.1)) <= 2 * RULE_DECEL)):
-            self._light_hold = dict(e=e, t=timestamp, green=0, g0=None)
+            self._light_hold = dict(e=e, t=timestamp, t0=timestamp, green=0, g0=None)
             return ds
         if timestamp - self._stop_sign_seen_t < 3.0 and e not in self._stop_entries_done:
             if v < 0.1 and ds < 3.0:
