@@ -462,7 +462,7 @@ def _energy_meter():
     return EnergyMeter()
 
 
-def label_episodes(teacher, episodes, out_dir, stride):
+def label_episodes(teacher, episodes, out_dir, stride, skip_wedged=False):
     """Labels + the TEACHER COST for the paper: wall time, GPU energy and peak
     memory per labelled frame, accumulated over runs in labelling_cost.json."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -470,7 +470,24 @@ def label_episodes(teacher, episodes, out_dir, stride):
     with _energy_meter() as em:
         for ep in episodes:
             ep = Path(ep)
-            metas = _load_episode(ep)[::stride]
+            if (out_dir / f'{ep.name}.npz').exists():
+                print(f'[{ep.name}] already labelled -- skipped', flush=True)
+                continue
+            metas = _load_episode(ep)
+            if skip_wedged:
+                # frames where the car pushes against what it hit: dropped by
+                # build_tactical anyway; ~1/3 of the frames, and the car is not
+                # moving, so ORION's temporal memory sees a pause, not a jump
+                if REPO_SRC not in sys.path:
+                    sys.path.insert(0, REPO_SRC)
+                from student.tactical import wedged_frames
+                # stride FIRST, then drop: the kept frames stay on the same
+                # every-stride-th grid as SimLingo's labels (the 'both' teacher
+                # needs both on the same frames)
+                w = wedged_frames(metas)
+                metas = [m for i, (m, x) in enumerate(zip(metas, w)) if i % stride == 0 and not x]
+            else:
+                metas = metas[::stride]
             frames = ((_read_frame(ep, m['step']), m) for m in metas)
             out = _run_sequence(teacher, frames, scene_token=ep.name)
             np.savez_compressed(out_dir / f'{ep.name}.npz', **out)
@@ -499,6 +516,8 @@ def main():
                     help='run N synthetic frames and report VRAM / latency')
     ap.add_argument('--episode', nargs='+', default=[], help='recorded episode dirs')
     ap.add_argument('--out', default='orion_labels', help='output dir for .npz labels')
+    ap.add_argument('--skip-wedged', action='store_true',
+                    help='do not label frames where the car is wedged (pushing, not moving)')
     ap.add_argument('--stride', type=int, default=1,
                     help='label every Nth recorded step (timestamps stay correct)')
     ap.add_argument('--dt', type=float, default=0.05,
@@ -522,7 +541,7 @@ def main():
     if args.selftest:
         selftest(teacher, args.selftest)
     if episodes:
-        label_episodes(teacher, episodes, out_dir, args.stride)
+        label_episodes(teacher, episodes, out_dir, args.stride, args.skip_wedged)
 
 
 if __name__ == '__main__':

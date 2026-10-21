@@ -232,6 +232,25 @@ def plan_dv(sc, plan_fl):
     return float(np.mean(vp[1:3]) - sc['v'])
 
 
+def wedged_frames(recs, v_stop=0.3, thr_push=0.3, after=20, v_free=1.0):
+    """Frames where the car pushes (throttle > thr_push) yet has not moved
+    (v < v_stop) for `after` ticks -- wedged against what it hit -- until it
+    moves again (v > v_free).  rec_train_clips2: ~60 % of all standstill ticks
+    were this; labels there are noise (the teacher plans for a car that cannot
+    move) and they swamp the decision frames."""
+    out, run, wedged = [], 0, False
+    for r in recs:
+        v = float(r['scene']['v'])
+        thr = float((r.get('u_final') or [0.0, 0.0])[0])
+        run = run + 1 if (v < v_stop and thr > thr_push) else 0
+        if run >= after:
+            wedged = True
+        elif v > v_free:
+            wedged = False
+        out.append(wedged)
+    return out
+
+
 # ── deployment ─────────────────────────────────────────────────────────────
 
 PROB_HEADS = ('go', 'yield', 'slow')       # sigmoid outputs; 'dv' is linear (x dv_scale)

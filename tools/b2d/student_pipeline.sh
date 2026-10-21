@@ -111,7 +111,7 @@ if has label; then
   if [ ${#todo[@]} -gt 0 ]; then
     pkill -9 -f CarlaUE4 2>/dev/null; sleep 5     # free the GPU
     PYTHONNOUSERSITE=1 $PY orion python tools/orion/orion_infer.py \
-      --orion-root "$ORION_ROOT" --jpeg-quality 0 --stride "$STRIDE" --episode "${todo[@]}" --out "$RUN/labels"
+      --orion-root "$ORION_ROOT" --jpeg-quality 0 --stride "$STRIDE" --skip-wedged --episode "${todo[@]}" --out "$RUN/labels"
   fi
   mapfile -t todo < <(todo_for "$RUN/labels_simlingo")
   say "SimLingo labelling: ${#todo[@]} routes"
