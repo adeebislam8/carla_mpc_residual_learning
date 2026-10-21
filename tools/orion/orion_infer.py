@@ -78,6 +78,11 @@ import cv2
 import numpy as np
 import torch
 
+# Absolute NOW: OrionTeacher chdirs into the ORION repo, and on Python 3.8 a
+# script's __file__ is relative -- resolved after the chdir it pointed into
+# the ORION tree ("No module named 'efficiency'", 2026-10-22).
+REPO_SRC = str(Path(__file__).resolve().parents[2] / 'src')
+
 CAMS = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT',
         'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
 
@@ -451,8 +456,8 @@ def selftest(teacher, n):
 def _energy_meter():
     """src/efficiency/power.py EnergyMeter (NVML GPU joules above idle; needs
     nvidia-ml-py in this env -- without it only wall/CPU time is recorded)."""
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
+    if REPO_SRC not in sys.path:
+        sys.path.insert(0, REPO_SRC)
     from efficiency.power import EnergyMeter
     return EnergyMeter()
 
