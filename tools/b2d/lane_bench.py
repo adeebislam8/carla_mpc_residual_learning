@@ -43,9 +43,11 @@ from global_planner.src.frenet_world_converter_python import FrenetConverter  # 
 from perception.lane_belief import LaneBelief, fit_points_on_route  # noqa: E402
 from perception.lanes import CameraGeometry, LanePerception, fit_lane_centre  # noqa: E402
 from perception.route_geometry import densify_route, route_sag_bound  # noqa: E402
+from student.tactical import wedged_frames  # noqa: E402
 
 CAM = dict(W=1600, H=900, fov_deg=70.0, x=0.80, y=0.0, z=1.60)   # ORION_CAMS[0], record mode
-AHEAD = (5.0, 15.0, 25.0)
+AHEAD = (4.0, 14.0, 24.0)          # metres ALONG THE TRUE ROAD
+AHEAD_IDX = (1, 6, 11)            # gt.route_fl points (2 m apart, first at 2 m)
 
 
 class Route:
@@ -153,24 +155,27 @@ class SplineLane:
 
 
 def lateral_errors(route, offset_fn, s, gt_route, tx, ty, tyaw):
-    """|est - true| lateral (left) at AHEAD metres, in the true ego frame."""
+    """Distance (m) from the TRUE lane centre 4 / 14 / 24 m ahead ALONG THE ROAD
+    (gt.route_fl points 2, 7, 12 -- 2 m apart along the true route) to the
+    estimated lane-centre curve.  Heading-free: an earlier version compared
+    lateral offsets at fixed distances in front of the car's nose, which is
+    meaningless when the car sits crooked or rotated after a collision (true
+    lane points then lay up to 20 m 'behind' it) -- that, not the lane
+    estimate, produced the 5 m spline error and the belief's 15 m error."""
     cy, sy = math.cos(tyaw), math.sin(tyaw)
-    f_e, l_e = [], []
-    for ds in np.arange(0.0, 44.0, 2.0):
-        sk = min(s + ds, route.fc.get_path_length())
-        wx, wy, _ = route.fc.frenet_to_world(sk, offset_fn(sk), 0.0)
-        dx, dy = wx - tx, wy - ty
-        f_e.append(cy * dx + sy * dy)
-        l_e.append(sy * dx - cy * dy)
+    L = route.fc.get_path_length()
+    est = np.array([route.fc.frenet_to_world(min(max(s + ds, 0.0), L), offset_fn(min(max(s + ds, 0.0), L)), 0.0)[:2]
+                    for ds in np.arange(-10.0, 50.0, 0.5)])
     g = np.asarray(gt_route, float)
-    f_e, l_e = np.asarray(f_e), np.asarray(l_e)
     out = []
-    for a in AHEAD:
-        if g[:, 0].max() < a or f_e.max() < a or not np.all(np.diff(f_e) > 0):
+    for k in AHEAD_IDX:
+        if k >= len(g):
             out.append(np.nan)
             continue
-        o = np.argsort(g[:, 0])
-        out.append(abs(np.interp(a, f_e, l_e) - np.interp(a, g[o, 0], g[o, 1])))
+        f, l = g[k]
+        wx, wy = tx + cy * f + sy * l, ty + sy * f - cy * l        # back to world
+        # distance to the polyline (vertices every 0.5 m: nearest vertex is within 0.25 m)
+        out.append(float(np.min(np.hypot(est[:, 0] - wx, est[:, 1] - wy))))
     return out
 
 
@@ -184,6 +189,7 @@ def run_episode(ep, lanes, rng):
     nx = ny = 0.0
     rho = 0.98
     s_hint, last_fit_t, rows = None, -1e9, []
+    wedge = wedged_frames(metas)
     for i, m in enumerate(metas):
         gt = m.get('gt') or {}
         if not gt.get('route_fl'):
@@ -211,7 +217,8 @@ def run_episode(ep, lanes, rng):
             if k == 'legacy' and fit is not None:
                 last_fit_t = m['step'] * 0.05
             t.update(fit, refs[k], ex, ey, eyaw, s)
-        row = dict(ep=os.path.basename(ep)[:40], step=m['step'],
+        row = dict(ep=os.path.basename(ep)[:40], step=m['step'], wedged=wedge[i],
+                   moving=float(m['scene']['v']) > 1.0,
                    blind=m['step'] * 0.05 - last_fit_t > 1.0,
                    junction=bool(m['scene'].get('in_junction')),
                    offlane=abs(gt.get('d', 0.0)) > 1.75,
@@ -226,14 +233,16 @@ def run_episode(ep, lanes, rng):
 
 def summarise(rows):
     names = ('spline', 'legacy', 'belief')
-    conds = [('ALL', lambda r: True), ('YOLOP fresh', lambda r: not r['blind']),
+    conds = [('ALL', lambda r: True), ('driving (moving, not wedged)', lambda r: r['moving'] and not r['wedged']),
+             ('wedged after a collision', lambda r: r['wedged']),
+             ('YOLOP fresh', lambda r: not r['blind']),
              ('YOLOP blind >1s', lambda r: r['blind']), ('junction', lambda r: r['junction']),
              ('off lane (overtaking)', lambda r: r['offlane']),
              ('route lane change', lambda r: r['lane_change'])]
     print(f"\n{len(rows)} ticks, {len({r['ep'] for r in rows})} episodes.  "
-          f"|lane-centre error| (m): median / p90 / share > 1.75 m (half a lane)")
+          f"distance to the TRUE lane centre (m), along the road: median / p90 / share > 1.75 m")
     for a in AHEAD:
-        print(f'\n  at {int(a)} m ahead          ' + ''.join(f'{n:>24s}' for n in names))
+        print(f'\n  {int(a)} m ahead along the road ' + ''.join(f'{n:>24s}' for n in names))
         for cname, cf in conds:
             sel = [r for r in rows if cf(r)]
             if not sel:
