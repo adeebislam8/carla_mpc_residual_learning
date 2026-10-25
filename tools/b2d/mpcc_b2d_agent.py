@@ -64,6 +64,9 @@ Efficiency / robustness (sensor-only):
     per-metre mean + sigma, Kalman-fused YOLOP fits with memory and lane
     identity (perception/lane_belief.py); sigma makes uncertain stretches
     'not passable' and widens the follow lane.  false = the 2026-10-19 tracker)
+  wedge_recovery (true: pushing against an obstacle without moving for 2 s ->
+    reverse ~1.5 m if the lane behind is clear, then a creep with stationary
+    obstacles inflated 0.6 m; at most 3 tries per spot)
   aeb (true: emergency brake under every arm -- full brake when an obstacle
     the MPC's PLANNED path will overlap is < AEB_TTC_S time-to-contact away;
     a planned pass around it does not trigger)
@@ -135,7 +138,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False,
                 obstacle_face=False, obstacle_priority=True,
                 gt_obstacles=False, gt_lights=False, aeb=True,
-                lane_belief=False)
+                lane_belief=False, wedge_recovery=True)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -194,10 +197,27 @@ LIGHT_ENTRY_MAX_S = 40.0     # total red-hold time at one entry, then never hold
 LIGHT_YELLOW_MIN_V = 3.0     # a yellow starts a hold only while moving faster than this
 # Emergency brake (aeb): a safety layer under every arm, like the CBF.
 AEB_TTC_S = 1.6              # brake when time-to-contact along the route drops below this
-AEB_LEN_M = 4.0              # ego centre -> front (2.4) + slack: obstacle points are centres or faces
-AEB_LAT_M = 1.7              # lateral overlap: ego half-width 1.0 + obstacle ~0.7
+AEB_FRONT_M = 2.4            # ego centre -> front bumper: points not beyond it are alongside
+AEB_GAP_MARGIN_M = 0.6       # gap = distance ahead of the bumper minus this
+AEB_LAT_M = 1.3              # lateral overlap for LiDAR points (on the obstacle's SURFACE):
+                             # ego half-width 1.0 + 0.3.  1.7 braked planned passes past parked
+                             # cars / cones (rec_train_clips2: 16 % of all standstill)
+AEB_LAT_GT_M = 1.9           # ... for box CENTRES (privileged / gt_obstacles): + half a car
+AEB_CONTACT_LAT_M = 1.0      # the closer-than-AEB_MIN_GAP_M rule: only true contact
 AEB_MIN_GAP_M = 1.0          # this close and still moving: brake whatever the closing speed
 AEB_ON_N = 2                 # consecutive triggering ticks before braking (single-frame phantoms)
+# Wedge recovery (wedge_recovery): after hitting a parked car / cones the MPCC kept
+# pushing into it at full throttle until the route timed out (20-27 % of abl44 routes,
+# ~54 % of the training clips).  Back off, then retry wider.
+WEDGE_DETECT_S = 2.0         # pushing (thr > 0.3) at v < 0.3 this long, obstacle close ahead
+WEDGE_AHEAD_M = 6.0          # ... an obstacle point within this ahead of the ego centre
+WEDGE_REV_M = 1.5            # reverse this far ...
+WEDGE_REV_MAX_S = 2.5        # ... or this long
+WEDGE_REV_THR = 0.4          # throttle in reverse gear
+WEDGE_REAR_M = 8.0           # nothing in our lane within this behind, or no reversing
+WEDGE_INFLATE_M = 0.6        # retry: stationary obstacles pushed this much further out
+WEDGE_RETRY_S = 10.0         # retry phase length (a creep with the wider obstacles)
+WEDGE_MAX_TRIES = 3          # per spot (within 10 m): then give up there
 AEB_OFF_N = 10               # clear ticks before releasing (0.5 s)
 
 
@@ -260,6 +280,8 @@ class MPCCAgent(AutonomousAgent):
         self.n_aeb = 0                   # ticks the emergency brake held
         self._aeb_on, self._aeb_off = 0, 0
         self._aeb_active = False
+        self._wedge, self._push_t, self._wedge_tries = None, 0.0, []   # recovery state
+        self.n_wedge_reverses = 0
         self.t_control = []
         # Per-step trace -> <B2D_TRACE_DIR>/route_<n>.csv + .png (run_b2d.sh sets it)
         self.trace = []
@@ -627,6 +649,8 @@ class MPCCAgent(AutonomousAgent):
                 core.mpc_controller.stop_s = core.current_s + stop_ds
             self._ms['tactical'] = time.perf_counter() - t1
         creeping = self._update_creep(stop_ds)
+        if self._wedge is not None and self._wedge['phase'] == 'retry':
+            self._inflate_static_obstacles(core)
 
         action = np.zeros(2)
         if self.policy is not None:
@@ -649,15 +673,22 @@ class MPCCAgent(AutonomousAgent):
         if self.cfg['aeb'] and self._aeb_step(core):
             thr = -1.0
             self.n_aeb += 1
+        reversing = self.cfg['wedge_recovery'] and self._wedge_step(core, thr, stop_ds, timestamp)
 
         control = carla.VehicleControl()
-        if thr >= 0:
+        if reversing:
+            control.reverse, control.throttle, control.brake = True, WEDGE_REV_THR, 0.0
+            control.steer = 0.0
+        elif thr >= 0:
             control.throttle, control.brake = float(thr), 0.0
         else:
             control.throttle, control.brake = 0.0, float(-thr)
-        control.steer = float(-steer)            # env convention (carlaEnv.step)
+        if not reversing:
+            control.steer = float(-steer)        # env convention (carlaEnv.step)
         if not self.cfg['privileged']:
-            self._last_applied = (control.throttle, control.brake, control.steer)
+            # (the MPC's own D state: no forward throttle while backing off)
+            self._last_applied = (0.0, 0.0, 0.0) if reversing else \
+                (control.throttle, control.brake, control.steer)
         self.t_control.append(time.perf_counter() - t0)
         self._ms['total'] = self.t_control[-1]
         if self.rec_dir is not None:
@@ -695,6 +726,7 @@ class MPCCAgent(AutonomousAgent):
                 ocp_fail=int(getattr(core.mpc_controller, 'consecutive_failures', 0)),
                 light_hold=int(getattr(self, '_light_hold', None) is not None),
                 aeb=int(self._aeb_active),
+                wedge=(0 if self._wedge is None else 1 if self._wedge['phase'] == 'reverse' else 2),
                 lane_sig=round(core.lane_sigma(core.current_s), 2),
                 n_cand=getattr(core, '_n_cand', None), n_near=getattr(core, '_n_near', None),
                 **{f'ms_{k}': round(1000.0 * v, 2) for k, v in self._ms.items()},
@@ -721,6 +753,63 @@ class MPCCAgent(AutonomousAgent):
         self.n_yield += 1
         return e - 0.5
 
+    def _obstacle_close_ahead(self, core):
+        for (s_o, d_o) in core.selected_obstacles:
+            if s_o > -50.0 and 0.0 < s_o - core.current_s < WEDGE_AHEAD_M \
+                    and abs(d_o - core.current_d) < 2.5:
+                return True
+        return False
+
+    def _rear_clear(self, core):
+        """Nothing in our lane within WEDGE_REAR_M behind (perceived tracks in
+        sensor mode -- the obstacle slots only reach 5 m back)."""
+        acts = getattr(core, '_perceived', None)
+        if acts is not None and not self.cfg['privileged']:
+            d_ego = core.current_d - core.lane_offset(core.current_s)
+            return not any(-WEDGE_REAR_M < a['ds'] < 0.0 and abs(a['d'] - d_ego) < 2.0
+                           for a in acts)
+        return not any(s_o > -50.0 and -WEDGE_REAR_M < s_o - core.current_s < 0.0
+                       and abs(d_o - core.current_d) < 2.0
+                       for s_o, d_o in core.selected_obstacles)
+
+    def _wedge_step(self, core, thr, stop_ds, timestamp, dt=0.05):
+        """Wedge recovery state machine; True = reverse this tick."""
+        s, v = core.current_s, core.current_speed
+        w = self._wedge
+        if w is None:
+            pushing = (abs(v) < 0.3 and thr > 0.3 and stop_ds is None
+                       and not self._aeb_active and self._obstacle_close_ahead(core))
+            self._push_t = self._push_t + dt if pushing else 0.0
+            if self._push_t < WEDGE_DETECT_S:
+                return False
+            self._push_t = 0.0
+            tries = [x for x in self._wedge_tries if abs(x - s) < 10.0]
+            if len(tries) >= WEDGE_MAX_TRIES or not self._rear_clear(core):
+                return False                                # give up here / blocked behind
+            self._wedge_tries.append(s)
+            self._wedge = dict(phase='reverse', t0=timestamp, s0=s)
+            self.n_wedge_reverses += 1
+            return True
+        if w['phase'] == 'reverse':
+            if w['s0'] - s >= WEDGE_REV_M or timestamp - w['t0'] >= WEDGE_REV_MAX_S \
+                    or not self._rear_clear(core):
+                w.update(phase='retry', t1=timestamp)
+                # retry = a creep (gate on, CBF on, v <= creep_v) with wider obstacles
+                self._creep_t, self._creep_s0, self._creep_cool = dt, s, 0.0
+                return False
+            return True
+        if timestamp - w['t1'] > WEDGE_RETRY_S or s > w['s0'] + 5.0:
+            self._wedge = None                              # past it, or the retry is over
+        return False
+
+    def _inflate_static_obstacles(self, core):
+        """Retry after a wedge: stationary obstacle points WEDGE_INFLATE_M further
+        out laterally, so the OCP plans the wider line the first attempt lacked."""
+        so, vel = core.selected_obstacles, core.selected_obstacle_vel
+        for i in range(len(so)):
+            if so[i, 0] > -50.0 and abs(vel[i, 0]) < 0.5 and abs(vel[i, 1]) < 0.5:
+                so[i, 1] += WEDGE_INFLATE_M * (1.0 if so[i, 1] >= core.current_d else -1.0)
+
     def _aeb_hit(self, core):
         """Is an obstacle about to be hit?  Time-to-contact along the route
         below AEB_TTC_S (or closer than AEB_MIN_GAP_M while moving), AND the
@@ -738,12 +827,19 @@ class MPCCAgent(AutonomousAgent):
             except Exception:
                 plan = None
         dt = getattr(mpc, 'dt', 0.05)
+        centres = self.cfg['privileged'] or self.cfg['gt_obstacles']
+        lat_m = AEB_LAT_GT_M if centres else AEB_LAT_M
+        creeping = bool(getattr(core, 'creep', False))
         for (s_o, d_o), (vs, vd) in zip(core.selected_obstacles, core.selected_obstacle_vel):
             if s_o <= -50.0:
                 continue
-            gap = s_o - core.current_s - AEB_LEN_M
-            if gap > 40.0 or s_o - core.current_s <= 0.0:
-                continue
+            ahead = s_o - core.current_s
+            if ahead <= AEB_FRONT_M or ahead > 45.0:
+                continue                      # alongside / behind: the CBF's job, not a frontal hit
+            stationary = abs(vs) < 0.5 and abs(vd) < 0.5
+            if creeping and stationary:
+                continue                      # deliberate walking-pace pass around it (CBF on)
+            gap = ahead - AEB_FRONT_M - AEB_GAP_MARGIN_M
             closing = v - vs
             if gap > AEB_MIN_GAP_M and (closing <= 0.3 or gap / closing > AEB_TTC_S):
                 continue
@@ -751,7 +847,10 @@ class MPCCAgent(AutonomousAgent):
             d_ego = core.current_d
             if plan is not None and len(plan):
                 d_ego = float(plan[min(int(round(t / dt)), len(plan) - 1)][1])
-            if abs(d_o + vd * t - d_ego) < AEB_LAT_M:
+            # squeezing past something STATIONARY at < 1 m: brake only for true
+            # contact; anything moving keeps the full lateral margin
+            lim = min(lat_m, AEB_CONTACT_LAT_M) if (gap <= AEB_MIN_GAP_M and stationary) else lat_m
+            if abs(d_o + vd * t - d_ego) < lim:
                 return True
         return False
 
@@ -1355,7 +1454,8 @@ class MPCCAgent(AutonomousAgent):
                       f'{1000 * np.median(self.t_control):.1f} ms, p95 '
                       f'{1000 * np.percentile(self.t_control, 95):.1f} ms', flush=True)
             print(f'[MPCCAgent] rule-layer brake overrides: {self.n_rule_overrides} '
-                  f'(stops the MPCC failed to plan); emergency-brake ticks {self.n_aeb}', flush=True)
+                  f'(stops the MPCC failed to plan); emergency-brake ticks {self.n_aeb}; '
+                  f'wedge reverses {self.n_wedge_reverses}', flush=True)
             if not self.cfg.get('privileged', True):
                 print(f'[MPCCAgent] light detector ran {self.n_light_runs}/{n} ticks; '
                       f'creep {self.n_creep_events} events, {self.n_creep_ticks} ticks; '
