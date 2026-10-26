@@ -91,7 +91,10 @@ def route_kappa(route_fl):
 
 def go_rule(sc):
     b = blocker_info(sc)
-    if b is None or not (8.0 < b['ds'] < 40.0) or abs(sc['d']) > 1.0:
+    if b is None or abs(sc['d']) > 1.0:
+        return -1
+    v = float(sc['v'])                       # same reach gate as tactical.go_label (v2)
+    if b['ds'] < 3.0 or not (b['ds'] < 15.0 or b['ds'] < 3.5 * max(v, 1.0)):
         return -1
     # blocker_info clips stopped_for at 10 s; read the raw one
     inl = [a for a in sc['actors'] if abs(a['d']) < LANE_D and abs(a['ds'] - b['ds']) < 0.5]

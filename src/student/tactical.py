@@ -176,19 +176,30 @@ def plan_speeds(plan_fl):
     return np.linalg.norm(np.diff(p, axis=0), axis=1) / 0.5
 
 
-def go_label(sc, plan_fl, go_m=1.5, wait_m=0.5):
-    """1 = ORION pulls out to pass, 0 = it stays behind, -1 = not a decision
-    frame or ambiguous.  A decision frame: we are in our lane and a slow /
-    stationary in-lane blocker is 8-40 m ahead."""
+def go_label(sc, plan_fl, reach_s=3.5, reach_m=15.0, go_m=1.0, wait_m=0.5, slow_dv=1.0):
+    """1 = the teacher pulls out to pass the in-lane blocker, 0 = it WAITS
+    (stays centred and slows down), -1 = no decision here.  (v2, 2026-10-26)
+
+    A decision frame: we are in our lane and the blocker is within reach of
+    the teacher's 3 s plan (< reach_s at our speed, or < reach_m) -- a VLA
+    starts its pull-out only when close, so a far blocker with a centred plan
+    meant 'not yet', not 'wait' (v1 labelled it wait: ORION/SimLingo kappa 0.36).
+    Centred WITHOUT slowing = 'proceed' (typically a perception phantom: 28 %
+    of v1 decision frames had no true blocker): no go label -- at deployment
+    'not go' and 'no slow-down' together mean proceed (TacticalPolicy).
+    v2: ORION/SimLingo kappa 0.58, ~48 / 30 % pass."""
     b = blocker_info(sc)
-    if b is None or not (8.0 < b['ds'] < 40.0) or abs(sc['d']) > 1.0:
+    if b is None or abs(sc['d']) > 1.0:
         return -1
-    # Passing is to the LEFT (d < 0, plan left > 0): offsets of the 1.5-3 s points.
-    off = plan_lateral_offsets(plan_fl, sc['route_fl'])[2:]
-    m = float(np.max(off))
-    if m > go_m:
+    v = float(sc['v'])
+    if b['ds'] < 3.0 or not (b['ds'] < reach_m or b['ds'] < reach_s * max(v, 1.0)):
+        return -1
+    off = plan_lateral_offsets(plan_fl, sc['route_fl'])[1:]
+    if float(np.max(off)) > go_m:
         return 1
-    if m < wait_m:
+    vp = plan_speeds(plan_fl)
+    v_plan = float(np.mean(vp[2:4]))
+    if float(np.max(np.abs(off))) < wait_m and (v_plan < v - slow_dv or v_plan < 1.5):
         return 0
     return -1
 

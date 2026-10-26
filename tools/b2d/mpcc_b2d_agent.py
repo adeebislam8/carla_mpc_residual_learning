@@ -42,6 +42,12 @@ Config (JSON, all optional):
   record (false: write ORION's 6 cameras + meta for offline labelling to
   $B2D_RECORD_DIR/<route>/, the layout tools/orion/orion_infer.py reads),
   tactical (null | dir: the go/slow student, src/student/tactical.py),
+  tactical_heads (['go', 'dv']: which student heads act.  go + dv give three
+    behaviours at an in-lane blocker: go -> pass; not go + dv slowing -> wait
+    behind it; not go + no slow-down -> PROCEED in lane (a perception phantom;
+    the CBF + emergency brake still guard).  'yield' is off by default: the
+    VLA teachers almost never yield at unsignalized entries in our clips
+    (~70-160 positives), too few to train it),
   scene_radius_m (110: actors kept for the tactical scene)
 
 Efficiency / robustness (sensor-only):
@@ -70,6 +76,9 @@ Efficiency / robustness (sensor-only):
   aeb (true: emergency brake under every arm -- full brake when an obstacle
     the MPC's PLANNED path will overlap is < AEB_TTC_S time-to-contact away;
     a planned pass around it does not trigger)
+  record_orion (true: record ORION's whole 6-camera rig; false = the LIGHT
+    rig -- front camera only (+ SimLingo's if record_simlingo): for rounds not
+    labelled by ORION (DAgger), several times faster to record)
   record_simlingo (false: also record SimLingo's front camera, 1024x512 FOV 110
     at (-1.5, 0, 2.0), for the SimLingo teacher -- tools/simlingo/)
 Env B2D_DUMP_DIR: every 20th tick, front image + LiDAR + pose -> npz, the
@@ -138,7 +147,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False,
                 obstacle_face=False, obstacle_priority=True,
                 gt_obstacles=False, gt_lights=False, aeb=True,
-                lane_belief=False, wedge_recovery=True)
+                lane_belief=False, wedge_recovery=True, record_orion=True,
+                tactical_heads=['go', 'dv'])
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -294,7 +304,7 @@ class MPCCAgent(AutonomousAgent):
                 raise RuntimeError("config 'record': true needs B2D_RECORD_DIR")
             name = '_'.join((self.route_name or f'route_{int(time.time())}').split('_')[:5])
             self.rec_dir = os.path.join(root, name)
-            for cam, *_ in ORION_CAMS:
+            for cam, *_ in self._rec_cams():
                 os.makedirs(os.path.join(self.rec_dir, cam), exist_ok=True)
             if self.cfg['record_simlingo']:
                 os.makedirs(os.path.join(self.rec_dir, SIMLINGO_CAM[0]), exist_ok=True)
@@ -304,7 +314,7 @@ class MPCCAgent(AutonomousAgent):
             from student.tactical import TacticalPolicy
             self.tactical = TacticalPolicy(self.cfg['tactical'])
         self._planner = None
-        self.n_go = self.n_wait = self.n_slow = 0
+        self.n_go = self.n_wait = self.n_slow = self.n_proceed = 0
         self.n_yield = 0                 # ticks the student held us at a junction entry
         self._yield_t0, self._yield_off_until = None, -1e9
         self.dump_dir = os.environ.get('B2D_DUMP_DIR')
@@ -318,6 +328,10 @@ class MPCCAgent(AutonomousAgent):
         self._stuck_t, self._creep_t, self._creep_cool = 0.0, 0.0, 0.0
         self.n_creep_events, self.n_creep_ticks = 0, 0
 
+    def _rec_cams(self):
+        """Cameras the recorder writes: ORION's rig, or the light rig (front only)."""
+        return ORION_CAMS if self.cfg.get('record_orion', True) else ORION_CAMS[:1]
+
     def sensors(self):
         # Ground-truth obstacles come from the world; the speedometer keeps the
         # leaderboard's sensor interface (and its sync wait) happy.
@@ -328,7 +342,7 @@ class MPCCAgent(AutonomousAgent):
         # Recording: ORION's whole rig.  Sensor-only driving alone: just the
         # front camera (traffic lights / stop signs) -- 6 x 1600x900 renders
         # are the slowest part of a tick.
-        use = ORION_CAMS if self.cfg.get('record') else ORION_CAMS[:1]
+        use = self._rec_cams() if self.cfg.get('record') else ORION_CAMS[:1]
         cams = [{'type': 'sensor.camera.rgb', 'x': x, 'y': y, 'z': 1.60,
                  'roll': 0.0, 'pitch': 0.0, 'yaw': yaw,
                  'width': 1600, 'height': 900, 'fov': fov, 'id': cid}
@@ -634,16 +648,21 @@ class MPCCAgent(AutonomousAgent):
             scene = self._scene(stop_ds)
         if self.tactical is not None:
             dec = self.tactical.step(scene)
-            go, dv = dec['go'], dec['dv']
+            heads = self.cfg['tactical_heads']
+            go = dec['go'] if 'go' in heads else True
+            dv = dec['dv'] if 'dv' in heads else None
             blocked = scene.get('_blocker') is not None
+            # pass / wait / proceed (see tactical_heads)
+            wait = (not go) and blocked and (dv is not None or 'dv' not in heads)
             core.gate_scale = 1.0 if go else 0.0
-            core.tactical_wait = (not go) and blocked
+            core.tactical_wait = wait
             core.mpc_controller.v_cap = None if dv is None else max(core.current_speed + dv, 0.0)
             self.n_go += int(go and blocked)
-            self.n_wait += int((not go) and blocked)
+            self.n_wait += int(wait)
+            self.n_proceed += int((not go) and blocked and not wait)
             self.n_slow += int(dv is not None)
             # yield: hold at the next junction entry (the light's stop machinery)
-            ys = self._yield_target(dec['yield_'], scene, timestamp)
+            ys = self._yield_target(dec['yield_'] and 'yield' in heads, scene, timestamp)
             if ys is not None and (stop_ds is None or ys < stop_ds):
                 stop_ds = ys
                 core.mpc_controller.stop_s = core.current_s + stop_ds
@@ -1330,7 +1349,7 @@ class MPCCAgent(AutonomousAgent):
         tactical scene and the MPCC's own action for the student."""
         import cv2
         step = self.n_steps
-        for cam, *_ in ORION_CAMS:
+        for cam, *_ in self._rec_cams():
             img = input_data[cam][1][:, :, :3]
             cv2.imwrite(os.path.join(self.rec_dir, cam, f'{step:06d}.jpg'), img,
                         [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
@@ -1440,7 +1459,7 @@ class MPCCAgent(AutonomousAgent):
         except Exception as e:
             print(f'[MPCCAgent] closing recording failed: {e}', flush=True)
         if getattr(self, 'tactical', None) is not None:
-            print(f'[MPCCAgent] tactical: go {self.n_go} / wait {self.n_wait} ticks with a '
+            print(f'[MPCCAgent] tactical: go {self.n_go} / wait {self.n_wait} / proceed {self.n_proceed} ticks with a '
                   f'blocker, speed cap {self.n_slow} ticks, yield {self.n_yield} ticks', flush=True)
         if getattr(self, 'trace_dir', None) and getattr(self, 'trace', None):
             try:
