@@ -70,9 +70,11 @@ Efficiency / robustness (sensor-only):
     per-metre mean + sigma, Kalman-fused YOLOP fits with memory and lane
     identity (perception/lane_belief.py); sigma makes uncertain stretches
     'not passable' and widens the follow lane.  false = the 2026-10-19 tracker)
-  wedge_recovery (true: pushing against an obstacle without moving for 2 s ->
+  wedge_recovery (false: pushing against an obstacle without moving for 2 s ->
     reverse ~1.5 m if the lane behind is clear, then a creep with stationary
-    obstacles inflated 0.6 m; at most 3 tries per spot)
+    obstacles inflated 0.6 m; at most 3 tries per spot.  Off by default: base2
+    abl44 58.5 with vs 59.8 without (the fixed emergency brake already halved
+    blocked routes) -- no measurable gain)
   aeb (true: emergency brake under every arm -- full brake when an obstacle
     the MPC's PLANNED path will overlap is < AEB_TTC_S time-to-contact away;
     a planned pass around it does not trigger)
@@ -147,7 +149,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 creep_max_s=20.0, creep_v=2.0, mpc_reuse=False, record_simlingo=False,
                 obstacle_face=False, obstacle_priority=True,
                 gt_obstacles=False, gt_lights=False, aeb=True,
-                lane_belief=False, wedge_recovery=True, record_orion=True,
+                lane_belief=False, wedge_recovery=False, record_orion=True,
                 tactical_heads=['go', 'dv'])
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
