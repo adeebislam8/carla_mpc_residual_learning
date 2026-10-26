@@ -42,6 +42,9 @@ Config (JSON, all optional):
   record (false: write ORION's 6 cameras + meta for offline labelling to
   $B2D_RECORD_DIR/<route>/, the layout tools/orion/orion_infer.py reads),
   tactical (null | dir: the go/slow student, src/student/tactical.py),
+  dv_cap_min (3.0 m/s: the student's speed cap v + dv never goes below this --
+    it was v + dv with no floor, so a stopped car told 'slow' got a 0 m/s cap
+    and never moved again: stu_* routes 3936 / 2204 / 14194, 70-90 % capped)
   tactical_heads (['go', 'dv']: which student heads act.  go + dv give three
     behaviours at an in-lane blocker: go -> pass; not go + dv slowing -> wait
     behind it; not go + no slow-down -> PROCEED in lane (a perception phantom;
@@ -66,6 +69,10 @@ Efficiency / robustness (sensor-only):
     the route, behind-first -- the old behaviour.  Its smoke "win" (65.6 vs
     59.1) was a parallel run that shared the acados solver dir; clean n1:
     noprio 60.6 vs 55.5, inside the 9-route noise of ~10 DS -- undecided)
+  lane_perception (true: YOLOP lane lines correct the sparse-route spline.
+    false: steer by the spline alone -- on the abl44 routes it is closer to the
+    true lane than either tracker (lane_bench: 0.16 m median / 3 % > half a
+    lane at 4 m vs YOLOP tracker 0.39 m / 17 %), and ~30 ms per tick cheaper)
   lane_belief (false: the perceived lane centre is a probabilistic belief --
     per-metre mean + sigma, Kalman-fused YOLOP fits with memory and lane
     identity (perception/lane_belief.py); sigma makes uncertain stretches
@@ -150,7 +157,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 obstacle_face=False, obstacle_priority=True,
                 gt_obstacles=False, gt_lights=False, aeb=True,
                 lane_belief=False, wedge_recovery=False, record_orion=True,
-                tactical_heads=['go', 'dv'])
+                tactical_heads=['go', 'dv'], lane_perception=True, dv_cap_min=3.0)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -491,7 +498,7 @@ class MPCCAgent(AutonomousAgent):
                 self._tl = TrafficLightDetector(device=c['device'])
             self._last_applied = (0.0, 0.0, 0.0)          # throttle, brake, steer
             self._lanes = None
-            if c['sparse_route']:
+            if c['sparse_route'] and c['lane_perception']:
                 from perception.lanes import LanePerception, CameraGeometry
                 fx, fy, fyaw, ffov = ORION_CAMS[0][1:]
                 self._lanes = LanePerception(c['yolop'], camera=CameraGeometry(
@@ -658,7 +665,8 @@ class MPCCAgent(AutonomousAgent):
             wait = (not go) and blocked and (dv is not None or 'dv' not in heads)
             core.gate_scale = 1.0 if go else 0.0
             core.tactical_wait = wait
-            core.mpc_controller.v_cap = None if dv is None else max(core.current_speed + dv, 0.0)
+            core.mpc_controller.v_cap = (None if dv is None else
+                                         max(core.current_speed + dv, self.cfg['dv_cap_min']))
             self.n_go += int(go and blocked)
             self.n_wait += int(wait)
             self.n_proceed += int((not go) and blocked and not wait)
