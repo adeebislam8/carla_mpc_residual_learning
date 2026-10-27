@@ -19,9 +19,12 @@
 #            COMBINE=soft|agree|safe), privileged, rules -> data/tactical_<t>.npz
 #   train    one student per teacher -> models/tactical_<t>        [torch, minutes]
 #   agree    teacher agreement table -> results/b2d/teacher_agreement.csv
-# Round 1 (ROUND=1, DAgger): the round-0 student (DAGGER_DRIVER, default 'both')
-#   drives the same clips -> results/b2d/rec_r1_train_clips2/rec/; the same
-#   teachers label ITS states; build = round-0 + round-1 data -> models/tactical_<t>_r1.
+# Round 1 (ROUND=1, DAgger): the round-0 student (DAGGER_DRIVER, default
+#   'simlingo') on the FINAL base drives the same clips with the light camera rig
+#   (front + SimLingo only; config_record_dagger.json record_orion false)
+#   -> results/b2d/rec_r1_train_clips2/rec/; SimLingo + the privileged / rule
+#   experts label ITS states; build = round-0 + round-1 -> models/tactical_<t>_r1
+#   (orion / both stay round-0 only).
 #
 # Evaluate afterwards with overnight.sh, e.g.
 #   NAME=stu JOBS="stu_both:abl44 stu_orion:abl44 stu_simlingo:abl44 stu_privileged:abl44" \
@@ -50,8 +53,12 @@ JUNCTION=${JUNCTION:-6}          # the yield head's target: junction gap-accepta
 PRUNE=${PRUNE:-0}
 COMBINE=${COMBINE:-soft}
 STRIDE=${STRIDE:-1}             # label every STRIDE-th frame (2 = 10 Hz: half the teacher GPU time)
-DAGGER_DRIVER=${DAGGER_DRIVER:-both}
-TEACHERS="orion simlingo both privileged rules"
+DAGGER_DRIVER=${DAGGER_DRIVER:-simlingo}
+# Round 1 (DAgger) records the LIGHT rig (no ORION cameras): ORION and the
+# ORION+SimLingo combination stay round-0 only (teacher comparison at round 0,
+# DAgger for the selected teacher + the camera-free experts).
+if [ "${ROUND:-0}" = "1" ]; then TEACHERS="simlingo privileged rules"
+else TEACHERS="orion simlingo both privileged rules"; fi
 # v2 clip set (adds junction gap-acceptance types for the yield head); a new
 # name so an old train_clips.xml is never reused
 CLIPS=tools/b2d/routes/train_clips2.xml
@@ -106,8 +113,8 @@ todo_for() {    # episodes of $RUN without a label file in $1
 
 if has label; then
   mkdir -p "$RUN/labels" "$RUN/labels_simlingo"
-  mapfile -t todo < <(todo_for "$RUN/labels")
-  say "ORION labelling: ${#todo[@]} routes"
+  if [ "$ROUND" = "1" ]; then todo=(); say "ORION labelling: skipped (round 1: light rig)"
+  else mapfile -t todo < <(todo_for "$RUN/labels"); say "ORION labelling: ${#todo[@]} routes"; fi
   if [ ${#todo[@]} -gt 0 ]; then
     pkill -9 -f CarlaUE4 2>/dev/null; sleep 5     # free the GPU
     PYTHONNOUSERSITE=1 $PY orion python tools/orion/orion_infer.py \
@@ -168,8 +175,9 @@ fi
 
 if has agree; then
   say "teacher agreement (round $ROUND)"
+  ORION_T=(); [ "$ROUND" = "1" ] || ORION_T=(--teacher orion="$RUN/labels")
   python3 tools/student/teacher_agreement.py --rec "$RUN/rec" \
-    --teacher orion="$RUN/labels" --teacher simlingo="$RUN/labels_simlingo" \
+    "${ORION_T[@]}" --teacher simlingo="$RUN/labels_simlingo" \
     --teacher privileged="$RUN/labels_privileged" --teacher rules="$RUN/labels_rules" \
     --csv "results/b2d/teacher_agreement${SUF}.csv"
 fi
