@@ -86,6 +86,8 @@ Efficiency / robustness (sensor-only):
   aeb (true: emergency brake under every arm -- full brake when an obstacle
     the MPC's PLANNED path will overlap is < AEB_TTC_S time-to-contact away;
     a planned pass around it does not trigger)
+  record_img_every (1: write camera images every N-th recorded tick only (meta
+    every tick); set it to the labelling STRIDE -- 2 halves the disk)
   record_orion (true: record ORION's whole 6-camera rig; false = the LIGHT
     rig -- front camera only (+ SimLingo's if record_simlingo): for rounds not
     labelled by ORION (DAgger), several times faster to record)
@@ -158,7 +160,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 obstacle_face=False, obstacle_priority=True,
                 gt_obstacles=False, gt_lights=False, aeb=True,
                 lane_belief=False, wedge_recovery=False, record_orion=True,
-                tactical_heads=['go', 'dv'], lane_perception=False, dv_cap_min=3.0)
+                tactical_heads=['go', 'dv'], lane_perception=False, dv_cap_min=3.0,
+                record_img_every=1)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -1380,11 +1383,20 @@ class MPCCAgent(AutonomousAgent):
         tactical scene and the MPCC's own action for the student."""
         import cv2
         step = self.n_steps
-        for cam, *_ in self._rec_cams():
+        # Images only on the labellers' frame grid (meta line index % every == 0:
+        # orion_infer / simlingo_infer take metas[::stride]); meta every tick (the
+        # student's history features).  every = 1 wrote 180 GB for 151 clips, half
+        # of it never labelled at STRIDE=2.
+        every = int(self.cfg['record_img_every'])
+        if len(self.rec_obs) % every:
+            img_cams, sim_cam = [], False
+        else:
+            img_cams, sim_cam = self._rec_cams(), self.cfg['record_simlingo']
+        for cam, *_ in img_cams:
             img = input_data[cam][1][:, :, :3]
             cv2.imwrite(os.path.join(self.rec_dir, cam, f'{step:06d}.jpg'), img,
                         [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        if self.cfg['record_simlingo']:
+        if sim_cam:
             cam = SIMLINGO_CAM[0]
             # its agent re-encodes with cv2's default JPEG quality (95)
             cv2.imwrite(os.path.join(self.rec_dir, cam, f'{step:06d}.jpg'),
