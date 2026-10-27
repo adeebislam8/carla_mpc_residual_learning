@@ -69,8 +69,9 @@ Efficiency / robustness (sensor-only):
     the route, behind-first -- the old behaviour.  Its smoke "win" (65.6 vs
     59.1) was a parallel run that shared the acados solver dir; clean n1:
     noprio 60.6 vs 55.5, inside the 9-route noise of ~10 DS -- undecided)
-  lane_perception (true: YOLOP lane lines correct the sparse-route spline.
-    false: steer by the spline alone -- on the abl44 routes it is closer to the
+  lane_perception (false = the BASE: steer by the sparse-route spline alone
+    (n4 abl44: 74.8 DS vs 59.8 with YOLOP; collisions 0.55 vs 1.05 per route;
+    ~34 vs 52 ms per tick).  true: YOLOP lane lines correct the spline -- on the abl44 routes it is closer to the
     true lane than either tracker (lane_bench: 0.16 m median / 3 % > half a
     lane at 4 m vs YOLOP tracker 0.39 m / 17 %), and ~30 ms per tick cheaper)
   lane_belief (false: the perceived lane centre is a probabilistic belief --
@@ -157,7 +158,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 obstacle_face=False, obstacle_priority=True,
                 gt_obstacles=False, gt_lights=False, aeb=True,
                 lane_belief=False, wedge_recovery=False, record_orion=True,
-                tactical_heads=['go', 'dv'], lane_perception=True, dv_cap_min=3.0)
+                tactical_heads=['go', 'dv'], lane_perception=False, dv_cap_min=3.0)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
 # puts static.prop.dirtdebris01 on the road, and treating it as a stopped car
@@ -663,7 +664,12 @@ class MPCCAgent(AutonomousAgent):
             blocked = scene.get('_blocker') is not None
             # pass / wait / proceed (see tactical_heads)
             wait = (not go) and blocked and (dv is not None or 'dv' not in heads)
-            core.gate_scale = 1.0 if go else 0.0
+            # The student acts only where it was trained: an in-lane blocker
+            # 3-15 m ahead (go_label's decision frames).  Elsewhere its go output
+            # is extrapolation -- switching the overtake gate in crossing / cut-in
+            # / pedestrian scenes cost ~9 DS on Emergency_Brake in 3 runs (n4) --
+            # so the base decides alone there.  (dv was trained on all frames.)
+            core.gate_scale = (1.0 if go else 0.0) if blocked else 1.0
             core.tactical_wait = wait
             core.mpc_controller.v_cap = (None if dv is None else
                                          max(core.current_speed + dv, self.cfg['dv_cap_min']))
