@@ -9,6 +9,5 @@
   "behavior_rules": false,
   "record": true,
   "creep_after_s": 12.0,
-  "record_simlingo": true,
-  "aeb": false
+  "record_simlingo": true
 }

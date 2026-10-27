@@ -325,6 +325,7 @@ class MPCCAgent(AutonomousAgent):
             self.tactical = TacticalPolicy(self.cfg['tactical'])
         self._planner = None
         self.n_go = self.n_wait = self.n_slow = self.n_proceed = 0
+        self._wait_t0, self._wait_off_until, self.n_wait_released = None, -1e9, 0
         self.n_yield = 0                 # ticks the student held us at a junction entry
         self._yield_t0, self._yield_off_until = None, -1e9
         self.dump_dir = os.environ.get('B2D_DUMP_DIR')
@@ -664,6 +665,18 @@ class MPCCAgent(AutonomousAgent):
             blocked = scene.get('_blocker') is not None
             # pass / wait / proceed (see tactical_heads)
             wait = (not go) and blocked and (dv is not None or 'dv' not in heads)
+            # A wait held WAIT_MAX_S is released for WAIT_COOL_S (the base decides):
+            # the student can delay us, never strand us (stu2 2082: 1253 ticks
+            # waiting behind a stopped car near a junction -> 'blocked', -88 DS)
+            if wait:
+                self._wait_t0 = timestamp if self._wait_t0 is None else self._wait_t0
+                if timestamp - self._wait_t0 > self.WAIT_MAX_S:
+                    self._wait_off_until, self._wait_t0 = timestamp + self.WAIT_COOL_S, None
+            else:
+                self._wait_t0 = None
+            if timestamp < self._wait_off_until:
+                go, wait = True, False
+                self.n_wait_released += 1
             # The student acts only where it was trained: an in-lane blocker
             # 3-15 m ahead (go_label's decision frames).  Elsewhere its go output
             # is extrapolation -- switching the overtake gate in crossing / cut-in
@@ -768,6 +781,8 @@ class MPCCAgent(AutonomousAgent):
                 **(self._perception_check() if not self.cfg['privileged'] else {})))
         return control
 
+    WAIT_MAX_S = 15.0        # longest the student may hold us behind one blocker ...
+    WAIT_COOL_S = 10.0       # ... then its wait is ignored this long (base decides)
     YIELD_MAX_S = 15.0       # longest the student may hold us at one entry ...
     YIELD_COOL_S = 10.0      # ... then its yield is ignored this long (no deadlock)
 
@@ -1475,7 +1490,7 @@ class MPCCAgent(AutonomousAgent):
         except Exception as e:
             print(f'[MPCCAgent] closing recording failed: {e}', flush=True)
         if getattr(self, 'tactical', None) is not None:
-            print(f'[MPCCAgent] tactical: go {self.n_go} / wait {self.n_wait} / proceed {self.n_proceed} ticks with a '
+            print(f'[MPCCAgent] tactical: wait released {self.n_wait_released} ticks; go {self.n_go} / wait {self.n_wait} / proceed {self.n_proceed} ticks with a '
                   f'blocker, speed cap {self.n_slow} ticks, yield {self.n_yield} ticks', flush=True)
         if getattr(self, 'trace_dir', None) and getattr(self, 'trace', None):
             try:

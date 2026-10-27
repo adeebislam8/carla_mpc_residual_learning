@@ -109,6 +109,25 @@ def rule_stop_at_entry(rec):
     return gt.get('sign_ds') is not None and gt['sign_ds'] < e + 5.0
 
 
+def to_spline_frame(rec):
+    """The recorded scene in the frame of the sparse-route SPLINE, not the
+    YOLOP-corrected lane.  Round-0 recordings were driven by the YOLOP-lane
+    base, so every lateral feature is relative to the perceived lane; the final
+    base steers by the spline alone (no lane correction), which is what the
+    student sees at deployment.  meta 'd' = ego offset from the spline, scene
+    'd' = ego offset from the perceived lane -> their difference is YOLOP's lane
+    offset at the ego, applied to every actor (it varies slowly along the road;
+    an approximation for actors far ahead).  Labels are unaffected: teacher
+    decisions are judged against the TRUE lane."""
+    sc = rec['scene']
+    if 'd' not in rec:
+        return sc
+    off = float(rec['d']) - float(sc['d'])
+    if abs(off) < 1e-6:
+        return sc
+    return dict(sc, d=float(rec['d']), actors=[dict(a, d=a['d'] + off) for a in sc['actors']])
+
+
 def load_labels(root):
     out = {}
     for p in glob.glob(os.path.join(os.path.expanduser(root), '*.npz')):
@@ -191,6 +210,9 @@ def main():
                     help='raw teacher go labels (the ablation); default: rule-checked')
     ap.add_argument('--flip-cautious', action='store_true',
                     help='turn over-cautious waits into go (default: only count them)')
+    ap.add_argument('--spline-frame', action='store_true',
+                    help='rebuild features in the spline frame (round-0 data recorded on the '
+                         'YOLOP-lane base, deployed on the spline base)')
     ap.add_argument('--frac', type=float, default=1.0,
                     help='keep this fraction of EPISODES (data-size ablation E3b)')
     args = ap.parse_args()
@@ -232,6 +254,9 @@ def main():
             lb = np.load(lab2[name]) if two else None
             ia = {int(s): j for j, s in enumerate(la['steps'])}
             ib = {int(s): j for j, s in enumerate(lb['steps'])} if two else None
+            if args.spline_frame:
+                for r in recs:
+                    r['scene'] = to_spline_frame(r)
             frames = [frame_features(r['scene']) for r in recs]
             wedge = wedged_frames(recs)
             fstats['wedged_frames_dropped'] += int(sum(wedge))

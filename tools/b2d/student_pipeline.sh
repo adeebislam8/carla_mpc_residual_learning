@@ -53,7 +53,7 @@ JUNCTION=${JUNCTION:-6}          # the yield head's target: junction gap-accepta
 PRUNE=${PRUNE:-0}
 COMBINE=${COMBINE:-soft}
 STRIDE=${STRIDE:-1}             # label every STRIDE-th frame (2 = 10 Hz: half the teacher GPU time)
-DAGGER_DRIVER=${DAGGER_DRIVER:-simlingo}
+DAGGER_DRIVER=${DAGGER_DRIVER:-simlingo_sf}   # the spline-frame round-0 SimLingo student
 # Round 1 (DAgger) records the LIGHT rig (no ORION cameras): ORION and the
 # ORION+SimLingo combination stay round-0 only (teacher comparison at round 0,
 # DAgger for the selected teacher + the camera-free experts).
@@ -65,6 +65,13 @@ CLIPS=tools/b2d/routes/train_clips2.xml
 R0=results/b2d/rec_train_clips2
 R1=results/b2d/rec_r1_train_clips2
 if [ "$ROUND" = "1" ]; then RUN=$R1; SUF=_r1; else RUN=$R0; SUF=; fi
+# SPLINE_FRAME=1: rebuild features in the sparse-route spline frame (the final
+# base has no lane perception; round 0 was recorded on the YOLOP-lane base, whose
+# lane correction exceeded 1 m on 34 % of frames).  Datasets / models get "_sf"
+# so the round-0 models are never overwritten.  Harmless on round-1 data
+# (recorded on the spline base: correction 0).
+SPLINE_FRAME=${SPLINE_FRAME:-0}
+SFFLAG=; [ "$SPLINE_FRAME" = "1" ] && { SFFLAG=--spline-frame; SUF="${SUF}_sf"; }
 PY="$CONDA run --no-capture-output -n"
 has() { [[ " $STAGES " == *" $1 "* ]]; }
 say() { echo; echo "[$(date +%H:%M:%S)] == $*"; }
@@ -155,11 +162,11 @@ if has build; then
     if [ "$t" = "both" ]; then
       L1=""; L2=""
       for r in $RECS; do L1="$L1 ${r%/rec}/labels"; L2="$L2 ${r%/rec}/labels_simlingo"; done
-      python3 tools/student/build_tactical.py --rec $RECS --labels $L1 --labels2 $L2 \
+      python3 tools/student/build_tactical.py --rec $RECS --labels $L1 --labels2 $L2 $SFFLAG \
         --combine "$COMBINE" --out "data/tactical_both${SUF}.npz" || exit 1
     else
       L=""; for r in $RECS; do L="$L ${r%/rec}/$(labels_dir "$t")"; done
-      python3 tools/student/build_tactical.py --rec $RECS --labels $L \
+      python3 tools/student/build_tactical.py --rec $RECS --labels $L $SFFLAG \
         --out "data/tactical_${t}${SUF}.npz" || exit 1
     fi
   done
