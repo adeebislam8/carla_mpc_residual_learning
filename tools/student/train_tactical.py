@@ -9,7 +9,10 @@ An ensemble of small MLPs (default 5 x [64, 64], ~11k parameters each), each
 on a bootstrap of training EPISODES.  Heads: go and yield -- sigmoid, masked,
 class-balanced BCE (soft 0.5 targets from a two-teacher 'soft' combine are
 fine); dv -- linear, masked Huber loss on dv / DV_SCALE.  Validation is a
-fixed set of held-out episodes.  Exports numpy weights for
+fixed set of held-out episodes.  --arch gru: the same ensemble, each member a
+GRU over the last 1.5 s of per-frame features (SEQ_LAGS, 16 frames) instead of
+an MLP over 3 stacked lags (needs a dataset with frames_all / seq_idx).
+Exports numpy weights for
 src/student/tactical.py (no torch at run time):
 
     <out>/tactical.npz, tactical_meta.json
@@ -17,9 +20,14 @@ src/student/tactical.py (no torch at run time):
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), 'src'))
 
 DV_SCALE = 3.0           # dv is learned as dv / DV_SCALE (m/s); tactical.py multiplies back
 
@@ -40,7 +48,9 @@ def main():
     ap.add_argument('--data', nargs='+', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--members', type=int, default=5)
-    ap.add_argument('--hidden', type=int, nargs='+', default=[64, 64])
+    ap.add_argument('--arch', choices=('mlp', 'gru'), default='mlp')
+    ap.add_argument('--hidden', type=int, nargs='+', default=[64, 64],
+                    help='MLP hidden sizes; for --arch gru the first is the GRU state size')
     ap.add_argument('--epochs', type=int, default=40)
     ap.add_argument('--batch', type=int, default=512)
     ap.add_argument('--lr', type=float, default=1e-3)
@@ -57,12 +67,18 @@ def main():
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
-    parts, off = [], 0
+    parts, off, foff, fall = [], 0, 0, []
     for p in args.data:
         d = np.load(Path(p).expanduser(), allow_pickle=False)
         part = {k: d[k] for k in ('X', 'y_go', 'm_go', 'y_yield', 'm_yield', 'dv', 'm_dv', 'ep')}
         part['ep'] = part['ep'] + off
         off += len(d['episodes'])
+        if args.arch == 'gru':
+            if 'seq_idx' not in d.files:
+                raise SystemExit(f'{p}: no frames_all / seq_idx -- rebuild it with build_tactical.py')
+            part['seq_idx'] = d['seq_idx'] + foff
+            foff += len(d['frames_all'])
+            fall.append(d['frames_all'])
         names = d['feature_names'].tolist()
         parts.append(part)
     D = {k: np.concatenate([q[k] for q in parts]) for k in parts[0]}
@@ -73,8 +89,16 @@ def main():
     is_val = np.isin(D['ep'], list(val_eps))
     tr = ~is_val
     X = D['X'].astype(np.float32)
-    mean, std = X[tr].mean(0), np.maximum(X[tr].std(0), 1e-3)
-    Xn = np.clip((X - mean) / std, -5, 5)
+    if args.arch == 'gru':
+        from student.tactical import N_FRAME, SEQ_LAGS
+        Xc = X[:, :N_FRAME]                                 # lag-0 block = the per-frame features
+        mean, std = Xc[tr].mean(0), np.maximum(Xc[tr].std(0), 1e-3)
+        Fn = np.clip((np.concatenate(fall) - mean) / std, -5, 5).astype(np.float32)
+        Xn = Fn[D['seq_idx']]                               # (N, len(SEQ_LAGS), N_FRAME)
+        names = names[:N_FRAME]
+    else:
+        mean, std = X[tr].mean(0), np.maximum(X[tr].std(0), 1e-3)
+        Xn = np.clip((X - mean) / std, -5, 5)
     HEADS = ('go', 'yield', 'dv')
     Y = np.stack([D['y_go'], D['y_yield'], D['dv'] / DV_SCALE], 1).astype(np.float32)
     M = np.stack([D['m_go'], D['m_yield'], D['m_dv']], 1).astype(np.float32)
@@ -87,7 +111,18 @@ def main():
     pos_w = torch.tensor(pos_w)
     dev = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
 
+    class GRUNet(nn.Module):
+        def __init__(self, din, h):
+            super().__init__()
+            self.gru = nn.GRU(din, h, batch_first=True)
+            self.out = nn.Linear(h, len(HEADS))
+
+        def forward(self, x):
+            return self.out(self.gru(x)[0][:, -1])
+
     def net():
+        if args.arch == 'gru':
+            return GRUNet(Xn.shape[-1], args.hidden[0]).to(dev)
         layers, din = [], X.shape[1]
         for h in args.hidden:
             layers += [nn.Linear(din, h), nn.ReLU()]
@@ -160,15 +195,23 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     weights, n_layers = {}, None
+    npy = lambda t: t.detach().cpu().numpy().astype(np.float64)
     for e, model in enumerate(members):
+        if args.arch == 'gru':
+            g = model.gru
+            weights.update({f'Wih{e}': npy(g.weight_ih_l0).T, f'Whh{e}': npy(g.weight_hh_l0).T,
+                            f'bih{e}': npy(g.bias_ih_l0), f'bhh{e}': npy(g.bias_hh_l0),
+                            f'Wo{e}': npy(model.out.weight).T, f'bo{e}': npy(model.out.bias)})
+            continue
         lins = [l for l in model if isinstance(l, nn.Linear)]
         n_layers = len(lins)
         for l, lin in enumerate(lins):
-            weights[f'W{e}_{l}'] = lin.weight.detach().cpu().numpy().T.astype(np.float64)
-            weights[f'b{e}_{l}'] = lin.bias.detach().cpu().numpy().astype(np.float64)
+            weights[f'W{e}_{l}'] = npy(lin.weight).T
+            weights[f'b{e}_{l}'] = npy(lin.bias)
     np.savez(out / 'tactical.npz', **weights)
     n_params = int(sum(v.size for v in weights.values()))
-    meta = dict(n_members=args.members, n_layers=n_layers, hidden=args.hidden,
+    meta = dict(arch=args.arch, n_members=args.members, n_layers=n_layers, hidden=args.hidden,
+                seq_lags=list(SEQ_LAGS) if args.arch == 'gru' else None,
                 heads=list(HEADS), dv_scale=DV_SCALE,
                 x_mean=mean.tolist(), x_std=std.tolist(), feature_names=names,
                 n_params_total=n_params, n_params_per_member=n_params // args.members,

@@ -48,6 +48,7 @@ import numpy as np
 
 FAR = 120.0
 HIST_LAGS = (0, 10, 20)        # ticks: now, 0.5 s ago, 1.0 s ago (20 Hz)
+SEQ_LAGS = tuple(range(30, -1, -2))   # GRU student: 16 frames over the last 1.5 s, oldest first
 
 # Lateral bands (Frenet d, + is right; the passing lane is on the left).
 LANE_D = 2.0
@@ -153,6 +154,12 @@ def stack_history(frames, i):
     """Features at index i from per-frame vectors: now and HIST_LAGS ago
     (clamped at the episode start)."""
     return np.concatenate([frames[max(i - lag, 0)] for lag in HIST_LAGS])
+
+
+def seq_history(frames, i):
+    """GRU input at index i: per-frame vectors SEQ_LAGS ago, oldest first
+    (clamped at the episode start) -> (len(SEQ_LAGS), N_FRAME)."""
+    return np.stack([frames[max(i - lag, 0)] for lag in SEQ_LAGS])
 
 
 # ── labels from ORION's plan ────────────────────────────────────────────────
@@ -268,13 +275,29 @@ PROB_HEADS = ('go', 'yield', 'slow')       # sigmoid outputs; 'dv' is linear (x 
 
 
 class TacticalEnsemble:
+    """arch 'mlp' (default): x = stacked HIST_LAGS features (D,).
+    arch 'gru': x = (len(SEQ_LAGS), N_FRAME) window, re-run from a zero state
+    every tick (windowed, so no hidden state to carry or reset)."""
+
     def __init__(self, weights, meta):
         self.meta = meta
+        self.arch = meta.get('arch', 'mlp')
         self.heads = list(meta.get('heads', ['go', 'slow']))     # v1 models: go, slow
         self.dv_scale = float(meta.get('dv_scale', 1.0))
         self.mean = np.asarray(meta['x_mean'])
         self.std = np.asarray(meta['x_std'])
-        self.n_members, self.n_layers = int(meta['n_members']), int(meta['n_layers'])
+        self.n_members = int(meta['n_members'])
+        if self.arch == 'gru':
+            E = self.n_members                     # members stacked: (E, D, 3H), (E, H, 3H), ...
+            self.Wih = np.stack([weights[f'Wih{e}'] for e in range(E)])
+            self.Whh = np.stack([weights[f'Whh{e}'] for e in range(E)])
+            self.bih = np.stack([weights[f'bih{e}'] for e in range(E)])
+            self.bhh = np.stack([weights[f'bhh{e}'] for e in range(E)])
+            self.Wo = np.stack([weights[f'Wo{e}'] for e in range(E)])
+            self.bo = np.stack([weights[f'bo{e}'] for e in range(E)])
+            self.H = self.Whh.shape[1]
+            return
+        self.n_layers = int(meta['n_layers'])
         self.layers = [[(weights[f'W{e}_{l}'], weights[f'b{e}_{l}'])
                         for l in range(self.n_layers)] for e in range(self.n_members)]
 
@@ -287,21 +310,39 @@ class TacticalEnsemble:
         """x (D,) -> {head: (ensemble mean, ensemble std)}; probabilities for
         go / yield / slow, metres-per-second for dv."""
         z = np.clip((np.asarray(x, float) - self.mean) / self.std, -5.0, 5.0)
-        outs = []
-        for member in self.layers:
-            h = z
-            for i, (W, b) in enumerate(member):
-                h = h @ W + b
-                if i < self.n_layers - 1:
-                    h = np.maximum(h, 0.0)
-            outs.append(h)
-        o = np.stack(outs)
+        if self.arch == 'gru':
+            o = self._gru(z)
+        else:
+            outs = []
+            for member in self.layers:
+                h = z
+                for i, (W, b) in enumerate(member):
+                    h = h @ W + b
+                    if i < self.n_layers - 1:
+                        h = np.maximum(h, 0.0)
+                outs.append(h)
+            o = np.stack(outs)
         res = {}
         for k, name in enumerate(self.heads):
             col = o[:, k]
             col = 1.0 / (1.0 + np.exp(-col)) if name in PROB_HEADS else col * self.dv_scale
             res[name] = (float(col.mean()), float(col.std()))
         return res
+
+
+    def _gru(self, z):
+        """z (T, D) -> (E, n_heads); torch GRU gate order r, z, n."""
+        H = self.H
+        gi = np.matmul(z[None], self.Wih) + self.bih[:, None]         # (E, T, 3H)
+        h = np.zeros((self.n_members, H))
+        sig = lambda a: 1.0 / (1.0 + np.exp(-a))
+        for t in range(z.shape[0]):
+            gh = np.matmul(h[:, None], self.Whh)[:, 0] + self.bhh
+            r = sig(gi[:, t, :H] + gh[:, :H])
+            u = sig(gi[:, t, H:2 * H] + gh[:, H:2 * H])
+            n = np.tanh(gi[:, t, 2 * H:] + r * gh[:, 2 * H:])
+            h = (1.0 - u) * n + u * h
+        return np.matmul(h[:, None], self.Wo)[:, 0] + self.bo
 
 
 class TacticalPolicy:
@@ -320,7 +361,7 @@ class TacticalPolicy:
         self.heads = self.net.heads
         self.go_threshold, self.slow_threshold = go_threshold, slow_threshold
         self.yield_threshold = yield_threshold
-        self.frames = deque(maxlen=max(HIST_LAGS) + 1)
+        self.frames = deque(maxlen=max(max(HIST_LAGS), max(SEQ_LAGS)) + 1)
         self.reset()
         self.last = {}
         self.n_queries = 0
@@ -355,7 +396,9 @@ class TacticalPolicy:
             self.last = dict(p_go=1.0, p_yield=0.0, dv=0.0, net=False)
             return dict(self.out)
         fr = list(self.frames)
-        x = np.concatenate([fr[max(len(fr) - 1 - lag, 0)] for lag in HIST_LAGS])
+        lags = SEQ_LAGS if self.net.arch == 'gru' else HIST_LAGS
+        x = [fr[max(len(fr) - 1 - lag, 0)] for lag in lags]
+        x = np.stack(x) if self.net.arch == 'gru' else np.concatenate(x)
         r = self.net.forward(x)
         self.n_net += 1
         p_go = r['go'][0]

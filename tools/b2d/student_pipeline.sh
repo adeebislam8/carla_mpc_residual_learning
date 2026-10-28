@@ -6,6 +6,7 @@
 #
 #   ./tools/b2d/student_pipeline.sh                         # round 0, all stages
 #   STAGES="label experts build train agree" ./tools/b2d/student_pipeline.sh
+#   ARCH=gru TEACHERS="simlingo both" STAGES=train ./tools/b2d/student_pipeline.sh
 #   ROUND=1 ./tools/b2d/student_pipeline.sh                 # DAgger round
 #
 # Round 0 (the sbase arm drives, so states match the sbase + student arm):
@@ -57,8 +58,12 @@ DAGGER_DRIVER=${DAGGER_DRIVER:-simlingo_sf}   # the spline-frame round-0 SimLing
 # Round 1 (DAgger) records the LIGHT rig (no ORION cameras): ORION and the
 # ORION+SimLingo combination stay round-0 only (teacher comparison at round 0,
 # DAgger for the selected teacher + the camera-free experts).
-if [ "${ROUND:-0}" = "1" ]; then TEACHERS="simlingo privileged rules"
-else TEACHERS="orion simlingo both privileged rules"; fi
+if [ "${ROUND:-0}" = "1" ]; then TEACHERS=${TEACHERS:-"simlingo privileged rules"}
+else TEACHERS=${TEACHERS:-"orion simlingo both privileged rules"}; fi
+# ARCH=gru trains the GRU student (1.5 s window) -> models/tactical_<t>_gru,
+# from the same datasets (they carry frames_all / seq_idx since 2026-10-28).
+ARCH=${ARCH:-mlp}
+ASUF=$([ "$ARCH" = "gru" ] && echo _gru || echo "")
 # v2 clip set (adds junction gap-acceptance types for the yield head); a new
 # name so an old train_clips.xml is never reused
 CLIPS=tools/b2d/routes/train_clips2.xml
@@ -174,9 +179,9 @@ fi
 
 if has train; then
   for t in $TEACHERS; do
-    say "training student: $t (round $ROUND)"
-    PYTHONNOUSERSITE=1 $PY orion python tools/student/train_tactical.py \
-      --data "data/tactical_${t}${SUF}.npz" --out "models/tactical_${t}${SUF}" || exit 1
+    say "training student: $t (round $ROUND, $ARCH)"
+    PYTHONNOUSERSITE=1 $PY orion python tools/student/train_tactical.py --arch "$ARCH" \
+      --data "data/tactical_${t}${SUF}.npz" --out "models/tactical_${t}${SUF}${ASUF}" || exit 1
   done
 fi
 

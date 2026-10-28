@@ -21,6 +21,8 @@ Per recorded frame (meta.jsonl 'scene', written by tools/b2d/mpcc_b2d_agent.py):
 
   X        features: src/student/tactical.py frame_features, stacked over
            HIST_LAGS (now, 0.5 s, 1 s ago)
+  frames_all, seq_idx   every frame's features (wedged ones too) and, per X
+           row, the indices of its SEQ_LAGS window in frames_all (GRU student)
   y_go     1 the teacher pulls out to pass / 0 it stays behind; m_go marks
            decision frames (in-lane slow blocker 8-40 m ahead, ego in lane)
   y_yield  1 it stops short of the next junction entry / 0 it enters; m_yield
@@ -68,7 +70,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
-from student.tactical import (FEATURE_NAMES, FRAME_NAMES, HIST_LAGS,  # noqa: E402
+from student.tactical import (FEATURE_NAMES, FRAME_NAMES, HIST_LAGS, SEQ_LAGS,  # noqa: E402
                               frame_features, go_label, plan_dv, stack_history, wedged_frames,
                               yield_label)
 
@@ -229,6 +231,7 @@ def main():
     two = L2 is not None
 
     X, V, EP, names = [], [], [], []
+    FALL, SEQ = [], []           # every frame (wedged too) + per-row GRU window indices into it
     T = {k: [] for k in ('g1', 'y1', 'dv1', 'g2', 'y2', 'dv2')}
     plan1 = plan2 = False
     fstats = collections.Counter()
@@ -261,6 +264,8 @@ def main():
             wedge = wedged_frames(recs)
             fstats['wedged_frames_dropped'] += int(sum(wedge))
             n_ep = len(names)
+            f0 = len(FALL)
+            FALL.extend(frames)
             for i, r in enumerate(recs):
                 if wedge[i]:
                     continue
@@ -287,6 +292,7 @@ def main():
                     else:
                         plan2 = plan2 or is_plan
                 X.append(stack_history(frames, i))
+                SEQ.append([f0 + max(i - lag, 0) for lag in SEQ_LAGS])
                 V.append(sc['v'])
                 EP.append(n_ep)
             names.append(f'{k}:{name}')
@@ -329,7 +335,7 @@ def main():
     dv = np.where(m_dv, dv, 0.0).astype(np.float32)
     y_slow = (dv < args.slow_on).astype(np.float32)
     m_slow = m_dv & ((dv < args.slow_on) | (dv > args.slow_off))
-    cfg = dict(hist_lags=HIST_LAGS, slow_on=args.slow_on, slow_off=args.slow_off,
+    cfg = dict(hist_lags=HIST_LAGS, seq_lags=SEQ_LAGS, slow_on=args.slow_on, slow_off=args.slow_off,
                filtered=not args.no_filter, flip_cautious=args.flip_cautious,
                filter_stats=dict(fstats), frac=args.frac,
                teachers=[L1[0]] + ([L2[0]] if two else []), combine=args.combine if two else None,
@@ -338,6 +344,7 @@ def main():
     np.savez_compressed(args.out, X=X, y_go=y_go, m_go=m_go, y_yield=y_yield, m_yield=m_yield,
                         dv=dv, m_dv=m_dv, y_slow=y_slow, m_slow=m_slow,
                         ep=np.asarray(EP, np.int32), episodes=np.array(names),
+                        frames_all=np.asarray(FALL, np.float32), seq_idx=np.asarray(SEQ, np.int32),
                         feature_names=np.array(FEATURE_NAMES), config=json.dumps(cfg))
     print(f'{len(names)} episodes, {len(X)} frames -> {args.out}')
     for head, y, m in (('go', y_go, m_go), ('yield', y_yield, m_yield)):
