@@ -7,6 +7,8 @@
 #   ./tools/b2d/student_pipeline.sh                         # round 0, all stages
 #   STAGES="label experts build train agree" ./tools/b2d/student_pipeline.sh
 #   ARCH=gru TEACHERS="simlingo both" STAGES=train ./tools/b2d/student_pipeline.sh
+#   ROUND=1 MASKJ=15 STRIDE=2 ./tools/b2d/student_pipeline.sh   # DAgger, v5 recipe (driver simlingo_v5,
+#        runtime options in config_record_dagger.json) -> models/tactical_{simlingo,privileged,rules}_v5_r1
 #   ROUND=1 ./tools/b2d/student_pipeline.sh                 # DAgger round
 #
 # Round 0 (the sbase arm drives, so states match the sbase + student arm):
@@ -54,7 +56,8 @@ JUNCTION=${JUNCTION:-6}          # the yield head's target: junction gap-accepta
 PRUNE=${PRUNE:-0}
 COMBINE=${COMBINE:-soft}
 STRIDE=${STRIDE:-1}             # label every STRIDE-th frame (2 = 10 Hz: half the teacher GPU time)
-DAGGER_DRIVER=${DAGGER_DRIVER:-simlingo_sf}   # the spline-frame round-0 SimLingo student
+DAGGER_DRIVER=${DAGGER_DRIVER:-simlingo_v5}   # the v5-recipe round-0 SimLingo student (make_teachers_v5.sh)
+MASKJ=${MASKJ:-}                 # v5 recipe: MASKJ=15 -> build --mask-junction 15, models *_v5[_r1]
 # Round 1 (DAgger) records the LIGHT rig (no ORION cameras): ORION and the
 # ORION+SimLingo combination stay round-0 only (teacher comparison at round 0,
 # DAgger for the selected teacher + the camera-free experts).
@@ -77,6 +80,7 @@ if [ "$ROUND" = "1" ]; then RUN=$R1; SUF=_r1; else RUN=$R0; SUF=; fi
 # (recorded on the spline base: correction 0).
 SPLINE_FRAME=${SPLINE_FRAME:-0}
 SFFLAG=; [ "$SPLINE_FRAME" = "1" ] && { SFFLAG=--spline-frame; SUF="${SUF}_sf"; }
+[ -n "$MASKJ" ] && { SFFLAG="$SFFLAG --mask-junction $MASKJ"; SUF="_v5${SUF}"; }
 PY="$CONDA run --no-capture-output -n"
 has() { [[ " $STAGES " == *" $1 "* ]]; }
 say() { echo; echo "[$(date +%H:%M:%S)] == $*"; }

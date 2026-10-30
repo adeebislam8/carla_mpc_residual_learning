@@ -18,5 +18,6 @@
     0.15,
     0.6
   ],
+  "dv_cap_latch": true,
   "sparse_route": false
 }
