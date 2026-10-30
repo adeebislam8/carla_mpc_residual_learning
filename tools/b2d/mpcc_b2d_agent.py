@@ -58,6 +58,9 @@ Config (JSON, all optional):
     braked on the approach), while its gains were on two-way overtaking)
   tactical_wait_v (null: off.  m/s: the student waits only behind a blocker
     slower than this; behind a moving one it follows)
+  dv_cap_latch (false: the student's speed cap is v_now + dv, re-anchored each
+    tick -- a ratchet down to dv_cap_min.  true: v_on + dv, v_on = our speed
+    when the cap came on)
   tactical_defer (null: off.  [go_std, dv_std]: ensemble disagreement at which
     the student defers to the base, see TacticalPolicy)
   scene_radius_m (110: actors kept for the tactical scene)
@@ -170,7 +173,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 gt_obstacles=False, gt_lights=False, aeb=True,
                 lane_belief=False, wedge_recovery=False, record_orion=True,
                 tactical_heads=['go', 'dv'], lane_perception=False, dv_cap_min=3.0, tactical_junction_m=None,
-                tactical_wait_v=None, tactical_defer=None,
+                tactical_wait_v=None, tactical_defer=None, dv_cap_latch=False,
                 record_img_every=1)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
@@ -340,6 +343,7 @@ class MPCCAgent(AutonomousAgent):
         self.n_go = self.n_wait = self.n_slow = self.n_proceed = 0
         self._wait_t0, self._wait_off_until, self.n_wait_released = None, -1e9, 0
         self.n_jct_off = 0
+        self._cap_v0 = None
         self.n_yield = 0                 # ticks the student held us at a junction entry
         self._yield_t0, self._yield_off_until = None, -1e9
         self.dump_dir = os.environ.get('B2D_DUMP_DIR')
@@ -708,8 +712,18 @@ class MPCCAgent(AutonomousAgent):
             # so the base decides alone there.  (dv was trained on all frames.)
             core.gate_scale = (1.0 if go else 0.0) if blocked else 1.0
             core.tactical_wait = wait
-            core.mpc_controller.v_cap = (None if dv is None else
-                                         max(core.current_speed + dv, self.cfg['dv_cap_min']))
+            # dv_cap_latch: the cap is v_on + dv, v_on = our speed when the cap came
+            # on.  Re-anchored every tick (v_now + dv) it sits ~|dv| below us on
+            # every tick, so the OCP brakes, the cap follows us down -- a ratchet
+            # to the dv_cap_min floor (stu4 OVTakingPriority: full brake 7.7 ->
+            # 1.1 m/s on an empty road at dv ~ -1, then late into the junction).
+            if dv is None:
+                self._cap_v0 = None
+                core.mpc_controller.v_cap = None
+            else:
+                if self._cap_v0 is None or not self.cfg['dv_cap_latch']:
+                    self._cap_v0 = core.current_speed
+                core.mpc_controller.v_cap = max(self._cap_v0 + dv, self.cfg['dv_cap_min'])
             self.n_go += int(go and blocked)
             self.n_wait += int(wait)
             self.n_proceed += int((not go) and blocked and not wait)
