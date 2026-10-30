@@ -105,16 +105,23 @@ def go_rule(sc):
     return 0 if go_unsafe(frame_features(sc)) else 1
 
 
-def yield_rule(sc):
+def yield_rule(sc, v2=False):
+    """v2 (gap acceptance, 2026-10-30): the window is timed at the speed we
+    would CROSS at, max(v, 6) m/s -- at the approach speed (>= 3) a slow
+    approach widened the window and the expert waited on 62 % of entries --
+    and only MOVING actors conflict (stopped ones are the lead / obstacle
+    layer's, e.g. a queue in our own lane)."""
     if not yield_decision_frame(sc):
         return -1
-    e, v = float(sc['entry_ds']), max(float(sc['v']), 3.0)
+    e, v = float(sc['entry_ds']), max(float(sc['v']), 6.0 if v2 else 3.0)
     t_in, t_out = e / v - 1.0, (e + 20.0) / v + 1.0
     for a in sc['actors']:
         if a['type'].startswith('static'):
             continue
         same_dir = a['vs'] > 0.5 and abs(a['vd']) < 1.0
         if same_dir:                                   # traffic going our way: not a conflict
+            continue
+        if v2 and math.hypot(a['vs'], a['vd']) < 0.5:
             continue
         for t in np.arange(max(t_in, 0.0), t_out + 1e-6, 0.25):
             s_t, d_t = a['ds'] + a['vs'] * t, a['d'] + a['vd'] * t
@@ -138,7 +145,7 @@ def dv_rule(sc):
     return float(np.clip(v_des - v, -8.0, 3.0))
 
 
-def label_episode(ep, mode, stride=1):
+def label_episode(ep, mode, stride=1, yield_v2=False):
     recs = [json.loads(l) for l in open(os.path.join(ep, 'meta.jsonl')) if l.strip()][::stride]
     steps, empty, go, yl, dv = [], [], [], [], []
     for r in recs:
@@ -149,7 +156,7 @@ def label_episode(ep, mode, stride=1):
             go.append(-1), yl.append(-1), dv.append(np.nan)
             continue
         empty.append(False)
-        go.append(go_rule(sc)), yl.append(yield_rule(sc)), dv.append(dv_rule(sc))
+        go.append(go_rule(sc)), yl.append(yield_rule(sc, yield_v2)), dv.append(dv_rule(sc))
     return dict(steps=np.array(steps), empty=np.array(empty), go=np.array(go, np.int8),
                 yield_=np.array(yl, np.int8), dv=np.array(dv, np.float32),
                 teacher=np.array(mode), kind=np.array('direct'))
@@ -161,6 +168,8 @@ def main():
     ap.add_argument('--mode', choices=('privileged', 'rules'), required=True)
     ap.add_argument('--rec', nargs='+', required=True, help='recording roots (contain episode dirs)')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--yield-v2', action='store_true',
+                    help='gap-acceptance yield rule (crossing speed >= 6 m/s, moving actors only)')
     ap.add_argument('--stride', type=int, default=1,
                     help='label every N-th frame -- use the image teachers\' stride, so every\n'
                          'teacher in the ablation trains on the same frames')
@@ -172,7 +181,7 @@ def main():
         for ep in sorted(glob.glob(os.path.join(os.path.expanduser(root), '*'))):
             if not os.path.exists(os.path.join(ep, 'meta.jsonl')):
                 continue
-            out = label_episode(ep, args.mode, args.stride)
+            out = label_episode(ep, args.mode, args.stride, args.yield_v2)
             if out['empty'].all():
                 n_nogt += 1
                 print(f'  {os.path.basename(ep)}: no usable frames (no gt block?) -- skipped')

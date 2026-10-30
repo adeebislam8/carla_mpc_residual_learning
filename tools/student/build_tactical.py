@@ -215,6 +215,12 @@ def main():
     ap.add_argument('--spline-frame', action='store_true',
                     help='rebuild features in the spline frame (round-0 data recorded on the '
                          'YOLOP-lane base, deployed on the spline base)')
+    ap.add_argument('--mask-junction', type=float, default=None, metavar='M',
+                    help='drop go / dv labels inside a junction or within M m of the next one '
+                         '(the student is off there at run time: tactical_junction_m)')
+    ap.add_argument('--yield-from', nargs='+', default=None,
+                    help='take the YIELD head from this teacher (label dirs, same pairing as --labels), '
+                         'e.g. the privileged expert: the VLAs almost never yield')
     ap.add_argument('--frac', type=float, default=1.0,
                     help='keep this fraction of EPISODES (data-size ablation E3b)')
     args = ap.parse_args()
@@ -228,15 +234,18 @@ def main():
             sys.exit(f'--{name}: give one root, or one per --rec root')
         return lst
     L1, L2 = pair(args.labels, 'labels'), pair(args.labels2, 'labels2')
+    LY = pair(args.yield_from, 'yield-from') if args.yield_from else None
     two = L2 is not None
 
     X, V, EP, names = [], [], [], []
+    JCT, YF = [], []             # per row: in / near a junction; yield label of --yield-from
     FALL, SEQ = [], []           # every frame (wedged too) + per-row GRU window indices into it
     T = {k: [] for k in ('g1', 'y1', 'dv1', 'g2', 'y2', 'dv2')}
     plan1 = plan2 = False
     fstats = collections.Counter()
     for k, root in enumerate(args.rec):
         lab1, lab2 = load_labels(L1[k]), (load_labels(L2[k]) if two else None)
+        labY = load_labels(LY[k]) if LY else None
         eps = sorted(glob.glob(os.path.join(os.path.expanduser(root), '*')))
         if args.frac < 1.0:
             keep = np.random.default_rng(0).permutation(len(eps))[:max(1, int(round(args.frac * len(eps))))]
@@ -254,6 +263,8 @@ def main():
                 print(f'  {name}: pre-v2 scene (no entry_ds) -- skipped')
                 continue
             la = np.load(lab1[name])
+            lyf = np.load(labY[name]) if labY and name in labY else None
+            iy = {int(s): j for j, s in enumerate(lyf['steps'])} if lyf is not None else {}
             lb = np.load(lab2[name]) if two else None
             ia = {int(s): j for j, s in enumerate(la['steps'])}
             ib = {int(s): j for j, s in enumerate(lb['steps'])} if two else None
@@ -291,6 +302,11 @@ def main():
                         plan1 = plan1 or is_plan
                     else:
                         plan2 = plan2 or is_plan
+                fi = frames[i]
+                JCT.append(bool(fi[F['in_junction']] > 0.5) or
+                           (args.mask_junction is not None and fi[F['junction_ds']] < args.mask_junction))
+                jy = iy.get(int(r['step']))
+                YF.append(teacher_frame(lyf, jy, r, sc)[1] if jy is not None else -1)
                 X.append(stack_history(frames, i))
                 SEQ.append([f0 + max(i - lag, 0) for lag in SEQ_LAGS])
                 V.append(sc['v'])
@@ -331,12 +347,21 @@ def main():
         y_go, m_go = np.maximum(g1, 0).astype(np.float32), g1 >= 0
         y_yield, m_yield = np.maximum(y1, 0).astype(np.float32), y1 >= 0
         dv = dv1
+    if LY:
+        YF = np.asarray(YF)
+        y_yield, m_yield = np.maximum(YF, 0).astype(np.float32), YF >= 0
+        fstats['yield_from'] = LY[0]
+    if args.mask_junction is not None:
+        J = np.asarray(JCT)
+        m_go = np.asarray(m_go) & ~J
+        dv = np.where(J, np.nan, dv)
+        fstats['junction_masked_rows'] = int(J.sum())
     m_dv = np.isfinite(dv)
     dv = np.where(m_dv, dv, 0.0).astype(np.float32)
     y_slow = (dv < args.slow_on).astype(np.float32)
     m_slow = m_dv & ((dv < args.slow_on) | (dv > args.slow_off))
     cfg = dict(hist_lags=HIST_LAGS, seq_lags=SEQ_LAGS, slow_on=args.slow_on, slow_off=args.slow_off,
-               filtered=not args.no_filter, flip_cautious=args.flip_cautious,
+               filtered=not args.no_filter, mask_junction=args.mask_junction, flip_cautious=args.flip_cautious,
                filter_stats=dict(fstats), frac=args.frac,
                teachers=[L1[0]] + ([L2[0]] if two else []), combine=args.combine if two else None,
                agreement=agreement,

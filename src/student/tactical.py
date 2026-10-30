@@ -356,7 +356,14 @@ class TacticalPolicy:
     DV_ON, DV_OFF = -1.0, -0.5       # cap when dv <= DV_ON, release when dv > DV_OFF
     SLOW_DV = -2.0                   # v1 models: binary slow = this cap
 
-    def __init__(self, path, go_threshold=0.5, slow_threshold=0.5, yield_threshold=0.5):
+    def __init__(self, path, go_threshold=0.5, slow_threshold=0.5, yield_threshold=0.5,
+                 defer_std=None):
+        # defer_std (go_std, dv_std): where the ensemble members disagree this
+        # much the student defers to the base (go, no cap).  0.15 / 0.6 from
+        # held-out frames: go decisions at std >= 0.15 (12 %) were right 53 %
+        # of the time (a coin flip) vs 83 % below it.
+        self.defer_go, self.defer_dv = defer_std if defer_std else (None, None)
+        self.n_defer = 0
         self.net = TacticalEnsemble.load(path)
         self.heads = self.net.heads
         self.go_threshold, self.slow_threshold = go_threshold, slow_threshold
@@ -402,13 +409,17 @@ class TacticalPolicy:
         r = self.net.forward(x)
         self.n_net += 1
         p_go = r['go'][0]
-        self._set('go', p_go >= self.go_threshold)
+        defer = self.defer_go is not None and r['go'][1] >= self.defer_go
+        self.n_defer += int(defer)
+        self._set('go', defer or p_go >= self.go_threshold)
         p_yield = r['yield'][0] if 'yield' in r else 0.0
         self._set('yield_', p_yield >= self.yield_threshold)
         if 'dv' in r:
             dv = r['dv'][0]
             cap_now = self.out['dv'] is not None
             want = dv <= self.DV_ON or (cap_now and dv <= self.DV_OFF)
+            if self.defer_dv is not None and r['dv'][1] >= self.defer_dv:
+                want = False
             self._set('dv', round(dv, 2) if want else None)
             if want and self.out['dv'] is not None:
                 self.out['dv'] = round(dv, 2)        # while capped, track the value

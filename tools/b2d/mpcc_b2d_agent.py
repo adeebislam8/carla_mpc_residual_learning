@@ -51,6 +51,15 @@ Config (JSON, all optional):
     the CBF + emergency brake still guard).  'yield' is off by default: the
     VLA teachers almost never yield at unsignalized entries in our clips
     (~70-160 positives), too few to train it),
+  tactical_junction_m (null: off.  A distance m: inside a junction or within m
+    of the next one the student is off -- go, no wait, no speed cap -- and the
+    rules / base decide.  stu3 abl44: every student lost 20-50 DS on the same
+    junction-flow routes (collisions with crossing traffic after a dv cap
+    braked on the approach), while its gains were on two-way overtaking)
+  tactical_wait_v (null: off.  m/s: the student waits only behind a blocker
+    slower than this; behind a moving one it follows)
+  tactical_defer (null: off.  [go_std, dv_std]: ensemble disagreement at which
+    the student defers to the base, see TacticalPolicy)
   scene_radius_m (110: actors kept for the tactical scene)
 
 Efficiency / robustness (sensor-only):
@@ -160,7 +169,8 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 obstacle_face=False, obstacle_priority=True,
                 gt_obstacles=False, gt_lights=False, aeb=True,
                 lane_belief=False, wedge_recovery=False, record_orion=True,
-                tactical_heads=['go', 'dv'], lane_perception=False, dv_cap_min=3.0,
+                tactical_heads=['go', 'dv'], lane_perception=False, dv_cap_min=3.0, tactical_junction_m=None,
+                tactical_wait_v=None, tactical_defer=None,
                 record_img_every=1)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
@@ -325,10 +335,11 @@ class MPCCAgent(AutonomousAgent):
         self.tactical = None
         if self.cfg['tactical']:
             from student.tactical import TacticalPolicy
-            self.tactical = TacticalPolicy(self.cfg['tactical'])
+            self.tactical = TacticalPolicy(self.cfg['tactical'], defer_std=self.cfg['tactical_defer'])
         self._planner = None
         self.n_go = self.n_wait = self.n_slow = self.n_proceed = 0
         self._wait_t0, self._wait_off_until, self.n_wait_released = None, -1e9, 0
+        self.n_jct_off = 0
         self.n_yield = 0                 # ticks the student held us at a junction entry
         self._yield_t0, self._yield_off_until = None, -1e9
         self.dump_dir = os.environ.get('B2D_DUMP_DIR')
@@ -666,8 +677,12 @@ class MPCCAgent(AutonomousAgent):
             go = dec['go'] if 'go' in heads else True
             dv = dec['dv'] if 'dv' in heads else None
             blocked = scene.get('_blocker') is not None
+            # tactical_wait_v: wait only behind a (nearly) stopped blocker; behind a
+            # moving one, follow it (braking for a car driving away got us rear-ended)
+            wv = self.cfg['tactical_wait_v']
+            moving = blocked and wv is not None and scene['_blocker']['vs'] >= wv
             # pass / wait / proceed (see tactical_heads)
-            wait = (not go) and blocked and (dv is not None or 'dv' not in heads)
+            wait = (not go) and blocked and (dv is not None or 'dv' not in heads) and not moving
             # A wait held WAIT_MAX_S is released for WAIT_COOL_S (the base decides):
             # the student can delay us, never strand us (stu2 2082: 1253 ticks
             # waiting behind a stopped car near a junction -> 'blocked', -88 DS)
@@ -680,6 +695,11 @@ class MPCCAgent(AutonomousAgent):
             if timestamp < self._wait_off_until:
                 go, wait = True, False
                 self.n_wait_released += 1
+            jm = self.cfg['tactical_junction_m']
+            jd = scene.get('junction_ds')
+            if jm is not None and (scene.get('in_junction') or (jd is not None and jd < jm)):
+                go, wait, dv = True, False, None
+                self.n_jct_off += 1
             # The student acts only where it was trained: an in-lane blocker
             # 3-15 m ahead (go_label's decision frames).  Elsewhere its go output
             # is extrapolation -- switching the overtake gate in crossing / cut-in
@@ -1503,7 +1523,8 @@ class MPCCAgent(AutonomousAgent):
             print(f'[MPCCAgent] closing recording failed: {e}', flush=True)
         if getattr(self, 'tactical', None) is not None:
             print(f'[MPCCAgent] tactical: wait released {self.n_wait_released} ticks; go {self.n_go} / wait {self.n_wait} / proceed {self.n_proceed} ticks with a '
-                  f'blocker, speed cap {self.n_slow} ticks, yield {self.n_yield} ticks', flush=True)
+                  f'blocker, speed cap {self.n_slow} ticks, yield {self.n_yield} ticks, '
+                  f'junction-off {self.n_jct_off} ticks, deferred {self.tactical.n_defer} ticks', flush=True)
         if getattr(self, 'trace_dir', None) and getattr(self, 'trace', None):
             try:
                 self._write_trace()
