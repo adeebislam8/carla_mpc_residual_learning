@@ -529,6 +529,7 @@ class MPCCAgent(AutonomousAgent):
                         junction_fn=core._in_junction)
             self._stop_entries_done = set()
             self._stop_sign_seen_t = -1e9
+            self._light_seen_t = -1e9
             # Stop-line context for the rules arm: every junction entry.
             core._stop_lines_s = list(self._junction_entries)
             # DIAGNOSTIC ONLY (_perception_check), never read by control: the
@@ -814,7 +815,13 @@ class MPCCAgent(AutonomousAgent):
         like a red light), or None.  A yield held YIELD_MAX_S is dropped for
         YIELD_COOL_S: the student can delay us, never strand us."""
         e = scene.get('entry_ds')
-        if not want or e is None or scene.get('in_junction') or e > 30.0 \
+        # Gap acceptance is for UNCONTROLLED entries (the labels exclude light /
+        # stop-sign frames): at a signalized one a yield hold outlived the light
+        # and the release crossed on red (stu4 v5: VanillaSignalizedTurn -30 x2).
+        controlled = (scene.get('stop_ds') is not None
+                      or timestamp - getattr(self, '_light_seen_t', -1e9) < 5.0
+                      or timestamp - getattr(self, '_stop_sign_seen_t', -1e9) < 5.0)
+        if not want or e is None or scene.get('in_junction') or e > 30.0 or controlled \
                 or timestamp < self._yield_off_until:
             self._yield_t0 = None
             return None
@@ -1280,6 +1287,8 @@ class MPCCAgent(AutonomousAgent):
         self._ms['yolo_net'] = self._tl.last_net_s
         if det['stop_sign']:
             self._stop_sign_seen_t = timestamp
+        if det['light'] in ('red', 'yellow', 'green'):
+            self._light_seen_t = timestamp
         s, v = core.current_s, core.current_speed
         light = det['light']
         hold = self._light_hold
