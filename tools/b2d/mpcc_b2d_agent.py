@@ -70,6 +70,8 @@ Config (JSON, all optional):
   tactical_gap (null: off.  dir: the gap-acceptance head (tools/student/build_gap.py,
     student.tactical.GapPolicy) decides wait / enter at the next UNCONTROLLED
     junction entry through _yield_target; needs tactical and wide_scene_m)
+  light_max_s (null: 25 s without seeing red / 40 s per entry release a red hold.
+    A number: both caps = this (v2: 50, below Bench2Drive's ~60 s blocked limit))
   tactical_defer (null: off.  [go_std, dv_std]: ensemble disagreement at which
     the student defers to the base, see TacticalPolicy)
   scene_radius_m (110: actors kept for the tactical scene)
@@ -183,7 +185,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 lane_belief=False, wedge_recovery=False, record_orion=True,
                 tactical_heads=['go', 'dv'], lane_perception=False, dv_cap_min=3.0, tactical_junction_m=None,
                 tactical_wait_v=None, tactical_defer=None, dv_cap_latch=False,
-                wide_scene_m=None, lidar_side_m=None, tactical_gap=None,
+                wide_scene_m=None, lidar_side_m=None, tactical_gap=None, light_max_s=None,
                 record_img_every=1)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
@@ -1349,10 +1351,18 @@ class MPCCAgent(AutonomousAgent):
             # saw another road's red / yellow flickers for 1-3 min): give up
             # on that entry for good.
             held = self._entry_hold_s.get(hold['e'], 0.0) + timestamp - hold['t0']
-            if held > LIGHT_ENTRY_MAX_S:
+            # light_max_s (v2): one cap for both timers.  At 25 / 40 s the hold was
+            # released while TRULY red on 17 of 28 red-light violations of the
+            # training clips (stopped 3 m before the line the light leaves the
+            # camera's view; Town12 red phases outlast 40 s).  Bench2Drive ends a
+            # route as blocked after ~60 s without moving: stay below it.
+            lm = self.cfg['light_max_s']
+            entry_max = LIGHT_ENTRY_MAX_S if lm is None else lm
+            unseen_max = LIGHT_HOLD_MAX_S if lm is None else lm
+            if held > entry_max:
                 self._light_given_up.add(hold['e'])
-            if green_ok or s > hold['e'] + LIGHT_PASSED_M or held > LIGHT_ENTRY_MAX_S \
-                    or timestamp - hold['t'] > LIGHT_HOLD_MAX_S:
+            if green_ok or s > hold['e'] + LIGHT_PASSED_M or held > entry_max \
+                    or timestamp - hold['t'] > unseen_max:
                 self._entry_hold_s[hold['e']] = held
                 self._light_hold = None
                 self.n_light_holds += 1
