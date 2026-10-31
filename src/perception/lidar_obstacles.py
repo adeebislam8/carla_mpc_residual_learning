@@ -75,7 +75,9 @@ class LidarObstacleTracker:
     MIN_DISP = {'vehicle': 0.6, 'small': 0.3}  # net displacement over the history (m)
     A_MAX = 8.0                   # reported velocity change limit, m/s^2
 
-    def __init__(self, mount=(1.3, 0.0, 2.5, 0.0)):
+    def __init__(self, mount=(1.3, 0.0, 2.5, 0.0), side_m=None):
+        if side_m is not None:            # wider lateral cut (crossing traffic at junctions)
+            self.RANGE_SIDE = float(side_m)
         self.mx, self.my, self.mz, myaw = mount
         self.myaw = math.radians(myaw)
         self.prev_pts = None

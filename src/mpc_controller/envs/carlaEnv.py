@@ -1819,22 +1819,34 @@ class CarlaMPCEnv(gym.Env):
         self._perceived, the tactical scene's actor list."""
         hints = getattr(self, '_track_s_hint', {})
         perceived, cand = [], []
+        # wide_scene_m (student view only): MOVING tracks off the road corridor
+        # within this distance -- crossing / merging traffic -- go to
+        # self._perceived_wide; control (cand) and self._perceived are unchanged.
+        wide_m = getattr(self, 'wide_scene_m', None)
+        wide = []
         for tr in tracks:
             hint = hints.get(tr['id'], self.current_s)
             s_o, d_o, _ = self.frenet_converter.world_to_frenet(tr['x'], tr['y'], 0, s_hint=hint)
             hints[tr['id']] = s_o
             ds = s_o - self.current_s
             d_lane = d_o - self.lane_offset(s_o)      # relative to the perceived lane centre
-            if not (self.PERCEIVED_D[0] < d_lane < self.PERCEIVED_D[1]
-                    and self.PERCEIVED_DS[0] < ds < self.PERCEIVED_DS[1]):
+            in_corr = (self.PERCEIVED_D[0] < d_lane < self.PERCEIVED_D[1]
+                       and self.PERCEIVED_DS[0] < ds < self.PERCEIVED_DS[1])
+            moving = math.hypot(tr['vx'], tr['vy']) > 1.0
+            if not in_corr and not (wide_m is not None and moving
+                                    and math.hypot(ds, d_lane) < wide_m):
                 continue
             s2, d2, _ = self.frenet_converter.world_to_frenet(
                 tr['x'] + 0.5 * tr['vx'], tr['y'] + 0.5 * tr['vy'], 0, s_hint=s_o)
             vs, vd = (s2 - s_o) / 0.5, (d2 - d_o) / 0.5
-            perceived.append(dict(type=tr['type'], ds=round(ds, 2), d=round(d_lane, 2),
-                                  vs=round(vs, 2), vd=round(vd, 2),
-                                  stopped_for=round(float(tr['stopped_for']), 2),
-                                  id=tr.get('id'), length=round(float(tr.get('length', 0.0)), 2)))
+            act = dict(type=tr['type'], ds=round(ds, 2), d=round(d_lane, 2),
+                       vs=round(vs, 2), vd=round(vd, 2),
+                       stopped_for=round(float(tr['stopped_for']), 2),
+                       id=tr.get('id'), length=round(float(tr.get('length', 0.0)), 2))
+            wide.append(act)
+            if not in_corr:
+                continue
+            perceived.append(act)
             pts = [(s_o, d_o)]
             if self.obstacle_face and tr.get('pts') is not None and len(tr['pts']) >= 3:
                 pts = self._face_points(tr, s_o, d_o)
@@ -1854,6 +1866,7 @@ class CarlaMPCEnv(gym.Env):
                     cand.append((sp - self.current_s, sp, dp, vs, vd, float(tr['stopped_for'])))
         self._track_s_hint = hints
         self._perceived = perceived
+        self._perceived_wide = wide
         self._n_cand = len(cand)
         if self.obstacle_priority:
             # Slots by threat, not by along-route order: everything within

@@ -61,6 +61,15 @@ Config (JSON, all optional):
   dv_cap_latch (false: the student's speed cap is v_now + dv, re-anchored each
     tick -- a ratchet down to dv_cap_min.  true: v_on + dv, v_on = our speed
     when the cap came on)
+  wide_scene_m (null: off.  m: the tactical scene also gets 'actors_wide' --
+    MOVING LiDAR tracks off the road corridor within this distance (crossing /
+    merging traffic, which the corridor filter PERCEIVED_D hides: 2026-10-31
+    beyond 25 m ~2-7 % of true moving vehicles were in the scene).  Control
+    and the existing student features are unchanged)
+  lidar_side_m (null = 25 m: lateral LiDAR cut in perception/lidar_obstacles.py)
+  tactical_gap (null: off.  dir: the gap-acceptance head (tools/student/build_gap.py,
+    student.tactical.GapPolicy) decides wait / enter at the next UNCONTROLLED
+    junction entry through _yield_target; needs tactical and wide_scene_m)
   tactical_defer (null: off.  [go_std, dv_std]: ensemble disagreement at which
     the student defers to the base, see TacticalPolicy)
   scene_radius_m (110: actors kept for the tactical scene)
@@ -174,6 +183,7 @@ DEFAULTS = dict(steer_fix=True, qc=0.5, gate_depth=0.98, target_speed=15.0,
                 lane_belief=False, wedge_recovery=False, record_orion=True,
                 tactical_heads=['go', 'dv'], lane_perception=False, dv_cap_min=3.0, tactical_junction_m=None,
                 tactical_wait_v=None, tactical_defer=None, dv_cap_latch=False,
+                wide_scene_m=None, lidar_side_m=None, tactical_gap=None,
                 record_img_every=1)
 
 # Props that are flat decals, not obstacles: Bench2Drive's ControlLoss scenario
@@ -339,6 +349,10 @@ class MPCCAgent(AutonomousAgent):
         if self.cfg['tactical']:
             from student.tactical import TacticalPolicy
             self.tactical = TacticalPolicy(self.cfg['tactical'], defer_std=self.cfg['tactical_defer'])
+        self.gap = None
+        if self.cfg['tactical_gap'] and self.cfg['tactical']:
+            from student.tactical import GapPolicy
+            self.gap = GapPolicy(self.cfg['tactical_gap'])
         self._planner = None
         self.n_go = self.n_wait = self.n_slow = self.n_proceed = 0
         self._wait_t0, self._wait_off_until, self.n_wait_released = None, -1e9, 0
@@ -511,7 +525,7 @@ class MPCCAgent(AutonomousAgent):
             from perception.ego_state import EgoStateEstimator
             from perception.lidar_obstacles import LidarObstacleTracker
             self._ego_est = EgoStateEstimator(*_get_latlon_ref(world), antenna_x=GNSS_X)
-            self._lidar = LidarObstacleTracker(mount=tuple(c['lidar_mount']))
+            self._lidar = LidarObstacleTracker(mount=tuple(c['lidar_mount']), side_m=c['lidar_side_m'])
             self._tl = None
             if c['traffic_rules'] and not c['gt_lights']:
                 from perception.traffic_lights import TrafficLightDetector
@@ -729,7 +743,9 @@ class MPCCAgent(AutonomousAgent):
             self.n_proceed += int((not go) and blocked and not wait)
             self.n_slow += int(dv is not None)
             # yield: hold at the next junction entry (the light's stop machinery)
-            ys = self._yield_target(dec['yield_'] and 'yield' in heads, scene, timestamp)
+            want_y = (self.gap.step(scene) if self.gap is not None
+                      else dec['yield_'] and 'yield' in heads)
+            ys = self._yield_target(want_y, scene, timestamp)
             if ys is not None and (stop_ds is None or ys < stop_ds):
                 stop_ds = ys
                 core.mpc_controller.stop_s = core.current_s + stop_ds
@@ -1074,6 +1090,7 @@ class MPCCAgent(AutonomousAgent):
             tracks = self._gt_tracks(timestamp)
         else:
             tracks = self._lidar.update(input_data['LIDAR'][1], (x, y, yaw), timestamp)
+        core.wide_scene_m = self.cfg['wide_scene_m']
         core._set_obstacles_from_tracks(tracks)
         self._ms['lidar'] = time.perf_counter() - t2
         if self.dump_dir and self.n_steps % DUMP_EVERY == 0:
@@ -1417,6 +1434,8 @@ class MPCCAgent(AutonomousAgent):
                   junction_ds=jd, entry_ds=round(min(ent), 2) if ent else None,
                   in_junction=bool(core._in_junction(core.current_s)),
                   actors=acts, route_fl=route_fl)
+        if self.cfg['wide_scene_m'] is not None and not self.cfg['privileged']:
+            sc['actors_wide'] = list(getattr(core, '_perceived_wide', []))
         from student.tactical import blocker_info
         sc['_blocker'] = blocker_info(sc)
         return sc
@@ -1547,7 +1566,9 @@ class MPCCAgent(AutonomousAgent):
         if getattr(self, 'tactical', None) is not None:
             print(f'[MPCCAgent] tactical: wait released {self.n_wait_released} ticks; go {self.n_go} / wait {self.n_wait} / proceed {self.n_proceed} ticks with a '
                   f'blocker, speed cap {self.n_slow} ticks, yield {self.n_yield} ticks, '
-                  f'junction-off {self.n_jct_off} ticks, deferred {self.tactical.n_defer} ticks', flush=True)
+                  f'junction-off {self.n_jct_off} ticks, deferred {self.tactical.n_defer} ticks'
+                  + (f', gap deferred {self.gap.n_defer} ticks' if getattr(self, 'gap', None) else ''),
+                  flush=True)
         if getattr(self, 'trace_dir', None) and getattr(self, 'trace', None):
             try:
                 self._write_trace()

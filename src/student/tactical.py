@@ -41,6 +41,7 @@ privileged / rule experts (tools/student/expert_teacher.py).
 """
 
 import json
+import math
 import os
 from collections import deque
 
@@ -148,6 +149,58 @@ def frame_features(sc):
                    and -20.0 < a['ds'] < 60.0], key=lambda a: abs(a['ds']))
     f.update(emerg_present=float(em is not None), emerg_ds=em['ds'] if em else 60.0)
     return np.array([float(f[n]) for n in FRAME_NAMES], dtype=np.float32)
+
+
+# ── gap acceptance (2026-10-31): the junction-entry wait/enter decision ─────
+# Reads scene['actors_wide'] (moving tracks off the road corridor too: the
+# crossing / merging traffic the corridor filter hides; mpcc_b2d_agent.py
+# wide_scene_m), falling back to scene['actors'].  Constant-velocity timing in
+# our route Frenet frame against our crossing window at max(v, 6) m/s.
+GAP_NAMES = ['gap_n_conflict', 'gap_margin', 'gap_t_enter', 'gap_speed', 'gap_n_zone', 'gap_t_in',
+             'gap_margin2', 'gap_n_moving40']
+GAP_LAGS = (0, 10)
+
+
+def gap_features(sc):
+    acts = sc.get('actors_wide') or sc['actors']
+    e, v, d = sc.get('entry_ds'), float(sc['v']), float(sc['d'])
+    n40 = float(sum(1 for a in acts if math.hypot(a['vs'], a['vd']) > 1.0
+                    and math.hypot(a['ds'], a['d'] - d) < 40.0))
+    if e is None:
+        return np.array([0, 8, 8, 0, 0, 8, 8, n40], dtype=np.float32)
+    vc = max(v, 6.0)
+    t_in, t_out = e / vc, (e + 22.0) / vc
+    ts = np.arange(0.0, 8.01, 0.25)
+    margins, n_conf, n_zone, best = [], 0, 0, None
+    for a in acts:
+        sp = math.hypot(a['vs'], a['vd'])
+        if sp < 0.5 or (a['vs'] > 0.5 and abs(a['vd']) < 1.0):
+            continue                                   # parked, or traffic going our way
+        s_t, d_t = a['ds'] + a['vs'] * ts, a['d'] + a['vd'] * ts
+        inz = (s_t >= e - 2.0) & (s_t <= e + 22.0) & (np.abs(d_t - d) < 3.0)
+        if not inz.any():
+            continue
+        n_zone += 1
+        te, tl = ts[inz][0], ts[inz][-1]
+        m = max(te - (t_out + 1.0), (t_in - 1.0) - tl)   # > 0: clear of our crossing window
+        n_conf += int(m < 0)
+        margins.append(m)
+        if best is None or m < best[0]:
+            best = (m, te, sp)
+    if best is None:
+        return np.array([0, 8, 8, 0, 0, min(t_in, 8), 8, n40], dtype=np.float32)
+    ms = sorted(margins)
+    return np.array([n_conf, np.clip(best[0], -8, 8), best[1], best[2], n_zone, min(t_in, 8),
+                     np.clip(ms[1], -8, 8) if len(ms) > 1 else 8.0, n40], dtype=np.float32)
+
+
+def gap_input(frames, gframes, i):
+    """Gap-head input at index i: the 36 frame features now + the gap features
+    now and GAP_LAGS ago (clamped at the episode start)."""
+    return np.concatenate([frames[i]] + [gframes[max(i - lag, 0)] for lag in GAP_LAGS])
+
+
+GAP_INPUT_NAMES = FRAME_NAMES + [f'{n}@{lag}' for lag in GAP_LAGS for n in GAP_NAMES]
 
 
 def stack_history(frames, i):
@@ -428,3 +481,39 @@ class TacticalPolicy:
             self._set('dv', self.SLOW_DV if dv < 0 else None)
         self.last = dict(p_go=p_go, std_go=r['go'][1], p_yield=p_yield, dv=float(dv), net=True)
         return dict(self.out)
+
+
+class GapPolicy:
+    """Deployed gap-acceptance head (tactical_gap): wait at the next junction
+    entry or enter.  Same ensemble format as TacticalEnsemble (its 'yield'
+    head).  Defers (= enter, the base decides) when the members disagree;
+    decisions held >= HOLD_TICKS."""
+
+    HOLD_TICKS = 10
+
+    def __init__(self, path, threshold=0.5, defer_std=0.15):
+        self.net = TacticalEnsemble.load(path)
+        self.threshold, self.defer_std = threshold, defer_std
+        self.frames = deque(maxlen=max(GAP_LAGS) + 1)
+        self.gframes = deque(maxlen=max(GAP_LAGS) + 1)
+        self.n_defer = 0
+        self.reset()
+
+    def reset(self):
+        self.frames.clear(); self.gframes.clear()
+        self.out, self._held, self.last = False, self.HOLD_TICKS, {}
+
+    def step(self, scene):
+        self.frames.append(frame_features(scene))
+        self.gframes.append(gap_features(scene))
+        fr, gf = list(self.frames), list(self.gframes)
+        x = np.concatenate([fr[-1]] + [gf[max(len(gf) - 1 - lag, 0)] for lag in GAP_LAGS])
+        p, sd = self.net.forward(x)['yield']
+        defer = self.defer_std is not None and sd >= self.defer_std
+        self.n_defer += int(defer)
+        want = (not defer) and p >= self.threshold
+        self._held += 1
+        if want != self.out and self._held >= self.HOLD_TICKS:
+            self.out, self._held = want, 0
+        self.last = dict(p_wait=p, std=sd, defer=defer)
+        return self.out
