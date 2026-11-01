@@ -312,7 +312,7 @@ class MPCCAgent(AutonomousAgent):
                 self.cfg.update(json.load(f))
         # Model paths in a config are relative to the repo (the evaluator runs
         # from the Bench2Drive dir).
-        for key in ('student', 'tactical', 'yolop'):
+        for key in ('student', 'tactical', 'yolop', 'tactical_gap'):
             if self.cfg.get(key) and not os.path.isabs(self.cfg[key]):
                 self.cfg[key] = os.path.join(_REPO, self.cfg[key])
         print(f'[MPCCAgent] config {path_to_conf_file}: {self.cfg}', flush=True)
@@ -1573,7 +1573,7 @@ class MPCCAgent(AutonomousAgent):
             self._close_recording()
         except Exception as e:
             print(f'[MPCCAgent] closing recording failed: {e}', flush=True)
-        if getattr(self, 'tactical', None) is not None:
+        if getattr(self, 'tactical', None) is not None and hasattr(self, 'n_wait_released'):
             print(f'[MPCCAgent] tactical: wait released {self.n_wait_released} ticks; go {self.n_go} / wait {self.n_wait} / proceed {self.n_proceed} ticks with a '
                   f'blocker, speed cap {self.n_slow} ticks, yield {self.n_yield} ticks, '
                   f'junction-off {self.n_jct_off} ticks, deferred {self.tactical.n_defer} ticks'
