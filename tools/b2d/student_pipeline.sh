@@ -10,6 +10,9 @@
 #   ROUND=1 MASKJ=15 STRIDE=2 ./tools/b2d/student_pipeline.sh   # DAgger, v5 recipe (driver simlingo_v5,
 #        runtime options in config_record_dagger.json) -> models/tactical_{simlingo,privileged,rules}_v5_r1
 #   ROUND=1 ./tools/b2d/student_pipeline.sh                 # DAgger round
+#   ROUND=1 MASKJ=15 STRIDE=2 DAGGER_DRIVER=v5 DAGGER_ORION=1 DAGGER_HEADS=go TEACHERS="both privileged" \
+#        ./tools/b2d/student_pipeline.sh   # DAgger of the VLA student: the ORION rig is recorded and
+#        ORION labels the round-1 states too -> models/tactical_both_v5_r1 (2026-11-03)
 #
 # Round 0 (the sbase arm drives, so states match the sbase + student arm):
 #   clips    cut single-scenario TRAINING clips out of Bench2Drive's long training
@@ -58,6 +61,8 @@ COMBINE=${COMBINE:-soft}
 STRIDE=${STRIDE:-1}             # label every STRIDE-th frame (2 = 10 Hz: half the teacher GPU time)
 DAGGER_DRIVER=${DAGGER_DRIVER:-simlingo_v5}   # the v5-recipe round-0 SimLingo student (make_teachers_v5.sh)
 MASKJ=${MASKJ:-}                 # v5 recipe: MASKJ=15 -> build --mask-junction 15, models *_v5[_r1]
+DAGGER_ORION=${DAGGER_ORION:-0}  # 1: round 1 records the ORION rig and ORION labels it (the 'both' teacher)
+DAGGER_HEADS=${DAGGER_HEADS:-go,dv}   # the driver's active heads in round 1 (go = pass decision only)
 # Round 1 (DAgger) records the LIGHT rig (no ORION cameras): ORION and the
 # ORION+SimLingo combination stay round-0 only (teacher comparison at round 0,
 # DAgger for the selected teacher + the camera-free experts).
@@ -103,11 +108,13 @@ fi
 if has rec; then
   if [ "$ROUND" = "1" ]; then
     [ -d "models/tactical_${DAGGER_DRIVER}" ] || { echo "no models/tactical_${DAGGER_DRIVER}: train round 0 first"; exit 1; }
-    say "DAgger recording: student '${DAGGER_DRIVER}' drives, ORION + SimLingo rigs on"
-    python3 - "$DAGGER_DRIVER" <<'EOF'
+    say "DAgger recording: student '${DAGGER_DRIVER}' (heads ${DAGGER_HEADS}) drives, SimLingo rig on, ORION rig ${DAGGER_ORION}"
+    python3 - "$DAGGER_DRIVER" "$DAGGER_ORION" "$DAGGER_HEADS" <<'EOF'
 import json, sys
 c = json.load(open('tools/b2d/config_record_dagger.json'))
 c['tactical'] = f'models/tactical_{sys.argv[1]}'
+c['record_orion'] = sys.argv[2] == '1'
+c['tactical_heads'] = sys.argv[3].split(',')
 json.dump(c, open('tools/b2d/config_record_dagger.json', 'w'), indent=2)
 EOF
     TAG=rec_r1 CONFIG=tools/b2d/config_record_dagger.json ./tools/b2d/run_b2d.sh train_clips2
@@ -129,7 +136,7 @@ todo_for() {    # episodes of $RUN without a label file in $1
 
 if has label; then
   mkdir -p "$RUN/labels" "$RUN/labels_simlingo"
-  if [ "$ROUND" = "1" ]; then todo=(); say "ORION labelling: skipped (round 1: light rig)"
+  if [ "$ROUND" = "1" ] && [ "$DAGGER_ORION" != "1" ]; then todo=(); say "ORION labelling: skipped (round 1: light rig)"
   else mapfile -t todo < <(todo_for "$RUN/labels"); say "ORION labelling: ${#todo[@]} routes"; fi
   if [ ${#todo[@]} -gt 0 ]; then
     pkill -9 -f CarlaUE4 2>/dev/null; sleep 5     # free the GPU
