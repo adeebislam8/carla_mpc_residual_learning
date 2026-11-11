@@ -8,7 +8,7 @@ CARLA server (same version as the recording) and the b2d conda env.
     python tools/b2d/render_replay.py --log results/b2d/vbase_video/recorder/RouteScenario_24367_rep0.log \
         --out frames/base_24367 --label "MPCC base"
 
-Default 960x810 panels: two side by side, padded to 1920x1080 for iMovie.
+Default 960x810 panels at 30 fps: two side by side, padded to 1920x1080 for iMovie.
 
 The ego car is the replayed vehicle with role_name 'hero' (Leaderboard 2.0).
 """
@@ -51,6 +51,7 @@ def main():
     ap.add_argument('--behind', type=float, default=7.0)
     ap.add_argument('--up', type=float, default=2.8)
     ap.add_argument('--aim', type=float, default=1.0, help='height on the car the camera looks at (car centred)')
+    ap.add_argument('--fps', type=int, default=30, help='render rate; the replayer interpolates the 20 Hz log')
     ap.add_argument('--smooth', type=float, default=0.15, help='heading follow rate per frame (1 = rigid)')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -65,7 +66,7 @@ def main():
     client.replay_file(log, a.start, dur, 0, False)      # loads the recorded map
     world = client.get_world()
     settings = world.get_settings()
-    settings.synchronous_mode, settings.fixed_delta_seconds = True, 0.05
+    settings.synchronous_mode, settings.fixed_delta_seconds = True, 1.0 / a.fps
     world.apply_settings(settings)
     for _ in range(5):
         world.tick()
@@ -77,32 +78,23 @@ def main():
     bp.set_attribute('image_size_x', str(a.width))
     bp.set_attribute('image_size_y', str(a.height))
     bp.set_attribute('fov', '90')
-    # Free camera behind the ego car with smoothed heading: the attached SpringArm
-    # shook with every small yaw jitter of the replayed car.
+    # Camera rigidly attached (no one-tick lag, so the car does not jump in the
+    # frame), but its heading is a smoothed copy of the car's: the attached
+    # SpringArm shook with every small yaw jitter of the replayed car.
     pitch = -math.degrees(math.atan2(a.up - a.aim, a.behind))
-    def follow(state):
-        t = hero.get_transform()
-        x, y, z, yaw = t.location.x, t.location.y, t.location.z, t.rotation.yaw
-        if state is None:
-            return [x, y, z, yaw]
-        k = a.smooth
-        dyaw = (yaw - state[3] + 180.0) % 360.0 - 180.0
-        # exact x/y (smoothing them would let the car run ahead of the camera at speed);
-        # yaw and height smoothed, which is where the shake comes from
-        return [x, y, state[2] + k * (z - state[2]), state[3] + k * dyaw]
-    def cam_tf(state):
-        x, y, z, yaw = state
-        r = math.radians(yaw)
-        return carla.Transform(carla.Location(x - a.behind * math.cos(r), y - a.behind * math.sin(r), z + a.up),
-                               carla.Rotation(pitch=pitch, yaw=yaw))
-    state = follow(None)
-    cam = world.spawn_actor(bp, cam_tf(state))
+    def rel_tf(ys):
+        d = math.radians((ys - hero.get_transform().rotation.yaw + 180.0) % 360.0 - 180.0)
+        return carla.Transform(carla.Location(-a.behind * math.cos(d), -a.behind * math.sin(d), a.up),
+                               carla.Rotation(pitch=pitch, yaw=math.degrees(d)))
+    ys = hero.get_transform().rotation.yaw
+    cam = world.spawn_actor(bp, rel_tf(ys), attach_to=hero, attachment_type=carla.AttachmentType.Rigid)
     q = queue.Queue()
     cam.listen(q.put)
     try:
-        for n in range(int(dur / 0.05)):
-            state = follow(state)
-            cam.set_transform(cam_tf(state))
+        for n in range(int(dur * a.fps)):
+            yaw = hero.get_transform().rotation.yaw
+            ys += a.smooth * ((yaw - ys + 180.0) % 360.0 - 180.0)
+            cam.set_transform(rel_tf(ys))
             frame = world.tick()
             img = q.get(timeout=10.0)
             while img.frame < frame:
