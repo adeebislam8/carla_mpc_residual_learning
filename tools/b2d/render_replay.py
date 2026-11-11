@@ -68,11 +68,26 @@ def main():
     settings = world.get_settings()
     settings.synchronous_mode, settings.fixed_delta_seconds = True, 1.0 / a.fps
     world.apply_settings(settings)
+    client.set_replayer_time_factor(0.01)      # hold the replay while the map streams in
     for _ in range(5):
         world.tick()
     hero = find_hero(world)
     if hero is None:
         raise SystemExit('no vehicle with role_name=hero in the replay')
+    # Large maps (Town12/13) only stream tiles around the hero/spectator; in a
+    # replay the camera ended up in unloaded tiles (sky below the horizon).
+    spectator = world.get_spectator()
+    def park_spectator():
+        spectator.set_transform(carla.Transform(hero.get_transform().location + carla.Location(z=30),
+                                                carla.Rotation(pitch=-90)))
+    for attr in ('tile_stream_distance', 'actor_active_distance'):
+        if hasattr(settings, attr):
+            setattr(settings, attr, 3000.0)
+    world.apply_settings(settings)
+    for _ in range(60):
+        park_spectator()
+        world.tick()
+    client.set_replayer_time_factor(1.0)
 
     bp = world.get_blueprint_library().find('sensor.camera.rgb')
     bp.set_attribute('image_size_x', str(a.width))
@@ -95,6 +110,7 @@ def main():
             yaw = hero.get_transform().rotation.yaw
             ys += a.smooth * ((yaw - ys + 180.0) % 360.0 - 180.0)
             cam.set_transform(rel_tf(ys))
+            park_spectator()
             frame = world.tick()
             img = q.get(timeout=10.0)
             while img.frame < frame:
