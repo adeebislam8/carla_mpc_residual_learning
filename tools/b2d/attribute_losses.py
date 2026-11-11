@@ -18,7 +18,7 @@ Each infraction is matched to its trace tick by position.
 
     python tools/b2d/attribute_losses.py base=results/full/sbase_nolane_full \
         vla=results/full/stu_v5_fix_full priv=results/teachers/stu_privileged_v5_full
-(a name ending in 'base' is treated as student-free)
+(whether a run has a student / a speed head is read from its agent config)
 """
 import collections, csv, glob, json, math, os, re, sys
 
@@ -119,7 +119,7 @@ def timeout(tr, student):
     w = T[i0:i0 + n]
     if sum(t['wedge'] == '1' for t in w) > 0.5 * n: return 'timeout: wedged after collision'
     if sum(t['light_hold'] == '1' or not math.isnan(fl(t['stop_ds'])) for t in w) > 0.5 * n: return 'timeout: light/stop hold'
-    if student and sum(t['student_net'] == '1' and fl(t['st_go']) < 0.5 and not math.isnan(fl(t['gt_ds'])) and fl(t['gt_ds']) < 15 for t in w) > 0.5 * n:
+    if student is not None and sum(t['student_net'] == '1' and fl(t['st_go']) < 0.5 and not math.isnan(fl(t['gt_ds'])) and fl(t['gt_ds']) < 15 for t in w) > 0.5 * n:
         return 'timeout: student waiting behind blocker'
     if sum(not math.isnan(fl(t['gt_ds'])) and fl(t['gt_ds']) < 15 for t in w) > 0.5 * n: return 'timeout: stopped too close behind obstacle to pull out'
     return 'timeout: stopped, nothing ahead (junction yield / creep)'
@@ -158,11 +158,23 @@ def run_arm(run, student):
             out[c] += 100 - rc; routes[c].add(rid)
     return {c: v / 220 for c, v in out.items()}, routes
 
+def student_mode(run):
+    """None: no student; True: student with the speed head (dv); False: student without it.
+    Read from the run's agent config (eval_cmd.sh), resolved to tools/b2d/<name> here."""
+    try:
+        cfg = re.search(r'agent-config="?([^" ]+)', open(os.path.join(run, 'eval_cmd.sh')).read()).group(1)
+        c = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.path.basename(cfg))))
+    except Exception:
+        return True
+    if not c.get('tactical'): return None
+    return 'dv' in c.get('tactical_heads', ['go', 'dv'])
+
+
 def main():
     arms = {}
     for a in sys.argv[1:]:
         name, path = a.split('=', 1)
-        arms[name] = (path, None if name.endswith('base') else True)
+        arms[name] = (path, student_mode(path))
     if not arms: sys.exit(__doc__)
     first = list(arms)[min(1, len(arms) - 1)]
     R = {a: run_arm(p, s) for a, (p, s) in arms.items()}

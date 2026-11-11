@@ -131,7 +131,7 @@ todo_for() {    # episodes of $RUN without a label file in $1
     [ -f "$ep/meta.jsonl" ] || continue
     [ -f "$out/$n.npz" ] || t+=("$ep")
   done
-  printf '%s\n' "${t[@]}"
+  [ ${#t[@]} -gt 0 ] && printf '%s\n' "${t[@]}"   # nothing (not one empty line) when all are labelled
 }
 
 if has label; then

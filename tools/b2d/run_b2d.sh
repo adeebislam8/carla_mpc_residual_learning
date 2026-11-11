@@ -30,6 +30,10 @@ PY="$CONDA run --no-capture-output -n b2d python"
 # tools/b2d/bench_stack.py / quantize_yolop.py, the offline efficiency study)
 DUMP_DIR=""
 [ "${DUMP:-0}" = "1" ] && DUMP_DIR="$OUT/dump"
+# RECORD=1: CARLA recorder logs of every route -> $OUT/recorder/*.log (server-side,
+# replayed later by tools/b2d/render_replay.py for the video; does not change the run)
+REC_ARG=""
+[ "${RECORD:-0}" = "1" ] && { mkdir -p "$OUT/recorder"; REC_ARG="--record=$OUT/recorder"; }
 
 ROUTES=$REPO/tools/b2d/routes/${SET}.xml
 
@@ -83,7 +87,7 @@ exec python "$B2D/leaderboard/leaderboard/leaderboard_evaluator.py" \\
   --routes="$ROUTES" --repetitions=1 --track=SENSORS \\
   --checkpoint="$OUT/eval.json" \\
   --agent="$REPO/tools/b2d/mpcc_b2d_agent.py" --agent-config="$CONFIG" \\
-  --debug=0 --resume=True --port=$PORT --traffic-manager-port=$TM_PORT \\
+  --debug=0 --resume=True --port=$PORT --traffic-manager-port=$TM_PORT $REC_ARG \\
   --gpu-rank=$GPU_RANK
 EOS
 # CARLA crashes on the large maps (segfault while loading Town12/13 is
