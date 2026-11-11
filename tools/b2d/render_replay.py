@@ -5,14 +5,16 @@ chase camera behind the ego car, for the submission video.  Needs a running
 CARLA server (same version as the recording) and the b2d conda env.
 
     ./CarlaUE4.sh -RenderOffScreen -carla-rpc-port=2000 &        # in $CARLA_ROOT
-    python tools/b2d/render_replay.py --log results/b2d/video_base_video/recorder/<route>.log \
-        --out results/b2d/frames/base_24367 --label "MPCC base"
-    ffmpeg -framerate 20 -i results/b2d/frames/base_24367/%05d.jpg -pix_fmt yuv420p base_24367.mp4
+    python tools/b2d/render_replay.py --log results/b2d/vbase_video/recorder/RouteScenario_24367_rep0.log \
+        --out frames/base_24367 --label "MPCC base"
+
+Default 960x810 panels: two side by side, padded to 1920x1080 for iMovie.
 
 The ego car is the replayed vehicle with role_name 'hero' (Leaderboard 2.0).
 """
 
 import argparse
+import math
 import os
 import queue
 import re
@@ -44,11 +46,12 @@ def main():
     ap.add_argument('--port', type=int, default=2000)
     ap.add_argument('--start', type=float, default=0.0, help='seconds into the log')
     ap.add_argument('--duration', type=float, default=0.0, help='0 = to the end')
-    ap.add_argument('--width', type=int, default=1280)
-    ap.add_argument('--height', type=int, default=720)
-    ap.add_argument('--behind', type=float, default=8.0)
-    ap.add_argument('--up', type=float, default=4.0)
-    ap.add_argument('--pitch', type=float, default=-15.0)
+    ap.add_argument('--width', type=int, default=960)
+    ap.add_argument('--height', type=int, default=810)
+    ap.add_argument('--behind', type=float, default=7.0)
+    ap.add_argument('--up', type=float, default=2.8)
+    ap.add_argument('--aim', type=float, default=1.0, help='height on the car the camera looks at (car centred)')
+    ap.add_argument('--smooth', type=float, default=0.15, help='heading follow rate per frame (1 = rigid)')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -74,20 +77,40 @@ def main():
     bp.set_attribute('image_size_x', str(a.width))
     bp.set_attribute('image_size_y', str(a.height))
     bp.set_attribute('fov', '90')
-    tf = carla.Transform(carla.Location(x=-a.behind, z=a.up), carla.Rotation(pitch=a.pitch))
-    cam = world.spawn_actor(bp, tf, attach_to=hero, attachment_type=carla.AttachmentType.SpringArmGhost)
+    # Free camera behind the ego car with smoothed heading: the attached SpringArm
+    # shook with every small yaw jitter of the replayed car.
+    pitch = -math.degrees(math.atan2(a.up - a.aim, a.behind))
+    def follow(state):
+        t = hero.get_transform()
+        x, y, z, yaw = t.location.x, t.location.y, t.location.z, t.rotation.yaw
+        if state is None:
+            return [x, y, z, yaw]
+        k = a.smooth
+        dyaw = (yaw - state[3] + 180.0) % 360.0 - 180.0
+        # exact x/y (smoothing them would let the car run ahead of the camera at speed);
+        # yaw and height smoothed, which is where the shake comes from
+        return [x, y, state[2] + k * (z - state[2]), state[3] + k * dyaw]
+    def cam_tf(state):
+        x, y, z, yaw = state
+        r = math.radians(yaw)
+        return carla.Transform(carla.Location(x - a.behind * math.cos(r), y - a.behind * math.sin(r), z + a.up),
+                               carla.Rotation(pitch=pitch, yaw=yaw))
+    state = follow(None)
+    cam = world.spawn_actor(bp, cam_tf(state))
     q = queue.Queue()
     cam.listen(q.put)
     try:
         for n in range(int(dur / 0.05)):
+            state = follow(state)
+            cam.set_transform(cam_tf(state))
             frame = world.tick()
             img = q.get(timeout=10.0)
             while img.frame < frame:
                 img = q.get(timeout=10.0)
             bgr = np.frombuffer(img.raw_data, np.uint8).reshape(a.height, a.width, 4)[:, :, :3].copy()
             if a.label:
-                cv2.rectangle(bgr, (0, 0), (len(a.label) * 22 + 30, 56), (0, 0, 0), -1)
-                cv2.putText(bgr, a.label, (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.rectangle(bgr, (0, 0), (len(a.label) * 17 + 24, 46), (0, 0, 0), -1)
+                cv2.putText(bgr, a.label, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.imwrite(os.path.join(a.out, f'{n:05d}.jpg'), bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
     finally:
         cam.stop()
